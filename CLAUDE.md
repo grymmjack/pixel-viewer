@@ -495,7 +495,12 @@ band lets it bleed through the off-bits and the halftone reads too dense. Solid 
 **Text:**
 font 0 is the 8×8 bitmap; fonts 1–10 (the spec's scalable BGI fonts) are real stroke
 fonts in `rip_chr.rs` — the `.CHR` glyphs are stroke lists we render with the same
-`line()`. **Buttons:** RIP_BUTTON_STYLE/RIP_BUTTON draw the beveled/recessed/chiseled
+`line()`. **Stroke text is always drawn thin + solid** (`draw_text` saves `thick`/
+`line_pat`, forces `1`/`0xFFFF`, restores after — exactly icy_engine's `out_text_xy` /
+PabloDraw's `OutTextXY`): a preceding `LineStyle thick:3` (common right before a title)
+would otherwise bold every glyph stroke into a doubled "shadow" (P1-WNC2's "Wind Ninja
+Chronicles" block; the fix also cut shadow 1.1%→0.07%, garfield 3.5%→2.6% vs reference).
+**Buttons:** RIP_BUTTON_STYLE/RIP_BUTTON draw the beveled/recessed/chiseled
 panels BBS *menus* are built from (`Btn` + `draw_button`/`button_label`, ported from
 icy_engine's `add_button`) — so menu screens render (msg5 ≈ 1.5% vs reference); only the
 panel visual is drawn (the mouse region is moot for a static viewer). **Image blits:**

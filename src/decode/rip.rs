@@ -678,9 +678,20 @@ impl Rip {
             let adv = f.draw(s, x, y, dir, size, &mut |a, b, c, d| {
                 segs.push((a, b, c, d))
             });
+            // BGI stroke-font text is always drawn **thin and solid**, regardless of the
+            // current line thickness/style: icy_engine (and PabloDraw) force
+            // `line_thickness = 1` + `LineStyle::Solid` around the glyph strokes and
+            // restore after. Without this, a preceding `LineStyle thick:3` (common right
+            // before a title) renders every stroke 3px wide — the bold "shadow"/doubled
+            // text seen on P1-WNC2's "Wind Ninja Chronicles" block.
+            let (saved_thick, saved_pat) = (self.thick, self.line_pat);
+            self.thick = 1;
+            self.line_pat = 0xFFFF;
             for (a, b, c, d) in segs {
                 self.line(a, b, c, d);
             }
+            self.thick = saved_thick;
+            self.line_pat = saved_pat;
             adv
         } else {
             self.text(x, y, s);
@@ -1258,7 +1269,10 @@ mod tests {
         green_border.fill_color = 7;
         green_border.color = 2;
         green_border.fill_poly(&rect);
-        assert_eq!(green_border.px[edge], 2, "a non-black border is still drawn");
+        assert_eq!(
+            green_border.px[edge], 2,
+            "a non-black border is still drawn"
+        );
     }
 
     #[test]
@@ -1277,6 +1291,37 @@ mod tests {
             r.px[(20 * W + 21) as usize],
             0,
             "clear bit → bkcolor (black), not the grey it covered"
+        );
+    }
+
+    #[test]
+    fn stroke_text_is_thin_and_solid_regardless_of_line_state() {
+        // BGI stroke-font text is always drawn thin + solid: a preceding
+        // `LineStyle thick:3` (or a dashed pattern) must not bold/dash the glyphs.
+        // icy_engine + PabloDraw force thickness 1 / solid around the strokes and
+        // restore after — without it, P1-WNC2's title rendered as bold "shadow" text.
+        let render = |thick: i32, pat: u16| {
+            let mut r = Rip::new();
+            r.font = 1; // a BGI stroke font
+            r.fsize = 4;
+            r.color = 15;
+            r.thick = thick;
+            r.line_pat = pat;
+            r.draw_text(50, 100, "Aj");
+            let lit = r.px.iter().filter(|&&p| p == 15).count();
+            (lit, r.thick, r.line_pat)
+        };
+        let (base, _, _) = render(1, 0xFFFF);
+        let (bold_dashed, thick_after, pat_after) = render(3, 0x8888);
+        assert!(base > 0, "stroke text actually drew something");
+        assert_eq!(
+            base, bold_dashed,
+            "stroke text must ignore line thickness and dash pattern"
+        );
+        assert_eq!(
+            (thick_after, pat_after),
+            (3, 0x8888),
+            "line thickness + pattern restored after drawing text"
         );
     }
 
