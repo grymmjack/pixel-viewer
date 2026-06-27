@@ -1,0 +1,41 @@
+[package]
+name = "pixelview"
+version = "0.1.0"
+edition = "2021"
+description = "A fast, pixel-art-first image viewer"
+
+[dependencies]
+asefile = "0.3.8"
+# eframe re-exports egui, so we depend on eframe only — guarantees matching versions.
+# "persistence" enables on-disk storage (eframe::{get,set}_value) to remember the UI zoom.
+eframe = { version = "0.34", features = ["persistence"] }
+# Only the formats we actually want; keeps the dep tree (and build time) smaller.
+image = { version = "0.25", default-features = false, features = [
+    "png", "gif", "bmp", "jpeg", "webp", "tga", "tiff", "pnm", "qoi", "ico",
+] }
+psd = "0.3.5"
+resvg = "0.47.0"
+# Read-only extraction of legacy + modern archives (zip/lha/arj/arc/zoo/7z/rar/…),
+# so archives can be browsed as virtual folders. Mike Krüger's crate (icy ecosystem).
+unarc-rs = "0.6"
+# Mike Krüger's scene-art parsers (PETSCII/RIP/ATASCII/…). The lightweight parser
+# crate only — no tokio/egui — driven into our own renderer via its CommandSink.
+# Pinned to a rev so upstream master can't break our build.
+icy_parser_core = { git = "https://github.com/mkrueger/icy_tools", rev = "68d4b4866c6b67bce0ad99d30f449bc8a8c30515" }
+# Browse 16colo.rs as a virtual disk: HTTPS for the JSON API + pack-zip downloads.
+ureq = "2"
+serde_json = "1"
+# Native open-folder / open-file dialogs on Linux, macOS, Windows.
+rfd = "0.15"
+trash = "5.2.6"
+# Read/write star ratings as the KDE Baloo `user.baloo.rating` extended attribute,
+# so ratings interoperate with Gwenview and the user's sort-by-rating tooling.
+xattr = "1"
+xcf = "0.4.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[dev-dependencies]
+egui_kittest = { version = "0.34", features = ["eframe"] }
