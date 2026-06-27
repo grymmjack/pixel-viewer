@@ -347,6 +347,44 @@ pub struct Piece {
     pub pack: String,
     pub raw_url: String,
     pub tn_url: String,
+    /// SAUCE record from the API (`?sauce=true`, pack endpoint only) — `None` when the
+    /// file has no SAUCE or the endpoint doesn't carry it (e.g. the artist view).
+    pub sauce: Option<crate::sauce::Sauce>,
+    /// File size in bytes from the SAUCE record (`0` when unknown).
+    pub filesize: u64,
+}
+
+/// Map a 16colo.rs API `sauce` object → our `crate::sauce::Sauce`. The API uses
+/// PascalCase keys (`Title`/`Author`/`Tinfo1`…), `Date` is a number *or* a string,
+/// and iCE colour lives in `f.ice` (or `Tflags` bit 0). An all-blank record → `None`.
+fn sauce_from_json(s: &serde_json::Value) -> Option<crate::sauce::Sauce> {
+    if !s.is_object() {
+        return None;
+    }
+    let txt = |k: &str| s[k].as_str().unwrap_or("").trim().to_string();
+    let date = match &s["Date"] {
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(st) => st.trim().to_string(),
+        _ => String::new(),
+    };
+    let (title, author, group) = (txt("Title"), txt("Author"), txt("Group"));
+    if title.is_empty() && author.is_empty() && group.is_empty() && date.is_empty() {
+        return None;
+    }
+    Some(crate::sauce::Sauce {
+        title,
+        author,
+        group,
+        date,
+        data_type: s["Datatype"].as_u64().unwrap_or(0) as u8,
+        file_type: s["Filetype"].as_u64().unwrap_or(0) as u8,
+        tinfo1: s["Tinfo1"].as_u64().unwrap_or(0) as u16,
+        tinfo2: s["Tinfo2"].as_u64().unwrap_or(0) as u16,
+        ice: s["f"]["ice"].as_u64().unwrap_or(0) != 0
+            || (s["Tflags"].as_u64().unwrap_or(0) & 1) != 0,
+        font: txt("Tinfos"),
+        ..Default::default()
+    })
 }
 
 /// Make a site-relative API path (`/pack/…`) absolute; pass through an already-absolute
@@ -389,6 +427,10 @@ fn pieces_from_artist_json(artist: &str, v: &serde_json::Value) -> Vec<Piece> {
                     pack: pack.clone(),
                     raw_url: abs_url(f["raw"].as_str().unwrap_or("")),
                     tn_url: abs_url(f["tn"].as_str().unwrap_or("")),
+                    // The artist view carries no SAUCE; extract it anyway in case a
+                    // future response adds it (harmless `None` today).
+                    sauce: sauce_from_json(&f["sauce"]),
+                    filesize: f["sauce"]["Filesize"].as_u64().unwrap_or(0),
                 });
             }
         }
@@ -433,6 +475,8 @@ fn pieces_from_pack_json(
                 pack: pack.to_string(),
                 raw_url: format!("{SITE}/pack/{}/raw/{}", enc(pack), filename),
                 tn_url: abs_url(tn),
+                sauce: sauce_from_json(&fobj["sauce"]),
+                filesize: fobj["sauce"]["Filesize"].as_u64().unwrap_or(0),
             });
         }
     }
@@ -468,7 +512,9 @@ pub fn fetch_group_pack_refs(group: &str) -> Result<Vec<(u32, String)>, String> 
 /// Every piece in `pack` (via `/v1/pack/:pack`), stamped with `group` (the listing
 /// context). `year_hint` is used only if a result omits its year.
 pub fn fetch_pack_pieces(group: &str, year_hint: u32, pack: &str) -> Result<Vec<Piece>, String> {
-    let v = get_json(&format!("{API}/pack/{}", enc(pack)))?;
+    // `?sauce=true` makes the pack endpoint include each file's SAUCE record (Title,
+    // Author, dimensions, Filesize) — populated into the Details panel without download.
+    let v = get_json(&format!("{API}/pack/{}?sauce=true", enc(pack)))?;
     Ok(pieces_from_pack_json(pack, group, year_hint, &v))
 }
 
@@ -554,6 +600,45 @@ mod tests {
             p.tn_url,
             "https://16colo.rs/pack/acdu0892/tn/ACID-BR.ANS.png"
         );
+    }
+
+    #[test]
+    fn pack_json_extracts_sauce_and_filesize() {
+        // `?sauce=true` adds a per-file SAUCE record (PascalCase keys; Date may be a
+        // number; iCE in `f.ice`). We map it into our `Sauce` + pull Filesize.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{ "results": [ { "year": 1997, "files": {
+                "CG-MALP.ANS": {
+                    "file": { "raw": "CG-MALP.ANS", "tn": { "uri": "/pack/tw/tn/CG-MALP.ANS.png" } },
+                    "artists": ["coug"],
+                    "sauce": { "Title": "Malpractice", "Author": "Coug", "Group": "Twilight",
+                               "Date": 19970309, "Filesize": 4315, "Datatype": 1, "Filetype": 1,
+                               "Tinfo1": 80, "Tinfo2": 25, "Tinfos": "", "Tflags": 1,
+                               "f": { "ice": 1 } } }
+            } } ] }"#,
+        )
+        .unwrap();
+        let p = &pieces_from_pack_json("tw-pack", "twilight", 0, &v)[0];
+        let s = p.sauce.as_ref().expect("sauce extracted");
+        assert_eq!(s.title, "Malpractice");
+        assert_eq!(s.author, "Coug");
+        assert_eq!(s.group, "Twilight");
+        assert_eq!(s.date, "19970309");
+        assert_eq!((s.tinfo1, s.tinfo2), (80, 25));
+        assert_eq!(s.data_type, 1);
+        assert!(s.ice);
+        assert_eq!(p.filesize, 4315);
+
+        // No sauce key → None, size 0 (hidden in the table).
+        let v2: serde_json::Value = serde_json::from_str(
+            r#"{ "results": [ { "year": 1992, "files": {
+                "X.ANS": { "file": { "raw": "X.ANS", "tn": { "uri": "/t.png" } }, "artists": [] }
+            } } ] }"#,
+        )
+        .unwrap();
+        let p2 = &pieces_from_pack_json("p", "g", 0, &v2)[0];
+        assert!(p2.sauce.is_none());
+        assert_eq!(p2.filesize, 0);
     }
 
     #[test]

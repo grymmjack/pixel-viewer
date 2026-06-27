@@ -138,7 +138,7 @@ type RandomPick = Result<(u32, String, String), String>;
 /// `SearchMsg`: one `Hit` per piece as it's discovered, then `Done(total)`. Each hit
 /// carries the piece's `Entry` (virtual path) plus its [`ColoPiece`] metadata.
 enum ColoMsg {
-    Hit(Entry, ColoPiece),
+    Hit(Entry, Box<ColoPiece>), // boxed: ColoPiece dwarfs the other variants
     Done(usize),
     Err(String),
 }
@@ -185,8 +185,9 @@ struct ColoPiece {
     group: String,
     year: u32,
     pack: String,
-    raw_url: String, // single-file download (the .ans/.png itself)
-    tn_url: String,  // pre-rendered thumbnail PNG
+    raw_url: String,                    // single-file download (the .ans/.png itself)
+    tn_url: String,                     // pre-rendered thumbnail PNG
+    sauce: Option<crate::sauce::Sauce>, // from the 16colo API (pack endpoint), if any
 }
 
 /// An animated GIF being viewed: uploaded frame textures + playback timing.
@@ -1600,7 +1601,13 @@ impl PixelView {
             match rx.try_recv() {
                 Ok(ColoMsg::Hit(mut entry, piece)) => {
                     entry.rating = self.read_rating(&entry.path);
-                    self.colo_pieces.insert(entry.path.clone(), piece);
+                    // Pre-seed the SAUCE cache from the API so the Details panel shows
+                    // title/author/group/dims for this piece without downloading it.
+                    if piece.sauce.is_some() {
+                        self.sauce_cache
+                            .insert(entry.path.clone(), piece.sauce.clone());
+                    }
+                    self.colo_pieces.insert(entry.path.clone(), *piece);
                     self.all_entries.push(entry);
                     got += 1;
                 }
@@ -3238,7 +3245,12 @@ impl PixelView {
         if let Some(c) = self.sauce_cache.get(path) {
             return c.clone();
         }
-        let parsed = read_file_tail(path, 128).and_then(|t| crate::sauce::parse(&t));
+        // 16colo.rs pieces show under a *virtual* display path; the downloaded bytes
+        // live elsewhere (`colo_files` maps virtual → real). Read SAUCE from the real
+        // file so the Details panel works for an opened piece. (Un-opened pieces get
+        // their SAUCE pre-seeded into this same cache from the 16colo API.)
+        let real = self.colo_files.get(path).map_or(path, |p| p.as_path());
+        let parsed = read_file_tail(real, 128).and_then(|t| crate::sauce::parse(&t));
         self.sauce_cache.insert(path.to_path_buf(), parsed.clone());
         parsed
     }
@@ -9123,7 +9135,7 @@ fn emit_piece(
         path,
         is_dir: false,
         is_archive: false,
-        size: 0,
+        size: p.filesize, // from the API SAUCE record (0 = unknown → hidden in the table)
         mtime: None,
         ctime: None,
         rating: 0,
@@ -9135,9 +9147,10 @@ fn emit_piece(
         pack: p.pack,
         raw_url: p.raw_url,
         tn_url: p.tn_url,
+        sauce: p.sauce,
     };
     *count += 1;
-    tx.send(ColoMsg::Hit(entry, piece)).is_ok()
+    tx.send(ColoMsg::Hit(entry, Box::new(piece))).is_ok()
 }
 
 /// Background worker for a flat 16colo.rs piece listing (see
@@ -10052,6 +10065,7 @@ mod tests {
             pack: pack.into(),
             raw_url: String::new(),
             tn_url: String::new(),
+            sauce: None,
         }
     }
 
