@@ -1,15 +1,24 @@
-# pixelview
+# pixel-viewer
 
 A fast, **pixel-art-first** image **browser** for Linux/macOS/Windows, written in
-Rust with [egui/eframe](https://github.com/emilk/egui). Think *Gwenview for pixel
-art and the BBS scene*: crisp nearest-neighbor zoom, palette-preserving decoders,
-a virtualized thumbnail grid, and first-class support for ANSI / PETSCII / RIPscript
-and the rest of the demoscene / textmode art world — right down to baud-rate
-"watch it type" playback and CRT effects.
+Rust with [egui/eframe](https://github.com/emilk/egui). 
+
+> I wrote this to accompany my https://github.com/grymmjack/pixelmon so I could easily see my generated AI art and rate it fast.
+> Needless to say, things got a little...
+
+<img width="3840" height="2096" alt="screenshot" src="https://github.com/user-attachments/assets/47f95af1-ddad-4c74-9aa0-409314aa3eec" />
 
 It decodes everything from PNG and Photoshop files to Commodore PETSCII and EGA
 vector RIPscript, browses inside archives (`.zip`/`.lha`/`.arj`/…), and can mount
 [16colo.rs](https://16colo.rs) — the online ANSI archive — as a virtual folder.
+
+<img width="3839" height="2095" alt="screenshot2" src="https://github.com/user-attachments/assets/fa6acd1c-ff1e-4310-9fb0-dff259b2e94d" />
+<img width="3840" height="2097" alt="screenshot3" src="https://github.com/user-attachments/assets/7999d018-c4a7-42a5-ae9e-0cde3e19cfb6" />
+
+Think *Gwenview for pixel art and the BBS scene*: crisp nearest-neighbor zoom, palette-preserving decoders,
+a virtualized thumbnail grid, and first-class support for ANSI / PETSCII / RIPscript
+and the rest of the demoscene / textmode art world — right down to baud-rate
+"watch it type" playback and CRT effects.
 
 ---
 
