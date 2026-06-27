@@ -155,7 +155,6 @@ struct Rip {
     font: u16,                  // RIP font number: 0 = 8×8 bitmap, 1-10 = BGI stroke
     btn: Btn,                   // current RIP_BUTTON_STYLE (beveled menu panels)
     rip_image: Option<(i32, i32, Vec<u8>)>, // GetImage clipboard: (w, h, palette indices)
-    leak_n: u32,                // diagnostic: count of abandoned (leaking) fills so far
 }
 
 /// RIP button style — the beveled "panel" look BBS menus are built from. Colours and
@@ -196,7 +195,6 @@ impl Rip {
             font: 0,
             btn: Btn::default(),
             rip_image: None,
-            leak_n: 0,
         }
     }
 
@@ -589,13 +587,7 @@ impl Rip {
         if x < 0 || y < 0 || x >= W || y >= H || self.px[(y * W + x) as usize] == border {
             return;
         }
-        let cap = if let Some(c) = std::env::var("RIP_FLOOD_CAP").ok().and_then(|s| s.parse::<usize>().ok()) {
-            c
-        } else if std::env::var_os("RIP_NO_FLOODGUARD").is_some() {
-            (W * H) as usize + 1
-        } else {
-            (W * H / 2) as usize
-        };
+        let cap = (W * H / 2) as usize;
         let mut region: Vec<(i32, i32)> = Vec::new();
         let mut seen = vec![false; (W * H) as usize];
         let mut stack = vec![(x, y)];
@@ -629,32 +621,33 @@ impl Rip {
                     }
                 }
             }
-            if region.len() > cap {
-                if std::env::var_os("RIP_FLOOD_DEBUG").is_some() {
-                    let (mut x0, mut y0, mut x1, mut y1) = (W, H, 0, 0);
-                    for &(px, py) in &region {
-                        x0 = x0.min(px);
-                        y0 = y0.min(py);
-                        x1 = x1.max(px);
-                        y1 = y1.max(py);
-                    }
-                    eprintln!(
-                        "LEAK seed=({x},{y}) fill={} border={border} region={} bbox=({x0},{y0})-({x1},{y1})",
-                        self.fill_color,
-                        region.len()
-                    );
-                    // RIP_FLOOD_PAINT=N: paint *this* leak's region (the Nth, 0-based)
-                    // bright magenta so the saved PNG shows the escape neck visually.
-                    if let Some(want) = std::env::var("RIP_FLOOD_PAINT").ok().and_then(|s| s.parse::<u32>().ok()) {
-                        if want == self.leak_n {
-                            for &(px, py) in &region {
-                                self.px[(py * W + px) as usize] = 13;
-                            }
-                        }
-                    }
-                    self.leak_n += 1;
+        }
+        // **Leak guard (shape-based).** A residual 1px gap in some art still lets a fill
+        // escape. Abandoning *every* big fill (the old `> W*H/2` rule) wrongly blanked
+        // legitimate full-screen backgrounds — the common case. Instead abandon only a big
+        // fill whose region is *topologically complex*: a leak escapes into a finished
+        // scene and must weave around every drawn shape, exploding its perimeter, whereas
+        // a real background is one solid blob. `perimeter²/area` measures exactly that — a
+        // disk≈12.6, a square 16; the 15 legit backgrounds in the test corpus sit at
+        // 16–20 (HOUND, weaving round the dog, at 65), while leaks run 95–2185. The `> 40`
+        // cut clears every solid background with wide margin and still catches the complex
+        // leaks (GARFIELD 112, FIERO 95, PMID1 68, …). Its blind spot: a leak that floods
+        // an *empty* region stays simple and slips through — those few need the outline
+        // gap closed per-file (see the leaker list in project memory).
+        if region.len() > cap {
+            let idx = |px: i32, py: i32| (py * W + px) as usize;
+            let mut perim = 0usize;
+            for &(px, py) in &region {
+                let edge = [(px - 1, py), (px + 1, py), (px, py - 1), (px, py + 1)]
+                    .iter()
+                    .any(|&(a, b)| a < 0 || b < 0 || a >= W || b >= H || !seen[idx(a, b)]);
+                if edge {
+                    perim += 1;
                 }
-                return; // leaked through a gap — leave the outline untouched
+            }
+            let p2_area = (perim as f64) * (perim as f64) / region.len() as f64;
+            if p2_area > 40.0 {
+                return; // complex shape → a leak; leave the outline untouched
             }
         }
         let (fc, bk) = (self.fill_color, self.bkcolor);
@@ -1327,6 +1320,35 @@ mod tests {
     }
 
     #[test]
+    fn shape_guard_keeps_solid_background_drops_leaky_shape() {
+        // The leak guard abandons a big fill only when it's topologically *complex*
+        // (high perimeter²/area — a leak weaving around drawn content), not merely big.
+        // A solid full-canvas background must paint; a fill forced to weave around a dense
+        // grid of obstacles (leak-shaped) must be abandoned.
+        let mut solid = Rip::new();
+        solid.fill_color = 3;
+        solid.flood(320, 175, 15); // nothing is colour 15 → floods the whole canvas
+        assert!(
+            solid.px.iter().filter(|&&p| p == 3).count() > (W * H / 2) as usize,
+            "a big *solid* background fill is allowed"
+        );
+
+        let mut complex = Rip::new();
+        for gy in (5..H - 5).step_by(6) {
+            for gx in (5..W - 5).step_by(6) {
+                complex.px[(gy * W + gx) as usize] = 15; // obstacle dots (= border colour)
+            }
+        }
+        complex.fill_color = 3;
+        complex.flood(320, 175, 15);
+        assert_eq!(
+            complex.px.iter().filter(|&&p| p == 3).count(),
+            0,
+            "a big *high-perimeter* (leak-shaped) fill is abandoned"
+        );
+    }
+
+    #[test]
     fn stroke_text_is_thin_and_solid_regardless_of_line_state() {
         // BGI stroke-font text is always drawn thin + solid: a preceding
         // `LineStyle thick:3` (or a dashed pattern) must not bold/dash the glyphs.
@@ -1426,7 +1448,7 @@ mod tests {
     }
 
     /// Dev harness (ignored): render every `.rip`/`.RIP` in `RIP_DIR` to
-    /// `RIP_OUTDIR/<stem>.png` in one process (fast batch). Honours `RIP_NO_FLOODGUARD`.
+    /// `RIP_OUTDIR/<stem>.png` in one process (fast batch).
     /// Run: `RIP_DIR=dir RIP_OUTDIR=out cargo test rip::tests::dump_dir -- --ignored --nocapture`.
     #[test]
     #[ignore]

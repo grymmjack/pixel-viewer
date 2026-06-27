@@ -476,13 +476,21 @@ most ≤ 4%): the **line** is the BGI *run-slice* line (whole H/V runs via `fill
 (`as i32`, not round) — matching `rip_bezier` exactly is what closed the dragon's body
 outline (20% → 0.15%); **ellipses/arcs** use the midpoint traversal (`ellipse_offsets`)
 and a **circle truncates** the EGA `ASPECT` (only `arc()` rounds) — the 1px that seals
-the dragon's eye (`eye_circle_isolation` guards this). **Flood-fill safety net:** even
-with matched rasterization a residual gap in some complex art can leak, so `flood()`
-*abandons* any fill that escapes past half the canvas — that bounds the worst case to a
-**missing region (line art preserved) rather than a full-screen colour flood**, the
-right failure for a viewer. The cost: a genuinely huge legit background fill (>50%, e.g.
-jdraw/bg-svhnd) is also skipped — a known tradeoff (size can't tell a leak from a big
-fill; a `border:0` coloring-book scene like garfield needs the net). **Patterned fills
+the dragon's eye (`eye_circle_isolation` guards this). **Flood-fill leak guard
+(shape-based, not size-based):** even with matched rasterization a residual 1px gap can
+let a fill escape, so `flood()` abandons a leak rather than flood the screen. But
+abandoning *every* big fill (the old `> W*H/2` rule) wrongly blanked **legitimate
+full-screen backgrounds** — the common case in real BBS art. The fix keys on *shape*: a
+leak escapes into a finished scene and must weave around every drawn shape, exploding its
+**`perimeter²/area`**, whereas a real background is one solid blob (disk≈12.6, square 16).
+`flood()` abandons an over-`W*H/2` region only when `perimeter²/area > 40` — the 15 legit
+backgrounds in the corpus sit at 16–20 (HOUND, weaving round the dog, at 65), leaks run
+95–2185. This **solved the size-guard's "impossible" case**: jdraw's legit 177k-px fill
+(p²/a≈20) now fills (56.9%→0.06% vs reference) while garfield's 170k-px leak (p²/a≈112)
+is still abandoned (line art preserved, 2.55%). Blind spot: a leak that floods an *empty*
+region stays shape-simple and slips through (HOUND's legit bg, conversely, is too complex
+and stays unfilled) — those few need the outline gap closed per-file (leaker list in
+project memory). **Patterned fills
 (two BGI quirks — get both or layered dithered art is wrong):** (1) `fill_poly` borders
 the shape in the draw colour **only when that colour isn't 0** (`if self.color != 0`,
 matching icy_engine + PabloDraw's `FillPoly`/`BGICanvas`) — drawing it unconditionally
@@ -518,12 +526,15 @@ how scenes synthesize textured fills (e.g. paleo XOR-stamps shifted copies of a 
 make a dither, then tiles it: 72%→42% once implemented). **Bézier note:** sample with
 icy's exact float ops (`tf.powf(2.0)`/`powf(3.0)`, *not* `tf*tf`) — the ~1-ULP difference
 flips a truncated (`as i32`) sample at integer boundaries and was leaving a 1-px outline
-gap. **Known limit — the flood guard's blind spot:** the >½-canvas leak guard (`flood`)
-can't be made smarter by size, *proven*: jdraw's legit background fill (177,631 px) is
-*larger* than garfield's leak (169,711 px), so any size threshold that passes jdraw also
-passes garfield's leak. So jdraw renders without its background (56.9% vs ref) and garfield
-keeps its line art (3.4%) — removing the guard nets worse overall (garfield → 69%). icy_parser_core also has ATASCII / Avatar /
-PCBoard / Renegade / Viewdata / IGS / SkyPix.
+gap. **Leak guard — size can't separate, but *shape* can:** a size threshold provably
+fails (jdraw's legit 177,631-px fill is *larger* than garfield's 169,711-px leak, so any
+size cut that passes jdraw passes garfield's leak). The guard instead keys on
+`perimeter²/area` (see the leak-guard note above): jdraw's solid fill (≈20) passes, garfield's
+weaving leak (≈112) is abandoned — so jdraw now fills (0.06% vs ref) *and* garfield keeps its
+line art (2.55%). Remaining blind spot — a leak that floods an *empty* region (PMID1) is
+shape-simple and slips through; a complex *legit* background (HOUND, weaving round the dog,
+≈65) is over the cut and stays unfilled. Those few need the per-file outline-gap fix.
+icy_parser_core also has ATASCII / Avatar / PCBoard / Renegade / Viewdata / IGS / SkyPix.
 
 ## egui version gotcha
 
