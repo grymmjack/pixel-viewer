@@ -482,8 +482,16 @@ mod tests {
         let pieces = fetch_artist_pieces("jed").expect("fetch jed");
         assert!(!pieces.is_empty(), "jed should have pieces");
         let p = &pieces[0];
-        assert!(p.tn_url.starts_with("https://16colo.rs/"), "tn: {}", p.tn_url);
-        assert!(p.raw_url.starts_with("https://16colo.rs/"), "raw: {}", p.raw_url);
+        assert!(
+            p.tn_url.starts_with("https://16colo.rs/"),
+            "tn: {}",
+            p.tn_url
+        );
+        assert!(
+            p.raw_url.starts_with("https://16colo.rs/"),
+            "raw: {}",
+            p.raw_url
+        );
         assert!(!p.pack.is_empty() && p.year >= 1990);
         // The thumbnail URL serves a decodable image (what RemoteThumbs relies on).
         let resp = ureq::get(&p.tn_url).call().expect("tn GET");

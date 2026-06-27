@@ -579,14 +579,17 @@ enum Action {
     NextImage,
     BackToGrid,
     ParentDir,
+    ToggleView,
 }
 
 impl Action {
-    const ALL: [Action; 4] = [
+    // New actions are appended so persisted keymap indices (`to_u8`) stay valid.
+    const ALL: [Action; 5] = [
         Action::PrevImage,
         Action::NextImage,
         Action::BackToGrid,
         Action::ParentDir,
+        Action::ToggleView,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -594,6 +597,7 @@ impl Action {
             Action::NextImage => "Next image",
             Action::BackToGrid => "Back to grid",
             Action::ParentDir => "Parent folder",
+            Action::ToggleView => "Toggle grid / table view",
         }
     }
     fn default_key(self) -> egui::Key {
@@ -602,6 +606,7 @@ impl Action {
             Action::NextImage => egui::Key::ArrowRight,
             Action::BackToGrid => egui::Key::Escape,
             Action::ParentDir => egui::Key::Backspace,
+            Action::ToggleView => egui::Key::T,
         }
     }
     fn to_u8(self) -> u8 {
@@ -5050,15 +5055,44 @@ impl PixelView {
                             ui.allocate_exact_size(egui::vec2(c.w, row_h), egui::Sense::click());
                         ui.painter().rect_filled(rect, 0.0, bg);
                         if i == 0 {
-                            // Thumbnail (or a folder glyph for directory rows).
-                            if entry.is_dir {
+                            // Folders + archives get the folder glyph; archives also get a
+                            // format badge (e.g. ZIP) so they read as distinct + enterable.
+                            // Any other file shows its thumbnail once decoded.
+                            if entry.is_dir || entry.is_archive {
                                 ui.painter().text(
                                     rect.center(),
                                     egui::Align2::CENTER_CENTER,
                                     "📁",
-                                    egui::FontId::proportional(row_h * 0.5),
+                                    egui::FontId::proportional(row_h * 0.46),
                                     fg,
                                 );
+                                if entry.is_archive {
+                                    let fmt = entry
+                                        .path
+                                        .extension()
+                                        .and_then(|e| e.to_str())
+                                        .unwrap_or("")
+                                        .to_ascii_uppercase();
+                                    if !fmt.is_empty() {
+                                        let p = ui.painter_at(rect);
+                                        let galley = p.layout_no_wrap(
+                                            fmt,
+                                            egui::FontId::proportional(8.0),
+                                            egui::Color32::WHITE,
+                                        );
+                                        let pos = egui::pos2(
+                                            rect.center().x - galley.size().x * 0.5,
+                                            rect.bottom() - galley.size().y - 3.0,
+                                        );
+                                        p.rect_filled(
+                                            egui::Rect::from_min_size(pos, galley.size())
+                                                .expand(2.0),
+                                            2.0,
+                                            egui::Color32::from_rgba_unmultiplied(90, 78, 30, 210),
+                                        );
+                                        p.galley(pos, galley, egui::Color32::WHITE);
+                                    }
+                                }
                             } else if let Some(tex) = &tex {
                                 let fit = fit_centered(rect.shrink(4.0), tex.size_vec2());
                                 ui.painter().image(
@@ -6764,7 +6798,8 @@ impl eframe::App for PixelView {
         {
             let back_key = self.key_for(Action::BackToGrid);
             let parent_key = self.key_for(Action::ParentDir);
-            let (rate, esc, back, z_held, zoom_set, zoom_step) = ctx.input(|i| {
+            let view_key = self.key_for(Action::ToggleView);
+            let (rate, esc, back, z_held, zoom_set, zoom_step, toggle_view) = ctx.input(|i| {
                 use egui::Key::*;
                 let z_held = i.key_down(Z); // DRAW-style zoom chord modifier
                 let rate = [
@@ -6803,8 +6838,14 @@ impl eframe::App for PixelView {
                     z_held,
                     zoom_set,
                     zoom_step,
+                    i.key_pressed(view_key),
                 )
             });
+            // Toggle grid/table only in the browse view (in the single view the same
+            // default key 'T' is the tile-mode toggle — they never overlap by mode).
+            if toggle_view && self.mode == Mode::Grid {
+                self.table_view = !self.table_view;
+            }
             // Hold Z in the viewer to set (1..0) or step (±) the image zoom — DRAW
             // style; this suppresses the 1-5/0 star ratings while Z is down.
             if z_held {
@@ -9882,8 +9923,14 @@ mod tests {
         ];
         let mut pieces = HashMap::new();
         pieces.insert(PathBuf::from("c.ans"), piece("zinc", "acid", 1994, "p3"));
-        pieces.insert(PathBuf::from("a.ans"), piece("aja", "blocktronics", 2002, "p1"));
-        pieces.insert(PathBuf::from("b.ans"), piece("mistress", "acid", 1991, "p2"));
+        pieces.insert(
+            PathBuf::from("a.ans"),
+            piece("aja", "blocktronics", 2002, "p1"),
+        );
+        pieces.insert(
+            PathBuf::from("b.ans"),
+            piece("mistress", "acid", 1991, "p2"),
+        );
 
         // Artist ascending: aja, mistress, zinc.
         let v = sorted_filtered_view(
@@ -9910,10 +9957,7 @@ mod tests {
             &HashMap::new(),
             &pieces,
         );
-        let years: Vec<_> = v
-            .iter()
-            .map(|e| pieces[&e.path].year)
-            .collect::<Vec<_>>();
+        let years: Vec<_> = v.iter().map(|e| pieces[&e.path].year).collect::<Vec<_>>();
         assert_eq!(years, vec![2002, 1994, 1991]);
     }
 
