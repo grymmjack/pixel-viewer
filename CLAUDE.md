@@ -224,7 +224,17 @@ columns (filename/artist/type/year/group/pack + a ⬇ download menu) when `colo_
 Sorting routes through the same `sorted_filtered_view`, which now also takes the
 `colo_pieces` map for the scene `SortKey`s (`Artist/Group/Year/Pack` — in `SortKey::ALL`
 for persistence but excluded from `SortKey::COMMON`, the sortbar combo). `Dimensions`
-sorts like `Colors` (unknown-last in both directions).
+sorts like `Colors` (unknown-last in both directions). The toggle is also the rebindable
+`Action::ToggleView` (default **`T`**, browse-mode only so it never clashes with `T` =
+tile in the single view), shown in Preferences → Hotkeys + the Help window. Each cell
+has `cell_pad` breathing room and clips its text to the cell, so columns never touch.
+Columns key off a `ColKind` (not a position), so the **file** layout's optional columns
+are user-toggled via a `TC_*` bitmask (`table_columns`, persisted; Preferences → "Table
+columns") while Name + thumbnail are always shown; archive rows (.zip/…) render the
+folder glyph + a format badge like the grid. In the scene layout the **Pack / Year /
+Group** cells are clickable links into the 16colo browser (`colo_link` deferred →
+`open_folder` of the pack / year / `groups/<group>` path; the link click takes priority
+over the row's open-the-art click).
 
 **16colo.rs flat-piece listings (`ColoSource`, `colo_walk`, `start_colo_pieces`)** —
 Artist / Group / Search no longer list pack *folders*; they stream individual **pieces**

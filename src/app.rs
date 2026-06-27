@@ -35,6 +35,50 @@ const CAPTION_FIELDS: &[(u16, &str)] = &[
     (CAP_COLORS, "Colors"),
     (CAP_DIMENSIONS, "Dimensions"),
 ];
+
+// Table view: which *optional* columns show in the file (local-disk) layout. The
+// thumbnail + Name columns are always shown; the rest are user-toggled (Preferences →
+// "Table columns"). Stored as a u16 bitmask so persistence is a plain integer. (The
+// 16colo scene layout — artist/year/group/pack — is a fixed set, not configurable.)
+const TC_TYPE: u16 = 1 << 0;
+const TC_SIZE: u16 = 1 << 1;
+const TC_DIMENSIONS: u16 = 1 << 2;
+const TC_COLORS: u16 = 1 << 3;
+const TC_RATING: u16 = 1 << 4;
+const TC_MODIFIED: u16 = 1 << 5;
+const TC_CREATED: u16 = 1 << 6;
+const TABLE_COLUMNS: &[(u16, &str)] = &[
+    (TC_TYPE, "Type"),
+    (TC_SIZE, "Size"),
+    (TC_DIMENSIONS, "Dimensions"),
+    (TC_COLORS, "Colors"),
+    (TC_RATING, "Rating"),
+    (TC_MODIFIED, "Modified"),
+    (TC_CREATED, "Created"),
+];
+// Default mirrors the original fixed column set (Created off).
+const TABLE_COLUMNS_DEFAULT: u16 =
+    TC_TYPE | TC_SIZE | TC_DIMENSIONS | TC_COLORS | TC_RATING | TC_MODIFIED;
+
+/// A table column's identity — drives both its content and its sort key. Kept separate
+/// from the on/off bitmask so the render + sort logic key off meaning, not position.
+#[derive(Clone, Copy, PartialEq)]
+enum ColKind {
+    Thumb,
+    Name, // filename in both layouts
+    Type,
+    Size,
+    Dims,
+    Colors,
+    Rating,
+    Modified,
+    Created,
+    Artist, // scene-only
+    Year,
+    Group,
+    Pack,
+    Download,
+}
 const CAP_LINE_H: f32 = 15.0; // height of one caption line, in points
 
 // GPL palette library (palette-swap preview). The default dir is the user's
@@ -808,6 +852,8 @@ pub struct PixelView {
     // Table view (an alternate renderer for the browse/grid mode — `Mode` stays
     // `Grid`, so selection/ratings/nav/keys all work unchanged). Persisted.
     table_view: bool,
+    // Which optional file columns show in the table (bitmask of TC_*). Persisted.
+    table_columns: u16,
     // 16colo.rs flat-piece listing state. `colo_flat` marks the current view as a
     // flattened artist/group/search listing (→ the table shows scene columns). The
     // map carries per-piece metadata keyed by virtual display path (see [`ColoPiece`]).
@@ -884,6 +930,8 @@ impl PixelView {
     const KEYMAP_KEY: &'static str = "keymap";
     /// Whether the browse view renders as a table (vs the thumbnail grid).
     const TABLE_VIEW_KEY: &'static str = "table_view";
+    /// Bitmask of optional table columns shown (TC_*).
+    const TABLE_COLUMNS_KEY: &'static str = "table_columns";
 
     pub fn new(cc: &eframe::CreationContext<'_>, cli: CliArgs) -> Self {
         let registry = Arc::new(Registry::with_builtins());
@@ -942,6 +990,10 @@ impl PixelView {
         let sort_key = SortKey::from_u8(get_u8(Self::SORT_KEY).unwrap_or(0));
         let sort_desc = get_bool(Self::SORT_DESC).unwrap_or(false);
         let table_view = get_bool(Self::TABLE_VIEW_KEY).unwrap_or(false);
+        let table_columns = cc
+            .storage
+            .and_then(|s| eframe::get_value::<u16>(s, Self::TABLE_COLUMNS_KEY))
+            .unwrap_or(TABLE_COLUMNS_DEFAULT);
         let dirs_first = get_bool(Self::DIRS_FIRST).unwrap_or(true);
         let min_rating = get_u8(Self::MIN_RATING).unwrap_or(0);
         let show_explorer = get_bool(Self::EXPLORER_KEY).unwrap_or(false);
@@ -1267,6 +1319,7 @@ impl PixelView {
             ui_zoom,
             thumb_size,
             table_view,
+            table_columns,
             colo_flat: false,
             colo_pieces: HashMap::new(),
             colo_rx: None,
@@ -4767,138 +4820,162 @@ impl PixelView {
         }
         let scene = self.colo_flat;
         let row_h = 46.0_f32;
+        let cell_pad = 12.0_f32; // horizontal breathing room inside every cell
 
         // Column set + widths. The name/filename (and scene artist) columns flex to
         // absorb leftover width so the table always spans the panel; the rest are fixed.
         struct Col {
+            kind: ColKind,
             label: &'static str,
             sort: Option<SortKey>,
             w: f32,
             flex: bool,
             num: bool, // right-align (numeric / short value columns)
         }
-        let thumb_w = row_h; // a square thumbnail cell
-        let dl_col = 7usize; // index of the scene download column (last)
-        let rating_col = 6usize; // index of the file rating column
-        let mut cols: Vec<Col> = if scene {
-            vec![
-                Col {
-                    label: "",
-                    sort: None,
-                    w: thumb_w,
-                    flex: false,
-                    num: false,
-                },
-                Col {
-                    label: "Filename",
-                    sort: Some(SortKey::Name),
-                    w: 0.0,
-                    flex: true,
-                    num: false,
-                },
-                Col {
-                    label: "Artist",
-                    sort: Some(SortKey::Artist),
-                    w: 0.0,
-                    flex: true,
-                    num: false,
-                },
-                Col {
-                    label: "Type",
-                    sort: Some(SortKey::Type),
-                    w: 56.0,
-                    flex: false,
-                    num: false,
-                },
-                Col {
-                    label: "Year",
-                    sort: Some(SortKey::Year),
-                    w: 52.0,
-                    flex: false,
-                    num: true,
-                },
-                Col {
-                    label: "Group",
-                    sort: Some(SortKey::Group),
-                    w: 130.0,
-                    flex: false,
-                    num: false,
-                },
-                Col {
-                    label: "Pack",
-                    sort: Some(SortKey::Pack),
-                    w: 130.0,
-                    flex: false,
-                    num: false,
-                },
-                Col {
-                    label: "",
-                    sort: None,
-                    w: 96.0,
-                    flex: false,
-                    num: false,
-                },
-            ]
-        } else {
-            vec![
-                Col {
-                    label: "",
-                    sort: None,
-                    w: thumb_w,
-                    flex: false,
-                    num: false,
-                },
-                Col {
-                    label: "Name",
-                    sort: Some(SortKey::Name),
-                    w: 0.0,
-                    flex: true,
-                    num: false,
-                },
-                Col {
-                    label: "Type",
-                    sort: Some(SortKey::Type),
-                    w: 64.0,
-                    flex: false,
-                    num: false,
-                },
-                Col {
-                    label: "Size",
-                    sort: Some(SortKey::Size),
-                    w: 84.0,
-                    flex: false,
-                    num: true,
-                },
-                Col {
-                    label: "Dimensions",
-                    sort: Some(SortKey::Dimensions),
-                    w: 96.0,
-                    flex: false,
-                    num: true,
-                },
-                Col {
-                    label: "Colors",
-                    sort: Some(SortKey::Colors),
-                    w: 68.0,
-                    flex: false,
-                    num: true,
-                },
-                Col {
-                    label: "Rating",
-                    sort: Some(SortKey::Rating),
-                    w: 72.0,
-                    flex: false,
-                    num: false,
-                },
-                Col {
-                    label: "Modified",
-                    sort: Some(SortKey::Modified),
-                    w: 110.0,
-                    flex: false,
-                    num: false,
-                },
-            ]
+        let col = |kind, label, sort, w, flex, num| Col {
+            kind,
+            label,
+            sort,
+            w,
+            flex,
+            num,
         };
+        let thumb_w = row_h; // a square thumbnail cell
+        let mut cols: Vec<Col> = Vec::new();
+        cols.push(col(ColKind::Thumb, "", None, thumb_w, false, false));
+        if scene {
+            // 16colo flat-piece layout — a fixed set (the requested columns).
+            cols.push(col(
+                ColKind::Name,
+                "Filename",
+                Some(SortKey::Name),
+                0.0,
+                true,
+                false,
+            ));
+            cols.push(col(
+                ColKind::Artist,
+                "Artist",
+                Some(SortKey::Artist),
+                0.0,
+                true,
+                false,
+            ));
+            cols.push(col(
+                ColKind::Type,
+                "Type",
+                Some(SortKey::Type),
+                56.0,
+                false,
+                false,
+            ));
+            cols.push(col(
+                ColKind::Year,
+                "Year",
+                Some(SortKey::Year),
+                52.0,
+                false,
+                true,
+            ));
+            cols.push(col(
+                ColKind::Group,
+                "Group",
+                Some(SortKey::Group),
+                130.0,
+                false,
+                false,
+            ));
+            cols.push(col(
+                ColKind::Pack,
+                "Pack",
+                Some(SortKey::Pack),
+                130.0,
+                false,
+                false,
+            ));
+            cols.push(col(ColKind::Download, "", None, 96.0, false, false));
+        } else {
+            // File layout — Name is always shown; the rest are user-toggled (TC_* mask).
+            cols.push(col(
+                ColKind::Name,
+                "Name",
+                Some(SortKey::Name),
+                0.0,
+                true,
+                false,
+            ));
+            let tc = self.table_columns;
+            if tc & TC_TYPE != 0 {
+                cols.push(col(
+                    ColKind::Type,
+                    "Type",
+                    Some(SortKey::Type),
+                    64.0,
+                    false,
+                    false,
+                ));
+            }
+            if tc & TC_SIZE != 0 {
+                cols.push(col(
+                    ColKind::Size,
+                    "Size",
+                    Some(SortKey::Size),
+                    84.0,
+                    false,
+                    true,
+                ));
+            }
+            if tc & TC_DIMENSIONS != 0 {
+                cols.push(col(
+                    ColKind::Dims,
+                    "Dimensions",
+                    Some(SortKey::Dimensions),
+                    96.0,
+                    false,
+                    true,
+                ));
+            }
+            if tc & TC_COLORS != 0 {
+                cols.push(col(
+                    ColKind::Colors,
+                    "Colors",
+                    Some(SortKey::Colors),
+                    68.0,
+                    false,
+                    true,
+                ));
+            }
+            if tc & TC_RATING != 0 {
+                cols.push(col(
+                    ColKind::Rating,
+                    "Rating",
+                    Some(SortKey::Rating),
+                    72.0,
+                    false,
+                    false,
+                ));
+            }
+            if tc & TC_MODIFIED != 0 {
+                cols.push(col(
+                    ColKind::Modified,
+                    "Modified",
+                    Some(SortKey::Modified),
+                    110.0,
+                    false,
+                    false,
+                ));
+            }
+            if tc & TC_CREATED != 0 {
+                cols.push(col(
+                    ColKind::Created,
+                    "Created",
+                    Some(SortKey::Created),
+                    110.0,
+                    false,
+                    false,
+                ));
+            }
+        }
         let bar = ui.spacing().scroll.bar_width + 2.0;
         let avail = (ui.available_width() - bar).max(200.0);
         let fixed: f32 = cols.iter().filter(|c| !c.flex).map(|c| c.w).sum();
@@ -4916,6 +4993,7 @@ impl PixelView {
         let mut pin_dir: Option<usize> = None;
         let mut smart_on: Option<(usize, SmartCriterion)> = None;
         let mut dl: Option<(usize, bool)> = None; // (idx, want_pack)
+        let mut colo_link: Option<(usize, ColKind)> = None; // pack/year/group link click
         let can_paste = self.clipboard.is_some();
         let (sort_key, sort_desc) = (self.sort_key, self.sort_desc);
 
@@ -4952,15 +5030,18 @@ impl PixelView {
                     let (anchor, pos) = if c.num {
                         (
                             egui::Align2::RIGHT_CENTER,
-                            rect.right_center() - egui::vec2(6.0, 0.0),
+                            rect.right_center() - egui::vec2(cell_pad, 0.0),
                         )
                     } else {
                         (
                             egui::Align2::LEFT_CENTER,
-                            rect.left_center() + egui::vec2(6.0, 0.0),
+                            rect.left_center() + egui::vec2(cell_pad, 0.0),
                         )
                     };
-                    ui.painter().text(
+                    let p = ui
+                        .painter()
+                        .with_clip_rect(rect.shrink2(egui::vec2(cell_pad * 0.5, 0.0)));
+                    p.text(
                         pos,
                         anchor,
                         format!("{}{arrow}", c.label),
@@ -5027,9 +5108,9 @@ impl PixelView {
                 let mut row_resp: Option<egui::Response> = None;
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    for (i, c) in cols.iter().enumerate() {
+                    for c in cols.iter() {
                         // The scene download column is an interactive menu, not a cell.
-                        if scene && i == dl_col && !entry.is_dir {
+                        if c.kind == ColKind::Download && !entry.is_dir {
                             ui.allocate_ui_with_layout(
                                 egui::vec2(c.w, row_h),
                                 egui::Layout::left_to_right(egui::Align::Center),
@@ -5054,7 +5135,7 @@ impl PixelView {
                         let (rect, resp) =
                             ui.allocate_exact_size(egui::vec2(c.w, row_h), egui::Sense::click());
                         ui.painter().rect_filled(rect, 0.0, bg);
-                        if i == 0 {
+                        if c.kind == ColKind::Thumb {
                             // Folders + archives get the folder glyph; archives also get a
                             // format badge (e.g. ZIP) so they read as distinct + enterable.
                             // Any other file shows its thumbnail once decoded.
@@ -5105,7 +5186,7 @@ impl PixelView {
                                     egui::Color32::WHITE,
                                 );
                             }
-                        } else if !scene && i == rating_col {
+                        } else if c.kind == ColKind::Rating {
                             if entry.rating > 0 {
                                 ui.painter().text(
                                     rect.left_center() + egui::vec2(6.0, 0.0),
@@ -5116,27 +5197,59 @@ impl PixelView {
                                 );
                             }
                         } else {
-                            let txt = table_cell_text(&entry, meta, piece.as_ref(), scene, i);
+                            let txt = table_cell_text(&entry, meta, piece.as_ref(), c.kind);
                             if !txt.is_empty() {
-                                let max_chars = ((c.w - 10.0) / 6.5).max(1.0) as usize;
-                                let (anchor, pos) = if c.num {
-                                    (
-                                        egui::Align2::RIGHT_CENTER,
-                                        rect.right_center() - egui::vec2(6.0, 0.0),
-                                    )
+                                // Pack / Year / Group are clickable links into the 16colo
+                                // browser (tinted + underlined on hover).
+                                let linkable = matches!(
+                                    c.kind,
+                                    ColKind::Pack | ColKind::Year | ColKind::Group
+                                ) && piece.is_some();
+                                let hot = linkable && resp.hovered();
+                                let col = if hot {
+                                    egui::Color32::from_rgb(120, 180, 255)
+                                } else if linkable {
+                                    egui::Color32::from_rgb(95, 155, 235)
                                 } else {
-                                    (
-                                        egui::Align2::LEFT_CENTER,
-                                        rect.left_center() + egui::vec2(6.0, 0.0),
-                                    )
+                                    fg
                                 };
-                                ui.painter().text(
-                                    pos,
-                                    anchor,
+                                // Budget chars to the *padded* inner width with a
+                                // conservative px/char so a proportional glyph string
+                                // can't overrun into the next column.
+                                let inner = (c.w - cell_pad * 2.0).max(8.0);
+                                let max_chars = (inner / 7.0).max(1.0) as usize;
+                                let galley = ui.painter().layout_no_wrap(
                                     elide(&txt, max_chars),
                                     egui::FontId::proportional(12.5),
-                                    fg,
+                                    col,
                                 );
+                                let y = rect.center().y - galley.size().y * 0.5;
+                                let tp = if c.num {
+                                    egui::pos2(rect.right() - cell_pad - galley.size().x, y)
+                                } else {
+                                    egui::pos2(rect.left() + cell_pad, y)
+                                };
+                                // Clip to the cell so text can never touch the neighbour,
+                                // even if an estimate is slightly off.
+                                let p = ui
+                                    .painter()
+                                    .with_clip_rect(rect.shrink2(egui::vec2(cell_pad * 0.5, 0.0)));
+                                if hot {
+                                    let uy = tp.y + galley.size().y - 1.0;
+                                    p.line_segment(
+                                        [
+                                            egui::pos2(tp.x, uy),
+                                            egui::pos2(tp.x + galley.size().x, uy),
+                                        ],
+                                        egui::Stroke::new(1.0, col),
+                                    );
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                p.galley(tp, galley, col);
+                                // A click on a link cell navigates instead of opening the art.
+                                if linkable && resp.clicked() {
+                                    colo_link = Some((idx, c.kind));
+                                }
                             }
                         }
                         row_resp = Some(match row_resp.take() {
@@ -5183,7 +5296,24 @@ impl PixelView {
             }
             self.rebuild_view();
         }
-        if let Some((idx, mods)) = clicked {
+        // A pack/year/group link click navigates the 16colo browser; it takes priority
+        // over the row's open-the-art click (the link cell is part of the row response).
+        if let Some((idx, kind)) = colo_link {
+            let dest = self.entries.get(idx).map(|e| e.path.clone()).and_then(|p| {
+                self.colo_pieces.get(&p).map(|pc| {
+                    let root = Path::new(crate::sixteen::ROOT);
+                    match kind {
+                        ColKind::Pack => root.join(pc.year.to_string()).join(&pc.pack),
+                        ColKind::Year => root.join(pc.year.to_string()),
+                        ColKind::Group => root.join(crate::sixteen::GROUPS).join(&pc.group),
+                        _ => root.to_path_buf(),
+                    }
+                })
+            });
+            if let Some(dest) = dest {
+                self.open_folder(dest);
+            }
+        } else if let Some((idx, mods)) = clicked {
             self.handle_click(ctx, idx, mods);
         }
         if let Some((idx, a)) = ctx_action {
@@ -7191,6 +7321,23 @@ impl eframe::App for PixelView {
                     self.caption_fields = fields;
 
                     ui.add_space(10.0);
+                    ui.label("Table columns (file view)");
+                    let mut tcols = self.table_columns;
+                    ui.horizontal_wrapped(|ui| {
+                        for &(mask, label) in TABLE_COLUMNS {
+                            let mut on = tcols & mask != 0;
+                            if ui.checkbox(&mut on, label).changed() {
+                                if on {
+                                    tcols |= mask;
+                                } else {
+                                    tcols &= !mask;
+                                }
+                            }
+                        }
+                    });
+                    self.table_columns = tcols;
+
+                    ui.add_space(10.0);
                     ui.label("Hotkeys");
                     let mut new_rebind: Option<Option<Action>> = None;
                     egui::Grid::new("prefs_keys")
@@ -7294,6 +7441,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::SORT_KEY, &self.sort_key.to_u8());
         eframe::set_value(storage, Self::SORT_DESC, &self.sort_desc);
         eframe::set_value(storage, Self::TABLE_VIEW_KEY, &self.table_view);
+        eframe::set_value(storage, Self::TABLE_COLUMNS_KEY, &self.table_columns);
         eframe::set_value(storage, Self::DIRS_FIRST, &self.dirs_first);
         eframe::set_value(storage, Self::MIN_RATING, &self.min_rating);
         eframe::set_value(storage, Self::EXPLORER_KEY, &self.show_explorer);
@@ -8914,54 +9062,41 @@ fn entry_context_menu(
     pick
 }
 
-/// The text shown in table column `col` for `entry` (column 0 = thumbnail and the
-/// rating column are painted by the caller, so they're not produced here).
+/// The text shown in a table cell of kind `kind` for `entry` (the thumbnail, rating,
+/// and download cells are painted/handled by the caller, so they produce nothing here).
 fn table_cell_text(
     entry: &Entry,
     meta: Option<ImgMeta>,
     piece: Option<&ColoPiece>,
-    scene: bool,
-    col: usize,
+    kind: ColKind,
 ) -> String {
-    let fname = || {
-        entry
+    match kind {
+        ColKind::Name => entry
             .path
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("")
-            .to_string()
-    };
-    let ext = || {
-        entry
+            .to_string(),
+        ColKind::Type => entry
             .path
             .extension()
             .and_then(|s| s.to_str())
             .map(|s| s.to_ascii_uppercase())
-            .unwrap_or_default()
-    };
-    if scene {
-        match col {
-            1 => fname(),
-            2 => piece.map(|p| p.artist.clone()).unwrap_or_default(),
-            3 => ext(),
-            4 => piece.map(|p| p.year.to_string()).unwrap_or_default(),
-            5 => piece.map(|p| p.group.clone()).unwrap_or_default(),
-            6 => piece.map(|p| p.pack.clone()).unwrap_or_default(),
-            _ => String::new(),
-        }
-    } else {
-        match col {
-            1 => fname(),
-            2 => ext(),
-            3 => human_size(entry.size),
-            4 => meta.map(|m| format!("{}×{}", m.w, m.h)).unwrap_or_default(),
-            5 => meta
-                .and_then(|m| m.colors)
-                .map(|c| c.to_string())
-                .unwrap_or_default(),
-            7 => entry.mtime.map(date_ymd).unwrap_or_default(),
-            _ => String::new(),
-        }
+            .unwrap_or_default(),
+        ColKind::Size => human_size(entry.size),
+        ColKind::Dims => meta.map(|m| format!("{}×{}", m.w, m.h)).unwrap_or_default(),
+        ColKind::Colors => meta
+            .and_then(|m| m.colors)
+            .map(|c| c.to_string())
+            .unwrap_or_default(),
+        ColKind::Modified => entry.mtime.map(date_ymd).unwrap_or_default(),
+        ColKind::Created => entry.ctime.map(date_ymd).unwrap_or_default(),
+        ColKind::Artist => piece.map(|p| p.artist.clone()).unwrap_or_default(),
+        ColKind::Year => piece.map(|p| p.year.to_string()).unwrap_or_default(),
+        ColKind::Group => piece.map(|p| p.group.clone()).unwrap_or_default(),
+        ColKind::Pack => piece.map(|p| p.pack.clone()).unwrap_or_default(),
+        // Painted/handled by the caller, not text:
+        ColKind::Thumb | ColKind::Rating | ColKind::Download => String::new(),
     }
 }
 
@@ -9966,22 +10101,31 @@ mod tests {
         let e = img_entry("MIDNACD3.ANS", 2048, 3);
         let p = piece("jed", "acid", 1992, "acdu0892");
         // Scene columns: filename / artist / type / year / group / pack.
-        assert_eq!(table_cell_text(&e, None, Some(&p), true, 1), "MIDNACD3.ANS");
-        assert_eq!(table_cell_text(&e, None, Some(&p), true, 2), "jed");
-        assert_eq!(table_cell_text(&e, None, Some(&p), true, 3), "ANS");
-        assert_eq!(table_cell_text(&e, None, Some(&p), true, 4), "1992");
-        assert_eq!(table_cell_text(&e, None, Some(&p), true, 5), "acid");
-        assert_eq!(table_cell_text(&e, None, Some(&p), true, 6), "acdu0892");
-        // File columns: name / type / size (dims/colors need ImgMeta; rating is painted).
+        assert_eq!(
+            table_cell_text(&e, None, Some(&p), ColKind::Name),
+            "MIDNACD3.ANS"
+        );
+        assert_eq!(table_cell_text(&e, None, Some(&p), ColKind::Artist), "jed");
+        assert_eq!(table_cell_text(&e, None, Some(&p), ColKind::Type), "ANS");
+        assert_eq!(table_cell_text(&e, None, Some(&p), ColKind::Year), "1992");
+        assert_eq!(table_cell_text(&e, None, Some(&p), ColKind::Group), "acid");
+        assert_eq!(
+            table_cell_text(&e, None, Some(&p), ColKind::Pack),
+            "acdu0892"
+        );
+        // File columns: name / type / size / dims / colors.
         let meta = Some(ImgMeta {
             w: 320,
             h: 200,
             colors: Some(16),
         });
-        assert_eq!(table_cell_text(&e, meta, None, false, 1), "MIDNACD3.ANS");
-        assert_eq!(table_cell_text(&e, meta, None, false, 2), "ANS");
-        assert_eq!(table_cell_text(&e, meta, None, false, 4), "320×200");
-        assert_eq!(table_cell_text(&e, meta, None, false, 5), "16");
+        assert_eq!(
+            table_cell_text(&e, meta, None, ColKind::Name),
+            "MIDNACD3.ANS"
+        );
+        assert_eq!(table_cell_text(&e, meta, None, ColKind::Type), "ANS");
+        assert_eq!(table_cell_text(&e, meta, None, ColKind::Dims), "320×200");
+        assert_eq!(table_cell_text(&e, meta, None, ColKind::Colors), "16");
     }
 
     #[test]
