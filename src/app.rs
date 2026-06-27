@@ -9083,7 +9083,14 @@ fn table_cell_text(
             .and_then(|s| s.to_str())
             .map(|s| s.to_ascii_uppercase())
             .unwrap_or_default(),
-        ColKind::Size => human_size(entry.size),
+        // Hide a 0-byte size (folders, virtual dirs) — "0 B" reads as noise.
+        ColKind::Size => {
+            if entry.size == 0 {
+                String::new()
+            } else {
+                human_size(entry.size)
+            }
+        }
         ColKind::Dims => meta.map(|m| format!("{}×{}", m.w, m.h)).unwrap_or_default(),
         ColKind::Colors => meta
             .and_then(|m| m.colors)
@@ -10126,6 +10133,10 @@ mod tests {
         assert_eq!(table_cell_text(&e, meta, None, ColKind::Type), "ANS");
         assert_eq!(table_cell_text(&e, meta, None, ColKind::Dims), "320×200");
         assert_eq!(table_cell_text(&e, meta, None, ColKind::Colors), "16");
+        // A 0-byte entry (folder / virtual dir) hides its size instead of "0 B".
+        let zero = img_entry("dir", 0, 0);
+        assert_eq!(table_cell_text(&zero, None, None, ColKind::Size), "");
+        assert!(!table_cell_text(&e, None, None, ColKind::Size).is_empty());
     }
 
     #[test]
