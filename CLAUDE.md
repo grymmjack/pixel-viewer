@@ -500,6 +500,13 @@ fonts in `rip_chr.rs` — the `.CHR` glyphs are stroke lists we render with the 
 PabloDraw's `OutTextXY`): a preceding `LineStyle thick:3` (common right before a title)
 would otherwise bold every glyph stroke into a doubled "shadow" (P1-WNC2's "Wind Ninja
 Chronicles" block; the fix also cut shadow 1.1%→0.07%, garfield 3.5%→2.6% vs reference).
+**Vertical text** (`FontStyle direction:1`) stacks glyphs **top-to-bottom in a column**:
+`rip_chr::draw` advances the pen along the text axis (x rightward for horizontal, *y
+downward* for vertical) with the cross-axis fixed, and rotates each glyph (`nx = ox +
+st.y`, `ny = oy + st.x`). Advancing `pen_x` for *both* directions was the bug that laid
+vertical labels out as overlapping rotated glyphs in a row (MAIN/MSG's left-margin "The
+Far Side BBS" + "USA"). NB the downward advance is PabloDraw's RIP convention — icy's BGI
+`out_text_xy` goes bottom-to-top; we match Pablo (the reference these were diffed against).
 **Buttons:** RIP_BUTTON_STYLE/RIP_BUTTON draw the beveled/recessed/chiseled
 panels BBS *menus* are built from (`Btn` + `draw_button`/`button_label`, ported from
 icy_engine's `add_button`) — so menu screens render (msg5 ≈ 1.5% vs reference); only the

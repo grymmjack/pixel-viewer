@@ -1393,6 +1393,50 @@ mod tests {
         eprintln!("wrote {out}");
     }
 
+    /// Dev harness (ignored): render every `.rip`/`.RIP` in `RIP_DIR` to
+    /// `RIP_OUTDIR/<stem>.png` in one process (fast batch). Honours `RIP_NO_FLOODGUARD`.
+    /// Run: `RIP_DIR=dir RIP_OUTDIR=out cargo test rip::tests::dump_dir -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dump_dir() {
+        let dir = std::env::var("RIP_DIR").expect("set RIP_DIR");
+        let outdir = std::env::var("RIP_OUTDIR").unwrap_or_else(|_| "/tmp/rip_corpus".into());
+        std::fs::create_dir_all(&outdir).unwrap();
+        let mut entries: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        entries.sort_by_key(|e| e.path());
+        for ent in entries {
+            let p = ent.path();
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !ext.eq_ignore_ascii_case("rip") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&p) else {
+                continue;
+            };
+            let Ok(img) = RipDecoder.decode(&bytes) else {
+                eprintln!("FAILED {:?}", p.file_name().unwrap());
+                continue;
+            };
+            use image::ImageEncoder;
+            let mut buf = Vec::new();
+            let mut rgba = Vec::with_capacity((img.width * img.height * 4) as usize);
+            for px in &img.pixels {
+                rgba.extend_from_slice(px);
+            }
+            image::codecs::png::PngEncoder::new(&mut buf)
+                .write_image(
+                    &rgba,
+                    img.width,
+                    img.height,
+                    image::ExtendedColorType::Rgba8,
+                )
+                .unwrap();
+            let stem = p.file_stem().unwrap().to_str().unwrap();
+            std::fs::write(format!("{outdir}/{stem}.png"), buf).unwrap();
+        }
+        eprintln!("wrote corpus to {outdir}");
+    }
+
     /// Dev harness (ignored): render every `.rip` in icy_engine's reference dir to
     /// `/tmp/rip_out/<stem>.png` so they can be AE-pixel-diffed against icy's golden
     /// PNGs. Hardcoded paths point at the icy_tools cargo-git checkout on this box.

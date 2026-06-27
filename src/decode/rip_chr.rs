@@ -140,18 +140,27 @@ impl ChrFont {
         let (up, down) = (UP[size], DOWN[size]);
         let sc = |v: i32| v * up / down;
         let height = sc(self.height);
-        let mut pen_x = x;
+        let vertical = dir == 1;
+        // The pen advances **along the text axis**: x rightward for horizontal text, y
+        // *downward* for vertical — so a vertical label stacks top-to-bottom from its
+        // origin (PabloDraw's RIP convention: MAIN/MSG's "The Far Side BBS" starts at the
+        // top and reads down). The cross-axis (the passed `x` for vertical, `y` for
+        // horizontal) stays fixed so the glyphs form a column. Advancing `pen_x`
+        // regardless of direction was the bug that laid vertical text out as overlapping
+        // rotated glyphs in a row.
+        let mut pen = if vertical { y } else { x };
         for ch in s.bytes() {
             let Some(Some(g)) = self.glyphs.get(ch as usize) else {
-                pen_x += sc(8); // unknown glyph → advance a nominal cell
+                pen += sc(8); // unknown glyph → advance a nominal cell
                 continue;
             };
-            let (mut cx, mut cy) = (pen_x, y);
+            let (ox, oy) = if vertical { (x, pen) } else { (pen, y) };
+            let (mut cx, mut cy) = (ox, oy);
             for st in &g.strokes {
-                let (nx, ny) = if dir == 1 {
-                    (pen_x + height - sc(st.y), y - sc(st.x))
+                let (nx, ny) = if vertical {
+                    (ox + sc(st.y), oy + sc(st.x))
                 } else {
-                    (pen_x + sc(st.x), y + height - sc(st.y))
+                    (ox + sc(st.x), oy + height - sc(st.y))
                 };
                 if st.line {
                     emit(cx, cy, nx, ny);
@@ -159,9 +168,14 @@ impl ChrFont {
                 cx = nx;
                 cy = ny;
             }
-            pen_x += sc(g.width);
+            pen += sc(g.width);
         }
-        pen_x
+        // Callers treat the return as the advanced x; vertical text leaves x fixed.
+        if vertical {
+            x
+        } else {
+            pen
+        }
     }
 }
 
@@ -214,5 +228,35 @@ mod tests {
             .unwrap()
             .draw("A", 0, 50, 0, 4, &mut |_, _, _, _| n += 1);
         assert!(n > 0, "drawing 'A' emits line segments");
+    }
+
+    #[test]
+    fn vertical_text_stacks_into_a_column() {
+        // Direction 1 (vertical) must stack glyphs top-to-bottom in a column, not lay
+        // them out in a horizontal row. Regression for MAIN/MSG's "The Far Side BBS":
+        // the advance used to go along x for both directions, so vertical text came out
+        // wider than tall. A 2-char string is wide-and-short horizontally, tall-and-
+        // narrow vertically.
+        let f = font(1).unwrap();
+        let span = |dir: u16| {
+            let mut segs: Vec<(i32, i32, i32, i32)> = Vec::new();
+            f.draw("AB", 100, 100, dir, 4, &mut |a, b, c, d| {
+                segs.push((a, b, c, d))
+            });
+            let xs: Vec<i32> = segs.iter().flat_map(|s| [s.0, s.2]).collect();
+            let ys: Vec<i32> = segs.iter().flat_map(|s| [s.1, s.3]).collect();
+            assert!(!segs.is_empty());
+            (
+                xs.iter().max().unwrap() - xs.iter().min().unwrap(),
+                ys.iter().max().unwrap() - ys.iter().min().unwrap(),
+            )
+        };
+        let (hx, hy) = span(0);
+        let (vx, vy) = span(1);
+        assert!(
+            hx > hy,
+            "horizontal 'AB' is wider than tall (got {hx}x{hy})"
+        );
+        assert!(vy > vx, "vertical 'AB' is taller than wide (got {vx}x{vy})");
     }
 }
