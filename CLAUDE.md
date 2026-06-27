@@ -10,7 +10,8 @@ Features: folder navigation (breadcrumbs, drag-reorderable favorites, a left
 activity rail, an explorer dock with an expandable folder tree + filter, and a
 live details dock with a fit thumbnail + palette swatches + `.GPL` export), a
 virtualized thumbnail grid with independent Ctrl+wheel sizing and configurable
-per-tile captions, a nearest-neighbor zoom view (persistent zoom), per-image
+per-tile captions **or a sortable table view** (Grid/Table toggle in the sortbar +
+View menu, persisted; click a header to sort), a nearest-neighbor zoom view (persistent zoom), per-image
 metadata + hover details, multi-select, star ratings stored as KDE Baloo xattrs,
 recursive folder montages + count badges, sort/filter, filename search (`/`),
 file operations (copy/cut/paste, new folder, rename, trash + Ctrl+Z undo via the
@@ -29,8 +30,11 @@ SAUCE-driven hints, shown in the Details pane.
 **Animated GIFs** play (autoplay + seek in the viewer,
 hover-to-play in the grid). Archives (`.zip`/`.lha`/`.arj`/…) and **16colo.rs** (the
 online ANSI archive: a Places entry with a nav bar — Years / Latest / Groups / Artists
-+ a server-side `?filter=` Search across artists+groups — → Packs → auto-downloaded
-pack art) are browsable as virtual folders. Keys: 1–5/0 rate, Esc→grid, Backspace→up — the nav keys
++ a server-side `?filter=` Search) are browsable as virtual folders. A **Year** lists
+Packs (→ auto-downloaded pack art); **Artist / Group / Search** instead flatten to a
+**sortable table of individual pieces** (thumb · filename · artist · type · year · group ·
+pack + a per-row "download file / pack" menu), fetched from the JSON API with no pack
+download — opening a piece grabs just its single `raw` file. Keys: 1–5/0 rate, Esc→grid, Backspace→up — the nav keys
 are rebindable (Preferences → Hotkeys); in the viewer, Ctrl+wheel or hold-Z + 1-9/0
 zooms (Snap locks to 100% steps).
 
@@ -45,6 +49,8 @@ src/
                      settings persistence, sort/filter, ratings, CLI parsing
   image_types.rs     PixImage (RGBA + optional indexed/palette)
   thumb.rs           worker pool: thumbnails + image metadata (dims, color count)
+  colo_thumb.rs      RemoteThumbs: HTTP worker pool fetching 16colo.rs `tn` PNGs
+                     (mirrors ThumbBuilder; results uploaded to thumb_tex by path)
   rating.rs          read/write star ratings via the user.baloo.rating xattr
   ratings.rs         cross-platform ratings sidecar (ratings.json) for virtual art
   anim.rs            decode animated GIF frames + per-frame delays
@@ -204,6 +210,38 @@ deferred → `favorites.push`). File tiles get a **🔍 Smart filter on…** sub
 size=±20% KB, Date=its mtime day, Rating=its stars+ (shown only when rated), SAUCE
 group/artist=its SAUCE field (shown only for `is_textmode_ext`). Both are deferred
 `pin_dir`/`smart_on` locals applied after the tile closure.
+
+**Table view (`ui_table`, `table_view` bool, persisted)** — an *alternate renderer*
+for the browse mode, **not a third `Mode`**: `Mode` stays `Grid` and the central panel
+picks `ui_table` vs `ui_grid` by `self.table_view`, so selection (`PathBuf`-keyed),
+ratings, keyboard nav, and context menus (`entry_context_menu`, shared with the grid)
+all keep working unchanged. Hand-rolled (no `egui_extras`) on the same virtualized
+`ScrollArea::show_rows` the grid uses: a fixed-width header row above the body (click a
+header → set `SortKey`, click again → reverse), then one row per `Entry` laid out cell
+by cell with `item_spacing = 0` so header/body columns align. Two column sets: **file**
+columns (name/type/size/dims/colors/rating/modified) for any folder, and **scene**
+columns (filename/artist/type/year/group/pack + a ⬇ download menu) when `colo_flat`.
+Sorting routes through the same `sorted_filtered_view`, which now also takes the
+`colo_pieces` map for the scene `SortKey`s (`Artist/Group/Year/Pack` — in `SortKey::ALL`
+for persistence but excluded from `SortKey::COMMON`, the sortbar combo). `Dimensions`
+sorts like `Colors` (unknown-last in both directions).
+
+**16colo.rs flat-piece listings (`ColoSource`, `colo_walk`, `start_colo_pieces`)** —
+Artist / Group / Search no longer list pack *folders*; they stream individual **pieces**
+into the table (the requested flat view), keyed by virtual path `<16colo.rs>/<year>/
+<pack>/<FILE>`. `colo_walk` (a background thread mirroring `search_walk`: `colo_rx` +
+`AtomicBool` cancel) emits `ColoMsg::Hit(Entry, ColoPiece)` then `Done(n)`; `poll_colo_pieces`
+drains them, resolves each rating, appends to `all_entries` + the `colo_pieces` map, and
+re-sorts. Pieces come from the JSON API with **no pack download**: an artist = one call
+(`fetch_artist_pieces`), a group = per-pack (`fetch_group_pack_refs` → `fetch_pack_pieces`),
+a search = matched artists + groups (capped). Thumbnails are 16colo's pre-rendered `tn`
+PNGs fetched by the `RemoteThumbs` HTTP pool (`colo_thumb.rs`) and uploaded to `thumb_tex`
+by virtual path (LINEAR — they're rendered previews, not pixel-art). Opening a piece
+downloads just its single `raw` file (`start_piece_open`/`poll_colo_open` → `colo_files`
+map; `load_full` decodes via `resolve_local`, keeping the virtual path as identity).
+Per-row ⬇ menu saves the file or its pack `.zip` to disk (`download_piece` → rfd +
+`sixteen::download_to`, reported via `colo_save_rx`). Entering a flat listing auto-switches
+to table view; navigating away (`show_folder`) cancels the stream + clears `colo_pieces`.
 
 ## Core invariants (read these before touching the data model)
 
