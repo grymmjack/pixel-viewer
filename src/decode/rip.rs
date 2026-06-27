@@ -628,12 +628,15 @@ impl Rip {
         // fill whose region is *topologically complex*: a leak escapes into a finished
         // scene and must weave around every drawn shape, exploding its perimeter, whereas
         // a real background is one solid blob. `perimeter²/area` measures exactly that — a
-        // disk≈12.6, a square 16; the 15 legit backgrounds in the test corpus sit at
-        // 16–20 (HOUND, weaving round the dog, at 65), while leaks run 95–2185. The `> 40`
-        // cut clears every solid background with wide margin and still catches the complex
-        // leaks (GARFIELD 112, FIERO 95, PMID1 68, …). Its blind spot: a leak that floods
-        // an *empty* region stays simple and slips through — those few need the outline
-        // gap closed per-file (see the leaker list in project memory).
+        // disk≈12.6, a square 16; the solid full-screen backgrounds sit at 16–20, while
+        // leaks run ≈50–2185. The `> 40` cut clears every *solid* background with wide
+        // margin and catches the complex leaks (GARFIELD 112, FIERO 95, MSG ≈50, …).
+        // Known limits (can't be tuned away — the metric genuinely overlaps here): a
+        // *complex but legit* background (HOUND's sky weaving round the dog, ≈65) is over
+        // the cut and stays unfilled; a leak that floods an *empty* region stays simple
+        // and slips through. Raising the cut to pass HOUND also passes the MSG/SH leaks
+        // (≈50) and floods them — so those need the real fix (the outline gap closed,
+        // generally, in the rasteriser; see project memory), not a threshold nudge.
         if region.len() > cap {
             let idx = |px: i32, py: i32| (py * W + px) as usize;
             let mut perim = 0usize;

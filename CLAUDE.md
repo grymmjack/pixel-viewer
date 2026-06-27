@@ -487,10 +487,15 @@ leak escapes into a finished scene and must weave around every drawn shape, expl
 backgrounds in the corpus sit at 16–20 (HOUND, weaving round the dog, at 65), leaks run
 95–2185. This **solved the size-guard's "impossible" case**: jdraw's legit 177k-px fill
 (p²/a≈20) now fills (56.9%→0.06% vs reference) while garfield's 170k-px leak (p²/a≈112)
-is still abandoned (line art preserved, 2.55%). Blind spot: a leak that floods an *empty*
-region stays shape-simple and slips through (HOUND's legit bg, conversely, is too complex
-and stays unfilled) — those few need the outline gap closed per-file (leaker list in
-project memory). **Patterned fills
+is still abandoned (line art preserved, 2.55%). **Irreducible blind spot (measured, not
+tunable):** the metric genuinely *overlaps* — HOUND's legit sky (p²/a≈**65**, a
+false-positive that stays unfilled) is *more* complex than the real MSG/SH leaks (≈**50**),
+and PMID1's empty-sky leak (≈68) is *simpler* than HOUND. So no threshold both fills HOUND
+and blocks MSG/SH — raising the `>40` cut to pass HOUND (tried 66) floods MSG/SH. The
+genuine fix is making the outline rasterisation exact so nothing leaks and the guard can go
+away entirely — i.e. the wholesale icy BGI-renderer port, **not** a per-file hack or a
+threshold nudge. Until then HOUND/PMID1 are accepted known-imperfect (project memory).
+**Patterned fills
 (two BGI quirks — get both or layered dithered art is wrong):** (1) `fill_poly` borders
 the shape in the draw colour **only when that colour isn't 0** (`if self.color != 0`,
 matching icy_engine + PabloDraw's `FillPoly`/`BGICanvas`) — drawing it unconditionally
@@ -515,6 +520,12 @@ st.y`, `ny = oy + st.x`). Advancing `pen_x` for *both* directions was the bug th
 vertical labels out as overlapping rotated glyphs in a row (MAIN/MSG's left-margin "The
 Far Side BBS" + "USA"). NB the downward advance is PabloDraw's RIP convention — icy's BGI
 `out_text_xy` goes bottom-to-top; we match Pablo (the reference these were diffed against).
+*Known limit:* our vertical glyph transform matches Pablo's **direction** but not its
+exact per-pixel placement (Pablo's `DrawCharacter` vertical formula isn't published, and
+icy's differs in direction), so art that draws vertical stroke text as an outline then
+**flood-fills it solid** via a hard-coded seed (MSG's big "USA" — `Fill{529,119}`) has the
+seed miss the letters → "USA" renders as a hollow outline instead of solid. Cosmetic; the
+real fix is the wholesale icy BGI-renderer port, not a positioning nudge.
 **Buttons:** RIP_BUTTON_STYLE/RIP_BUTTON draw the beveled/recessed/chiseled
 panels BBS *menus* are built from (`Btn` + `draw_button`/`button_label`, ported from
 icy_engine's `add_button`) — so menu screens render (msg5 ≈ 1.5% vs reference); only the
