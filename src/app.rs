@@ -869,7 +869,9 @@ pub struct PixelView {
     // viewer can decode a piece opened from the flat listing (see `resolve_local`).
     colo_files: HashMap<PathBuf, PathBuf>,
     // A piece whose `raw` file is downloading so we can open it in the viewer once ready.
-    colo_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
+    #[allow(clippy::type_complexity)]
+    colo_open_rx:
+        Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf, Option<crate::sauce::Sauce>), String>>>,
     // Status messages from "Download file/pack" save threads (drained into `status`).
     colo_save_rx: Option<std::sync::mpsc::Receiver<String>>,
 }
@@ -1657,11 +1659,25 @@ impl PixelView {
             .and_then(|n| n.to_str())
             .unwrap_or("art")
             .to_string();
+        // 16colo strips SAUCE from the single `raw` file and the artist endpoint omits
+        // it, so when a piece has no SAUCE yet (artist/search view) fetch its *pack's*
+        // SAUCE (`?sauce=true`) to fill the Details panel. Keyed by (group, year, pack).
+        let want_sauce = piece
+            .sauce
+            .is_none()
+            .then(|| (piece.group.clone(), piece.year, piece.pack.clone(), fname.clone()));
         self.status = format!("Opening {fname}…");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ =
-                tx.send(crate::sixteen::download_file(&url, &fname).map(|local| (vpath, local)));
+            let dl = crate::sixteen::download_file(&url, &fname);
+            let sauce = want_sauce.and_then(|(group, year, pack, file)| {
+                crate::sixteen::fetch_pack_pieces(&group, year, &pack)
+                    .ok()?
+                    .into_iter()
+                    .find(|p| p.filename.eq_ignore_ascii_case(&file))?
+                    .sauce
+            });
+            let _ = tx.send(dl.map(|local| (vpath, local, sauce)));
         });
         self.colo_open_rx = Some(rx);
     }
@@ -1672,13 +1688,17 @@ impl PixelView {
             return;
         };
         match rx.try_recv() {
-            Ok(Ok((vpath, local))) => {
+            Ok(Ok((vpath, local, sauce))) => {
                 self.colo_open_rx = None;
                 self.colo_files.insert(vpath.clone(), local);
-                // Drop any stale SAUCE cached while the piece had no local file (e.g.
-                // inspected in the table before opening — search/artist pieces carry no
-                // API SAUCE), so `cached_sauce` re-reads it from the downloaded file.
-                self.sauce_cache.remove(&vpath);
+                // Seed the SAUCE we fetched from the pack API (artist/search pieces); else
+                // drop any stale `None` cached while the piece had no local file so
+                // `cached_sauce` re-reads. (Group/pack pieces were already pre-seeded.)
+                if sauce.is_some() {
+                    self.sauce_cache.insert(vpath.clone(), sauce);
+                } else {
+                    self.sauce_cache.remove(&vpath);
+                }
                 self.load_full(ctx, vpath);
                 self.mode = Mode::Single;
                 self.want_repaint = true;
