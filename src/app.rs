@@ -874,6 +874,16 @@ pub struct PixelView {
         Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf, Option<crate::sauce::Sauce>), String>>>,
     // Status messages from "Download file/pack" save threads (drained into `status`).
     colo_save_rx: Option<std::sync::mpsc::Receiver<String>>,
+    // Background pack-SAUCE fetcher for *inspected* (hovered) 16colo pieces. 16colo
+    // strips SAUCE from the raw file and the artist/search endpoints omit it, so when
+    // the Details panel inspects a piece with no SAUCE we fetch its whole pack's SAUCE
+    // (`?sauce=true`) once and seed every file. Shared channel (tx cloned per fetch)
+    // since several packs can be in flight; `colo_sauce_done` dedupes per "year/pack".
+    #[allow(clippy::type_complexity)]
+    colo_sauce_tx: std::sync::mpsc::Sender<Vec<(PathBuf, crate::sauce::Sauce)>>,
+    #[allow(clippy::type_complexity)]
+    colo_sauce_rx: std::sync::mpsc::Receiver<Vec<(PathBuf, crate::sauce::Sauce)>>,
+    colo_sauce_done: HashSet<String>,
 }
 
 impl PixelView {
@@ -1192,6 +1202,9 @@ impl PixelView {
             }
         }
 
+        // Shared channel for background pack-SAUCE fetches (see `ensure_colo_sauce`).
+        let (colo_sauce_tx, colo_sauce_rx) = std::sync::mpsc::channel();
+
         let mut app = Self {
             registry,
             thumbs,
@@ -1331,6 +1344,9 @@ impl PixelView {
             colo_files: HashMap::new(),
             colo_open_rx: None,
             colo_save_rx: None,
+            colo_sauce_tx,
+            colo_sauce_rx,
+            colo_sauce_done: HashSet::new(),
         };
 
         // Reopen wherever we left off so the grid, breadcrumb, and favorites are
@@ -1709,6 +1725,65 @@ impl PixelView {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
             Err(_) => self.colo_open_rx = None,
+        }
+    }
+
+    /// Lazily fetch SAUCE for an *inspected* (hovered/selected) 16colo piece. The artist
+    /// and search listings come from endpoints that omit SAUCE, and the raw file has it
+    /// stripped — so the Details panel would read "no record" until you actually open the
+    /// piece. This fetches the piece's whole pack's SAUCE (`?sauce=true`) in the
+    /// background and seeds *every* file in it, so hovering one piece fills the SAUCE for
+    /// the rest of the pack too. Deduped per "year/pack" (`colo_sauce_done`) so sweeping a
+    /// table costs one request per pack, not one per file. Cheap no-op when the piece
+    /// already has SAUCE (pre-seeded, opened, or a prior pack fetch).
+    fn ensure_colo_sauce(&mut self, path: &Path) {
+        // Already resolved → nothing to do.
+        if matches!(self.sauce_cache.get(path), Some(Some(_))) {
+            return;
+        }
+        let Some(piece) = self.colo_pieces.get(path) else {
+            return; // not a 16colo piece
+        };
+        if piece.sauce.is_some() {
+            return; // pack/group listing already carried it
+        }
+        let (group, year, pack) = (piece.group.clone(), piece.year, piece.pack.clone());
+        if !self.colo_sauce_done.insert(format!("{year}/{pack}")) {
+            return; // this pack is already fetched or in flight
+        }
+        let tx = self.colo_sauce_tx.clone();
+        std::thread::spawn(move || {
+            let seeds: Vec<(PathBuf, crate::sauce::Sauce)> =
+                crate::sixteen::fetch_pack_pieces(&group, year, &pack)
+                    .map(|pieces| {
+                        pieces
+                            .into_iter()
+                            .filter_map(|p| {
+                                // Rebuild the same virtual display path `emit_piece` uses
+                                // (ROOT/year/pack/filename) so the key matches the cache.
+                                p.sauce.map(|s| {
+                                    let vp = Path::new(crate::sixteen::ROOT)
+                                        .join(p.year.to_string())
+                                        .join(&p.pack)
+                                        .join(&p.filename);
+                                    (vp, s)
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            let _ = tx.send(seeds);
+        });
+        self.want_repaint = true;
+    }
+
+    /// Drain finished pack-SAUCE fetches into `sauce_cache` (see `ensure_colo_sauce`).
+    fn poll_colo_sauce(&mut self) {
+        while let Ok(seeds) = self.colo_sauce_rx.try_recv() {
+            for (vpath, sauce) in seeds {
+                self.sauce_cache.insert(vpath, Some(sauce));
+            }
+            self.want_repaint = true;
         }
     }
 
@@ -3434,6 +3509,10 @@ impl PixelView {
                     // panel doesn't vanish when a file has no record (it reads "no record"
                     // and the fields show "—"). Hidden for ordinary images (never SAUCE).
                     if is_textmode_ext(&entry.path) || self.colo_pieces.contains_key(&entry.path) {
+                        // For a 16colo piece whose listing omitted SAUCE, kick off a
+                        // background pack fetch so hovering it (not just opening) fills
+                        // the record — it lands in `sauce_cache` a few frames later.
+                        self.ensure_colo_sauce(&entry.path);
                         let sauce = self.cached_sauce(&entry.path);
                         let none = sauce.is_none();
                         let sc = sauce.unwrap_or_default();
@@ -6872,6 +6951,7 @@ impl eframe::App for PixelView {
         self.poll_colo_pieces();
         self.poll_colo_open(&ctx);
         self.poll_colo_save();
+        self.poll_colo_sauce();
         // Screensaver: once a (random) pack has finished downloading + mounting, open its
         // first art file. Both async ops idle ⇒ the listing has settled.
         if self.pending_autoplay && self.random_rx.is_none() && self.remote_rx.is_none() {
