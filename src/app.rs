@@ -99,6 +99,15 @@ enum ColoMsg {
     Err(String),
 }
 
+/// What a 16colo.rs flat-piece listing is built from (see
+/// [`PixelView::start_colo_pieces`]): an artist, a group, or a server-side search.
+#[derive(Clone)]
+enum ColoSource {
+    Artist(String),
+    Group(String),
+    Search(String),
+}
+
 /// A virtual (non-on-disk) directory `Entry`, used for the 16colo.rs year/pack tree.
 fn virtual_dir(path: PathBuf) -> Entry {
     Entry {
@@ -1335,6 +1344,11 @@ impl PixelView {
             self.cancel_search();
             self.search_results = None;
         }
+        // …and leaves any 16colo.rs flat-piece listing (stops its stream + drops its
+        // metadata). The listing handler re-sets `colo_flat` *after* calling us.
+        self.cancel_colo();
+        self.colo_flat = false;
+        self.colo_pieces.clear();
         self.all_entries = entries;
         // Record in the back/forward history unless we're navigating *via* it.
         if !self.suppress_history {
@@ -1429,51 +1443,16 @@ impl PixelView {
                     sixteen::fetch_artists().map(|ns| ns.into_iter().map(|n| (n, None)).collect())
                 });
             }
+            // An artist / group / search now flattens to individual *pieces* (a sortable
+            // table), not a grid of pack folders — the whole point of this view.
             [s, group] if s.as_str() == sixteen::GROUPS => {
-                let group = group.clone();
-                self.status = format!("Loading {group} packs…");
-                self.spawn_listing(dir, move || {
-                    sixteen::fetch_group_packs(&group)
-                        .map(|ps| ps.into_iter().map(|p| (p.name, Some(p.url))).collect())
-                });
+                self.start_colo_pieces(dir, ColoSource::Group(group.clone()));
             }
             [s, artist] if s.as_str() == sixteen::ARTISTS => {
-                let artist = artist.clone();
-                self.status = format!("Loading {artist}…");
-                self.spawn_listing(dir, move || {
-                    sixteen::fetch_artist_packs(&artist)
-                        .map(|ps| ps.into_iter().map(|p| (p.name, Some(p.url))).collect())
-                });
+                self.start_colo_pieces(dir, ColoSource::Artist(artist.clone()));
             }
-            // Server-side search across groups + artists → a results grid of folders
-            // that point at the matching `groups/<g>` / `artists/<a>` listings.
             [s, query] if s.as_str() == sixteen::SEARCH => {
-                let query = query.clone();
-                self.status = format!("Searching “{query}”…");
-                self.show_folder(dir.clone(), Vec::new());
-                let (tx, rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
-                    let root = Path::new(sixteen::ROOT);
-                    let groups = sixteen::search_groups(&query);
-                    let artists = sixteen::search_artists(&query);
-                    // Only fail if *both* sides errored (report groups' error); otherwise
-                    // merge whatever succeeded.
-                    let msg = match groups {
-                        Err(e) if artists.is_err() => RemoteMsg::Err(e),
-                        groups => {
-                            let mut entries = Vec::new();
-                            for g in groups.unwrap_or_default() {
-                                entries.push(virtual_dir(root.join(sixteen::GROUPS).join(&g)));
-                            }
-                            for a in artists.unwrap_or_default() {
-                                entries.push(virtual_dir(root.join(sixteen::ARTISTS).join(&a)));
-                            }
-                            RemoteMsg::Packs(dir, entries, HashMap::new())
-                        }
-                    };
-                    let _ = tx.send(msg);
-                });
-                self.remote_rx = Some(rx);
+                self.start_colo_pieces(dir, ColoSource::Search(query.clone()));
             }
             [year] if year.parse::<u32>().is_ok() => {
                 let year: u32 = year.parse().unwrap_or(0);
@@ -1517,6 +1496,155 @@ impl PixelView {
             let _ = tx.send(msg);
         });
         self.remote_rx = Some(rx);
+    }
+
+    /// Start a flat 16colo.rs *piece* listing for `dir` (an artist / group / search).
+    /// Pieces stream in on a background thread (mirrors the recursive-search pattern:
+    /// `colo_rx` + an `AtomicBool` cancel), each a `ColoMsg::Hit(entry, piece)`, drained
+    /// by [`poll_colo_pieces`]. Switches the view to the table so the scene columns show.
+    fn start_colo_pieces(&mut self, dir: PathBuf, source: ColoSource) {
+        // `show_folder` resets the view + clears the previous flat-listing state.
+        let label = match &source {
+            ColoSource::Artist(a) => format!("Loading {a}…"),
+            ColoSource::Group(g) => format!("Loading {g}…"),
+            ColoSource::Search(q) => format!("Searching “{q}”…"),
+        };
+        self.show_folder(dir.clone(), Vec::new());
+        self.colo_flat = true;
+        self.table_view = true; // a flat piece listing is the table's whole reason to exist
+        self.status = label;
+
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.colo_cancel = Some(Arc::clone(&cancel));
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.colo_rx = Some(rx);
+        std::thread::spawn(move || colo_walk(source, cancel, tx));
+    }
+
+    /// Stop a running flat-piece listing and forget its stream.
+    fn cancel_colo(&mut self) {
+        if let Some(c) = self.colo_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.colo_rx = None;
+    }
+
+    /// Drain streamed pieces into `all_entries` + `colo_pieces` (resolving each rating
+    /// on the UI thread, like `open_folder`), re-sorting as they arrive.
+    fn poll_colo_pieces(&mut self) {
+        let Some(rx) = self.colo_rx.as_ref() else {
+            return;
+        };
+        let mut got = 0usize;
+        let mut done: Option<Result<usize, String>> = None;
+        // Bounded drain per frame so a fast stream can't stall the UI.
+        for _ in 0..512 {
+            match rx.try_recv() {
+                Ok(ColoMsg::Hit(mut entry, piece)) => {
+                    entry.rating = self.read_rating(&entry.path);
+                    self.colo_pieces.insert(entry.path.clone(), piece);
+                    self.all_entries.push(entry);
+                    got += 1;
+                }
+                Ok(ColoMsg::Done(n)) => {
+                    done = Some(Ok(n));
+                    break;
+                }
+                Ok(ColoMsg::Err(e)) => {
+                    done = Some(Err(e));
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    done = Some(Ok(self.all_entries.len()));
+                    break;
+                }
+            }
+        }
+        if got > 0 {
+            self.rebuild_view();
+            self.want_repaint = true;
+        }
+        match done {
+            Some(Ok(n)) => {
+                self.colo_rx = None;
+                self.colo_cancel = None;
+                self.status = format!("{n} pieces");
+            }
+            Some(Err(e)) => {
+                self.colo_rx = None;
+                self.colo_cancel = None;
+                self.status = format!("16colo.rs: {e}");
+            }
+            None => self.want_repaint = true,
+        }
+    }
+
+    /// Download a piece's single `raw` file (not its whole pack) so the viewer can open
+    /// it; the local path lands via `colo_open_rx` → [`poll_colo_open`].
+    fn start_piece_open(&mut self, vpath: PathBuf) {
+        let Some(piece) = self.colo_pieces.get(&vpath) else {
+            return;
+        };
+        let url = piece.raw_url.clone();
+        let fname = vpath
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("art")
+            .to_string();
+        self.status = format!("Opening {fname}…");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ =
+                tx.send(crate::sixteen::download_file(&url, &fname).map(|local| (vpath, local)));
+        });
+        self.colo_open_rx = Some(rx);
+    }
+
+    /// A piece's `raw` file finished downloading → cache it + open it in the viewer.
+    fn poll_colo_open(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.colo_open_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok((vpath, local))) => {
+                self.colo_open_rx = None;
+                self.colo_files.insert(vpath.clone(), local);
+                self.load_full(ctx, vpath);
+                self.mode = Mode::Single;
+                self.want_repaint = true;
+            }
+            Ok(Err(e)) => {
+                self.colo_open_rx = None;
+                self.status = format!("Open failed: {e}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(_) => self.colo_open_rx = None,
+        }
+    }
+
+    /// Drain a "Download file/pack" save thread's final status message.
+    fn poll_colo_save(&mut self) {
+        let Some(rx) = self.colo_save_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(msg) => {
+                self.status = msg;
+                self.colo_save_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(_) => self.colo_save_rx = None,
+        }
+    }
+
+    /// Map a display path to a locally-readable file for decoding: a downloaded 16colo
+    /// piece resolves to its cached `raw` file; anything else is already real on disk.
+    fn resolve_local(&self, path: &Path) -> PathBuf {
+        self.colo_files
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| path.to_path_buf())
     }
 
     /// A downloaded 16colo.rs pack zip finished: extract + mount it (with the
@@ -2191,6 +2319,9 @@ impl PixelView {
         if already {
             return;
         }
+        // `path` is the display identity (kept for stepping/ratings/full_tex keys); a
+        // downloaded 16colo piece reads its bytes from the local cache file instead.
+        let src = self.resolve_local(&path);
         // Pick the remembered zoom for this image's kind: text-mode art (tiny 8×16
         // cells) opens at its own larger default, raster art at its own. Sticky fit,
         // when on, overrides both and re-fits the window.
@@ -2225,7 +2356,8 @@ impl PixelView {
         // Animated GIF → upload every frame as a texture for playback (no size cap:
         // the user explicitly opened this one).
         if is_gif(&path) {
-            if let Some(a) = build_anim(ctx, &path, usize::MAX) {
+            if let Some(mut a) = build_anim(ctx, &src, usize::MAX) {
+                a.path = path.clone(); // keep the virtual identity for `already` + stepping
                 self.anim = Some(a);
                 return;
             }
@@ -2234,7 +2366,7 @@ impl PixelView {
         // Baud-rate playback for stream art (ANSImation / "watch RIP draw"). The static
         // decode below still builds full_tex/full_src for the minimap, recolor and
         // palette panes; the player only drives the main view while it's animating.
-        self.player = std::fs::read(&path)
+        self.player = std::fs::read(&src)
             .ok()
             .and_then(|bytes| Stream::for_file(&bytes, &path))
             .map(|stream| {
@@ -2249,7 +2381,7 @@ impl PixelView {
             });
 
         // Static image.
-        match self.registry.decode_path(&path) {
+        match self.registry.decode_path(&src) {
             Ok(img) => {
                 let size = [img.width as usize, img.height as usize];
                 let rgba = img.rgba_bytes();
@@ -2310,6 +2442,13 @@ impl PixelView {
         };
         if entry.is_dir || entry.is_archive {
             self.open_folder(entry.path); // archives route to enter_archive
+        } else if self.colo_pieces.contains_key(&entry.path)
+            && !self.colo_files.contains_key(&entry.path)
+        {
+            // A 16colo flat-listing piece not yet downloaded → fetch its single `raw`
+            // file, then open it once ready (mode flips in `poll_colo_open`).
+            self.selected = idx;
+            self.start_piece_open(entry.path);
         } else {
             self.selected = idx;
             self.load_full(ctx, entry.path);
@@ -4493,7 +4632,13 @@ impl PixelView {
                                     egui::Color32::WHITE,
                                 );
                             } else {
-                                self.thumbs.request(path, THUMB_PX);
+                                // 16colo piece → fetch its pre-rendered PNG over HTTP;
+                                // any other file → decode locally.
+                                if let Some(p) = self.colo_pieces.get(path) {
+                                    self.colo_thumbs.request(path, &p.tn_url, THUMB_PX);
+                                } else {
+                                    self.thumbs.request(path, THUMB_PX);
+                                }
                                 self.want_repaint = true;
                             }
                         }
@@ -4549,9 +4694,7 @@ impl PixelView {
                         }
                         resp.context_menu(|ui| {
                             let pinned = self.favorites.iter().any(|f| f == &entry.path);
-                            if let Some(pick) =
-                                entry_context_menu(ui, &entry, can_paste, pinned)
-                            {
+                            if let Some(pick) = entry_context_menu(ui, &entry, can_paste, pinned) {
                                 match pick {
                                     TilePick::Pin => pin_dir = Some(idx),
                                     TilePick::Smart(c) => smart_on = Some((idx, c)),
@@ -4634,25 +4777,121 @@ impl PixelView {
         let rating_col = 6usize; // index of the file rating column
         let mut cols: Vec<Col> = if scene {
             vec![
-                Col { label: "", sort: None, w: thumb_w, flex: false, num: false },
-                Col { label: "Filename", sort: Some(SortKey::Name), w: 0.0, flex: true, num: false },
-                Col { label: "Artist", sort: Some(SortKey::Artist), w: 0.0, flex: true, num: false },
-                Col { label: "Type", sort: Some(SortKey::Type), w: 56.0, flex: false, num: false },
-                Col { label: "Year", sort: Some(SortKey::Year), w: 52.0, flex: false, num: true },
-                Col { label: "Group", sort: Some(SortKey::Group), w: 130.0, flex: false, num: false },
-                Col { label: "Pack", sort: Some(SortKey::Pack), w: 130.0, flex: false, num: false },
-                Col { label: "", sort: None, w: 96.0, flex: false, num: false },
+                Col {
+                    label: "",
+                    sort: None,
+                    w: thumb_w,
+                    flex: false,
+                    num: false,
+                },
+                Col {
+                    label: "Filename",
+                    sort: Some(SortKey::Name),
+                    w: 0.0,
+                    flex: true,
+                    num: false,
+                },
+                Col {
+                    label: "Artist",
+                    sort: Some(SortKey::Artist),
+                    w: 0.0,
+                    flex: true,
+                    num: false,
+                },
+                Col {
+                    label: "Type",
+                    sort: Some(SortKey::Type),
+                    w: 56.0,
+                    flex: false,
+                    num: false,
+                },
+                Col {
+                    label: "Year",
+                    sort: Some(SortKey::Year),
+                    w: 52.0,
+                    flex: false,
+                    num: true,
+                },
+                Col {
+                    label: "Group",
+                    sort: Some(SortKey::Group),
+                    w: 130.0,
+                    flex: false,
+                    num: false,
+                },
+                Col {
+                    label: "Pack",
+                    sort: Some(SortKey::Pack),
+                    w: 130.0,
+                    flex: false,
+                    num: false,
+                },
+                Col {
+                    label: "",
+                    sort: None,
+                    w: 96.0,
+                    flex: false,
+                    num: false,
+                },
             ]
         } else {
             vec![
-                Col { label: "", sort: None, w: thumb_w, flex: false, num: false },
-                Col { label: "Name", sort: Some(SortKey::Name), w: 0.0, flex: true, num: false },
-                Col { label: "Type", sort: Some(SortKey::Type), w: 64.0, flex: false, num: false },
-                Col { label: "Size", sort: Some(SortKey::Size), w: 84.0, flex: false, num: true },
-                Col { label: "Dimensions", sort: Some(SortKey::Dimensions), w: 96.0, flex: false, num: true },
-                Col { label: "Colors", sort: Some(SortKey::Colors), w: 68.0, flex: false, num: true },
-                Col { label: "Rating", sort: Some(SortKey::Rating), w: 72.0, flex: false, num: false },
-                Col { label: "Modified", sort: Some(SortKey::Modified), w: 110.0, flex: false, num: false },
+                Col {
+                    label: "",
+                    sort: None,
+                    w: thumb_w,
+                    flex: false,
+                    num: false,
+                },
+                Col {
+                    label: "Name",
+                    sort: Some(SortKey::Name),
+                    w: 0.0,
+                    flex: true,
+                    num: false,
+                },
+                Col {
+                    label: "Type",
+                    sort: Some(SortKey::Type),
+                    w: 64.0,
+                    flex: false,
+                    num: false,
+                },
+                Col {
+                    label: "Size",
+                    sort: Some(SortKey::Size),
+                    w: 84.0,
+                    flex: false,
+                    num: true,
+                },
+                Col {
+                    label: "Dimensions",
+                    sort: Some(SortKey::Dimensions),
+                    w: 96.0,
+                    flex: false,
+                    num: true,
+                },
+                Col {
+                    label: "Colors",
+                    sort: Some(SortKey::Colors),
+                    w: 68.0,
+                    flex: false,
+                    num: true,
+                },
+                Col {
+                    label: "Rating",
+                    sort: Some(SortKey::Rating),
+                    w: 72.0,
+                    flex: false,
+                    num: false,
+                },
+                Col {
+                    label: "Modified",
+                    sort: Some(SortKey::Modified),
+                    w: 110.0,
+                    flex: false,
+                    num: false,
+                },
             ]
         };
         let bar = ui.spacing().scroll.bar_width + 2.0;
@@ -4687,7 +4926,8 @@ impl PixelView {
                         egui::Sense::hover()
                     },
                 );
-                ui.painter().rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
+                ui.painter()
+                    .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
                 if !c.label.is_empty() {
                     let active = c.sort == Some(sort_key);
                     let arrow = if active {
@@ -4705,9 +4945,15 @@ impl PixelView {
                         ui.visuals().weak_text_color()
                     };
                     let (anchor, pos) = if c.num {
-                        (egui::Align2::RIGHT_CENTER, rect.right_center() - egui::vec2(6.0, 0.0))
+                        (
+                            egui::Align2::RIGHT_CENTER,
+                            rect.right_center() - egui::vec2(6.0, 0.0),
+                        )
                     } else {
-                        (egui::Align2::LEFT_CENTER, rect.left_center() + egui::vec2(6.0, 0.0))
+                        (
+                            egui::Align2::LEFT_CENTER,
+                            rect.left_center() + egui::vec2(6.0, 0.0),
+                        )
                     };
                     ui.painter().text(
                         pos,
@@ -4754,8 +5000,7 @@ impl PixelView {
                 }
 
                 // Predict the row rect to highlight on hover the same frame it's drawn.
-                let row_rect =
-                    egui::Rect::from_min_size(ui.cursor().min, egui::vec2(avail, row_h));
+                let row_rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(avail, row_h));
                 let hover_row = ui.rect_contains_pointer(row_rect);
                 let bg = if is_selected {
                     ui.visuals().selection.bg_fill
@@ -4960,7 +5205,10 @@ impl PixelView {
                     .to_string(),
             )
         };
-        let Some(dest) = rfd::FileDialog::new().set_file_name(&default_name).save_file() else {
+        let Some(dest) = rfd::FileDialog::new()
+            .set_file_name(&default_name)
+            .save_file()
+        else {
             return; // user cancelled
         };
         self.status = format!("Downloading {default_name}…");
@@ -6413,6 +6661,9 @@ impl eframe::App for PixelView {
         self.poll_remote();
         self.poll_search();
         self.poll_random();
+        self.poll_colo_pieces();
+        self.poll_colo_open(&ctx);
+        self.poll_colo_save();
         // Screensaver: once a (random) pack has finished downloading + mounting, open its
         // first art file. Both async ops idle ⇒ the listing has settled.
         if self.pending_autoplay && self.random_rx.is_none() && self.remote_rx.is_none() {
@@ -6454,6 +6705,20 @@ impl eframe::App for PixelView {
             self.thumb_tex.insert(r.path, tex);
             self.want_repaint = true;
             new_meta = true;
+        }
+        // Upload finished 16colo.rs piece thumbnails (the pre-rendered `tn` PNGs fetched
+        // over HTTP). They're keyed by the piece's virtual path, so the grid/table find
+        // them in `thumb_tex` like any thumb. Always LINEAR — they're rendered previews,
+        // not pixel-art sprites, so a nearest pass at tile size would shimmer.
+        for r in self.colo_thumbs.drain() {
+            let color = egui::ColorImage::from_rgba_unmultiplied([r.width, r.height], &r.rgba);
+            let tex = ctx.load_texture(
+                r.path.to_string_lossy(),
+                color,
+                egui::TextureOptions::LINEAR,
+            );
+            self.thumb_tex.insert(r.path, tex);
+            self.want_repaint = true;
         }
         // Sorting by Colors needs every entry's count, which the grid would only
         // request for *visible* tiles — so eagerly decode the rest (request() dedupes,
@@ -8657,6 +8922,139 @@ fn table_cell_text(
             _ => String::new(),
         }
     }
+}
+
+/// Build a piece's `Entry` + `ColoPiece` and send it as a hit. Returns false if the
+/// receiver is gone (the user navigated away → stop the walk). The virtual display
+/// path is `<16colo.rs>/<year>/<pack>/<FILE>` — the same scheme a downloaded pack uses.
+fn emit_piece(
+    tx: &std::sync::mpsc::Sender<ColoMsg>,
+    p: crate::sixteen::Piece,
+    count: &mut usize,
+) -> bool {
+    let path = Path::new(crate::sixteen::ROOT)
+        .join(p.year.to_string())
+        .join(&p.pack)
+        .join(&p.filename);
+    let entry = Entry {
+        path,
+        is_dir: false,
+        is_archive: false,
+        size: 0,
+        mtime: None,
+        ctime: None,
+        rating: 0,
+    };
+    let piece = ColoPiece {
+        artist: p.artist,
+        group: p.group,
+        year: p.year,
+        pack: p.pack,
+        raw_url: p.raw_url,
+        tn_url: p.tn_url,
+    };
+    *count += 1;
+    tx.send(ColoMsg::Hit(entry, piece)).is_ok()
+}
+
+/// Background worker for a flat 16colo.rs piece listing (see
+/// [`PixelView::start_colo_pieces`]). Streams a `ColoMsg::Hit` per piece, then
+/// `Done(total)`. An artist is one API call; a group fetches each of its packs; a
+/// search aggregates matched artists + groups (capped, so a broad query stays bounded).
+/// Checks `cancel` between pieces / network calls so navigation stops it promptly.
+fn colo_walk(
+    source: ColoSource,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<ColoMsg>,
+) {
+    use crate::sixteen;
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut count = 0usize;
+
+    match source {
+        ColoSource::Artist(name) => match sixteen::fetch_artist_pieces(&name) {
+            Ok(pieces) => {
+                for p in pieces {
+                    if cancel.load(Relaxed) || !emit_piece(&tx, p, &mut count) {
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(ColoMsg::Err(e));
+                return;
+            }
+        },
+        ColoSource::Group(name) => match sixteen::fetch_group_pack_refs(&name) {
+            Ok(refs) => {
+                for (year, pack) in refs {
+                    if cancel.load(Relaxed) {
+                        return;
+                    }
+                    // A single pack fetch may fail; skip it rather than abort the listing.
+                    if let Ok(pieces) = sixteen::fetch_pack_pieces(&name, year, &pack) {
+                        for p in pieces {
+                            if cancel.load(Relaxed) || !emit_piece(&tx, p, &mut count) {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(ColoMsg::Err(e));
+                return;
+            }
+        },
+        ColoSource::Search(query) => {
+            // A search can match many artists/groups; cap the fan-out so a broad query
+            // can't fetch thousands of packs. (The status reports the final count.)
+            const MAX_ARTISTS: usize = 25;
+            const MAX_GROUPS: usize = 15;
+            const MAX_PIECES: usize = 4000;
+            let artists = sixteen::search_artists(&query).unwrap_or_default();
+            let groups = sixteen::search_groups(&query).unwrap_or_default();
+            for a in artists.into_iter().take(MAX_ARTISTS) {
+                if cancel.load(Relaxed) {
+                    return;
+                }
+                if let Ok(pieces) = sixteen::fetch_artist_pieces(&a) {
+                    for p in pieces {
+                        if cancel.load(Relaxed) || !emit_piece(&tx, p, &mut count) {
+                            return;
+                        }
+                        if count >= MAX_PIECES {
+                            let _ = tx.send(ColoMsg::Done(count));
+                            return;
+                        }
+                    }
+                }
+            }
+            for g in groups.into_iter().take(MAX_GROUPS) {
+                if cancel.load(Relaxed) {
+                    return;
+                }
+                let refs = sixteen::fetch_group_pack_refs(&g).unwrap_or_default();
+                for (year, pack) in refs {
+                    if cancel.load(Relaxed) {
+                        return;
+                    }
+                    if let Ok(pieces) = sixteen::fetch_pack_pieces(&g, year, &pack) {
+                        for p in pieces {
+                            if cancel.load(Relaxed) || !emit_piece(&tx, p, &mut count) {
+                                return;
+                            }
+                            if count >= MAX_PIECES {
+                                let _ = tx.send(ColoMsg::Done(count));
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let _ = tx.send(ColoMsg::Done(count));
 }
 
 fn hover_details(ui: &mut egui::Ui, entry: &Entry, meta: Option<ImgMeta>) {

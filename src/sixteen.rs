@@ -182,6 +182,22 @@ pub fn download_to(url: &str, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Download a single piece's `raw` file into a per-URL cache subdir, preserving its
+/// real `filename` (so the decoder's extension dispatch still works), and return the
+/// local path. Cached: an already-downloaded piece is reused.
+pub fn download_file(url: &str, filename: &str) -> Result<PathBuf, String> {
+    let dir = cache_dir()
+        .join("files")
+        .join(format!("{:016x}", hash(url)));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dest = dir.join(filename);
+    if dest.exists() {
+        return Ok(dest);
+    }
+    download_to(url, &dest)?;
+    Ok(dest)
+}
+
 fn hash(s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -251,29 +267,6 @@ pub fn fetch_groups() -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// A group's packs (newest year first) as downloadable [`Pack`]s. `/v1/group/:name`
-/// returns `{ results: { packs: { "<year>": ["<pack>", …] } } }`.
-pub fn fetch_group_packs(group: &str) -> Result<Vec<Pack>, String> {
-    let v = get_json(&format!("{API}/group/{}?pagesize=100", enc(group)))?;
-    let mut packs = Vec::new();
-    if let Some(by_year) = v["results"]["packs"].as_object() {
-        let mut years: Vec<&String> = by_year.keys().collect();
-        years.sort_by(|a, b| b.cmp(a)); // newest first
-        for y in years {
-            let year: u32 = y.parse().unwrap_or(0);
-            if let Some(list) = by_year[y].as_array() {
-                for p in list.iter().filter_map(|p| p.as_str()) {
-                    packs.push(Pack {
-                        name: p.to_string(),
-                        url: pack_url(year, p),
-                    });
-                }
-            }
-        }
-    }
-    Ok(packs)
-}
-
 /// Every artist name on 16colo.rs (sorted). `/v1/artist` items are `{ artist: { name } }`.
 pub fn fetch_artists() -> Result<Vec<String>, String> {
     let mut names = Vec::new();
@@ -285,33 +278,6 @@ pub fn fetch_artists() -> Result<Vec<String>, String> {
     names.sort_by_key(|s| s.to_lowercase());
     names.dedup();
     Ok(names)
-}
-
-/// The packs an artist contributed to (newest year first, de-duplicated). The
-/// `/v1/artist/:name` body is `{ results: { "<year>": { "<pack>": { files, … } } } }`;
-/// we surface the packs (each opens via the normal zip flow) rather than loose pieces.
-pub fn fetch_artist_packs(artist: &str) -> Result<Vec<Pack>, String> {
-    let v = get_json(&format!("{API}/artist/{}?pagesize=100", enc(artist)))?;
-    let mut packs = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    if let Some(by_year) = v["results"].as_object() {
-        let mut years: Vec<&String> = by_year.keys().collect();
-        years.sort_by(|a, b| b.cmp(a));
-        for y in years {
-            let year: u32 = y.parse().unwrap_or(0);
-            if let Some(map) = by_year[y].as_object() {
-                for name in map.keys() {
-                    if seen.insert(name.clone()) {
-                        packs.push(Pack {
-                            name: name.clone(),
-                            url: pack_url(year, name),
-                        });
-                    }
-                }
-            }
-        }
-    }
-    Ok(packs)
 }
 
 /// The most recent releases (packs), newest first. `/v1/latest/releases` items carry
@@ -368,9 +334,203 @@ pub fn search_groups(query: &str) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+/// One individual art *piece* on 16colo.rs (not a pack). This is what the flat table
+/// view shows: the file plus the metadata needed for its columns + actions. Built
+/// from the artist/pack JSON endpoints (no pack download). `raw_url` is the single
+/// file (for "open" / "download file"); `tn_url` is its pre-rendered thumbnail PNG.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Piece {
+    pub filename: String,
+    pub artist: String,
+    pub group: String,
+    pub year: u32,
+    pub pack: String,
+    pub raw_url: String,
+    pub tn_url: String,
+}
+
+/// Make a site-relative API path (`/pack/…`) absolute; pass through an already-absolute
+/// URL; empty stays empty.
+fn abs_url(p: &str) -> String {
+    if p.is_empty() || p.starts_with("http") {
+        p.to_string()
+    } else {
+        format!("{SITE}{p}")
+    }
+}
+
+/// Flatten an artist's `/v1/artist/:name` body into pieces. Shape:
+/// `results → "<year>" → "<pack>" → { group, files: [{ file, raw, tn }] }`.
+/// Pure (no network) so it's unit-testable; [`fetch_artist_pieces`] just feeds it.
+fn pieces_from_artist_json(artist: &str, v: &serde_json::Value) -> Vec<Piece> {
+    let mut pieces = Vec::new();
+    let Some(by_year) = v["results"].as_object() else {
+        return pieces;
+    };
+    for (y, packs) in by_year {
+        let year: u32 = y.parse().unwrap_or(0);
+        let Some(packs) = packs.as_object() else {
+            continue;
+        };
+        for (pack, info) in packs {
+            let group = info["group"].as_str().unwrap_or("").to_string();
+            let Some(files) = info["files"].as_array() else {
+                continue;
+            };
+            for f in files {
+                let Some(filename) = f["file"].as_str() else {
+                    continue;
+                };
+                pieces.push(Piece {
+                    filename: filename.to_string(),
+                    artist: artist.to_string(),
+                    group: group.clone(),
+                    year,
+                    pack: pack.clone(),
+                    raw_url: abs_url(f["raw"].as_str().unwrap_or("")),
+                    tn_url: abs_url(f["tn"].as_str().unwrap_or("")),
+                });
+            }
+        }
+    }
+    pieces
+}
+
+/// Flatten a pack's `/v1/pack/:pack` body into pieces. Shape:
+/// `results[] → { year, files: { "<FILE>": { file: { raw, tn: { uri } }, artists: [] } } }`.
+/// `group` isn't reliably per-file here, so the caller stamps it (it's listing one group).
+fn pieces_from_pack_json(
+    pack: &str,
+    group: &str,
+    year_hint: u32,
+    v: &serde_json::Value,
+) -> Vec<Piece> {
+    let mut pieces = Vec::new();
+    let Some(results) = v["results"].as_array() else {
+        return pieces;
+    };
+    for r in results {
+        let year = r["year"].as_u64().map(|y| y as u32).unwrap_or(year_hint);
+        let Some(files) = r["files"].as_object() else {
+            continue;
+        };
+        for (filename, fobj) in files {
+            let tn = fobj["file"]["tn"]["uri"].as_str().unwrap_or("");
+            let artist = fobj["artists"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            pieces.push(Piece {
+                filename: filename.clone(),
+                artist,
+                group: group.to_string(),
+                year,
+                pack: pack.to_string(),
+                raw_url: format!("{SITE}/pack/{}/raw/{}", enc(pack), filename),
+                tn_url: abs_url(tn),
+            });
+        }
+    }
+    pieces
+}
+
+/// Every piece by `artist` (one API call — the artist endpoint carries files inline).
+pub fn fetch_artist_pieces(artist: &str) -> Result<Vec<Piece>, String> {
+    let v = get_json(&format!("{API}/artist/{}?pagesize=100", enc(artist)))?;
+    Ok(pieces_from_artist_json(artist, &v))
+}
+
+/// A group's packs as `(year, pack)` refs (newest year first), so the caller can fetch
+/// each pack's pieces. `/v1/group/:name` → `{ results: { packs: { "<year>": [pack…] } } }`.
+pub fn fetch_group_pack_refs(group: &str) -> Result<Vec<(u32, String)>, String> {
+    let v = get_json(&format!("{API}/group/{}?pagesize=100", enc(group)))?;
+    let mut refs = Vec::new();
+    if let Some(by_year) = v["results"]["packs"].as_object() {
+        let mut years: Vec<&String> = by_year.keys().collect();
+        years.sort_by(|a, b| b.cmp(a)); // newest first
+        for y in years {
+            let year: u32 = y.parse().unwrap_or(0);
+            if let Some(list) = by_year[y].as_array() {
+                for p in list.iter().filter_map(|p| p.as_str()) {
+                    refs.push((year, p.to_string()));
+                }
+            }
+        }
+    }
+    Ok(refs)
+}
+
+/// Every piece in `pack` (via `/v1/pack/:pack`), stamped with `group` (the listing
+/// context). `year_hint` is used only if a result omits its year.
+pub fn fetch_pack_pieces(group: &str, year_hint: u32, pack: &str) -> Result<Vec<Piece>, String> {
+    let v = get_json(&format!("{API}/pack/{}", enc(pack)))?;
+    Ok(pieces_from_pack_json(pack, group, year_hint, &v))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artist_json_flattens_to_pieces() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{ "results": { "1992": { "acdu0892": {
+                "group": "acid",
+                "files": [
+                    { "file": "MIDNACD3.ANS", "raw": "/pack/acdu0892/raw/MIDNACD3.ANS",
+                      "tn": "/pack/acdu0892/tn/MIDNACD3.ANS.png" }
+                ]
+            } } } }"#,
+        )
+        .unwrap();
+        let pieces = pieces_from_artist_json("jed", &v);
+        assert_eq!(pieces.len(), 1);
+        let p = &pieces[0];
+        assert_eq!(p.filename, "MIDNACD3.ANS");
+        assert_eq!(p.artist, "jed");
+        assert_eq!(p.group, "acid");
+        assert_eq!(p.year, 1992);
+        assert_eq!(p.pack, "acdu0892");
+        assert_eq!(
+            p.raw_url,
+            "https://16colo.rs/pack/acdu0892/raw/MIDNACD3.ANS"
+        );
+        assert_eq!(
+            p.tn_url,
+            "https://16colo.rs/pack/acdu0892/tn/MIDNACD3.ANS.png"
+        );
+    }
+
+    #[test]
+    fn pack_json_flattens_and_stamps_group() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{ "results": [ { "year": 1992, "files": {
+                "ACID-BR.ANS": {
+                    "file": { "raw": "ACID-BR.ANS",
+                              "tn": { "uri": "/pack/acdu0892/tn/ACID-BR.ANS.png" } },
+                    "artists": ["blade runner"]
+                }
+            } } ] }"#,
+        )
+        .unwrap();
+        let pieces = pieces_from_pack_json("acdu0892", "acid", 0, &v);
+        assert_eq!(pieces.len(), 1);
+        let p = &pieces[0];
+        assert_eq!(p.filename, "ACID-BR.ANS");
+        assert_eq!(p.artist, "blade runner");
+        assert_eq!(p.group, "acid"); // stamped from listing context
+        assert_eq!(p.year, 1992);
+        assert_eq!(p.raw_url, "https://16colo.rs/pack/acdu0892/raw/ACID-BR.ANS");
+        assert_eq!(
+            p.tn_url,
+            "https://16colo.rs/pack/acdu0892/tn/ACID-BR.ANS.png"
+        );
+    }
 
     #[test]
     fn rel_parts_splits_the_virtual_path() {
