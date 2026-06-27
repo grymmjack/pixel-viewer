@@ -1,3 +1,4 @@
+use crate::colo_thumb::RemoteThumbs;
 use crate::decode::Registry;
 use crate::thumb::ThumbBuilder;
 use eframe::egui;
@@ -89,6 +90,15 @@ enum RemoteMsg {
 /// A screensaver random-pack pick: `(year, pack name, download URL)` or an error.
 type RandomPick = Result<(u32, String, String), String>;
 
+/// A streamed result from a 16colo.rs flat-piece listing (artist/group/search). Mirrors
+/// `SearchMsg`: one `Hit` per piece as it's discovered, then `Done(total)`. Each hit
+/// carries the piece's `Entry` (virtual path) plus its [`ColoPiece`] metadata.
+enum ColoMsg {
+    Hit(Entry, ColoPiece),
+    Done(usize),
+    Err(String),
+}
+
 /// A virtual (non-on-disk) directory `Entry`, used for the 16colo.rs year/pack tree.
 fn virtual_dir(path: PathBuf) -> Entry {
     Entry {
@@ -108,6 +118,22 @@ struct ImgMeta {
     w: u32,
     h: u32,
     colors: Option<usize>,
+}
+
+/// Per-piece 16colo.rs metadata, keyed by the piece's virtual display path
+/// (`<16colo.rs>/<year>/<pack>/<FILE>`). Populated when an artist/group/search view
+/// is flattened into individual pieces (see [`PixelView::start_colo_pieces`]); it
+/// drives the table's scene columns, the scene sort keys, and the per-row download
+/// actions. The thumbnail comes from `tn_url` (16colo's pre-rendered PNG), and
+/// opening a piece downloads `raw_url` (the single file) rather than its whole pack.
+#[derive(Clone)]
+struct ColoPiece {
+    artist: String,
+    group: String,
+    year: u32,
+    pack: String,
+    raw_url: String, // single-file download (the .ans/.png itself)
+    tn_url: String,  // pre-rendered thumbnail PNG
 }
 
 /// An animated GIF being viewed: uploaded frame textures + playback timing.
@@ -326,11 +352,18 @@ enum SortKey {
     Size,
     Rating,
     Colors,
+    Dimensions,
+    // 16colo.rs flat-listing columns — sort by the `colo_pieces` metadata map. They
+    // never reach the sortbar combo (`COMMON`); only the table's scene headers set them.
+    Artist,
+    Group,
+    Year,
+    Pack,
 }
 
 impl SortKey {
     // New keys are appended so persisted indices (`to_u8`) stay valid across upgrades.
-    const ALL: [SortKey; 7] = [
+    const ALL: [SortKey; 12] = [
         SortKey::Name,
         SortKey::Type,
         SortKey::Modified,
@@ -338,6 +371,23 @@ impl SortKey {
         SortKey::Size,
         SortKey::Rating,
         SortKey::Colors,
+        SortKey::Dimensions,
+        SortKey::Artist,
+        SortKey::Group,
+        SortKey::Year,
+        SortKey::Pack,
+    ];
+    /// The keys offered in the sort-bar combo (the scene-only keys are excluded —
+    /// they're only meaningful in a 16colo.rs flat listing and set via the table).
+    const COMMON: [SortKey; 8] = [
+        SortKey::Name,
+        SortKey::Type,
+        SortKey::Modified,
+        SortKey::Created,
+        SortKey::Size,
+        SortKey::Rating,
+        SortKey::Colors,
+        SortKey::Dimensions,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -348,6 +398,11 @@ impl SortKey {
             SortKey::Size => "Size",
             SortKey::Rating => "Rating",
             SortKey::Colors => "Colors",
+            SortKey::Dimensions => "Dimensions",
+            SortKey::Artist => "Artist",
+            SortKey::Group => "Group",
+            SortKey::Year => "Year",
+            SortKey::Pack => "Pack",
         }
     }
     fn to_u8(self) -> u8 {
@@ -369,6 +424,7 @@ enum MenuAction {
     ToggleExplorer,
     ToggleDetails,
     ToggleRecolor,
+    ToggleTable,
     Up,
     Home,
     Nav(PathBuf),
@@ -734,6 +790,27 @@ pub struct PixelView {
     // Persisted on-screen thumbnail tile size in points — Ctrl+wheel in the grid.
     // Independent of `ui_zoom`: this scales tiles only, not the chrome.
     thumb_size: f32,
+
+    // Table view (an alternate renderer for the browse/grid mode — `Mode` stays
+    // `Grid`, so selection/ratings/nav/keys all work unchanged). Persisted.
+    table_view: bool,
+    // 16colo.rs flat-piece listing state. `colo_flat` marks the current view as a
+    // flattened artist/group/search listing (→ the table shows scene columns). The
+    // map carries per-piece metadata keyed by virtual display path (see [`ColoPiece`]).
+    colo_flat: bool,
+    colo_pieces: HashMap<PathBuf, ColoPiece>,
+    // Streaming channel for a piece listing (mirrors `search_rx`): Hit(piece) per match.
+    colo_rx: Option<std::sync::mpsc::Receiver<ColoMsg>>,
+    colo_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    // Remote thumbnail fetcher for 16colo pieces (downloads `tn` PNGs off the UI thread).
+    colo_thumbs: RemoteThumbs,
+    // Downloaded single-piece files: virtual display path → local cache file, so the
+    // viewer can decode a piece opened from the flat listing (see `resolve_local`).
+    colo_files: HashMap<PathBuf, PathBuf>,
+    // A piece whose `raw` file is downloading so we can open it in the viewer once ready.
+    colo_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
+    // Status messages from "Download file/pack" save threads (drained into `status`).
+    colo_save_rx: Option<std::sync::mpsc::Receiver<String>>,
 }
 
 impl PixelView {
@@ -791,6 +868,8 @@ impl PixelView {
     const PALETTE_FAV_KEY: &'static str = "palette_favorites";
     const SELECTED_PAL_KEY: &'static str = "selected_palette";
     const KEYMAP_KEY: &'static str = "keymap";
+    /// Whether the browse view renders as a table (vs the thumbnail grid).
+    const TABLE_VIEW_KEY: &'static str = "table_view";
 
     pub fn new(cc: &eframe::CreationContext<'_>, cli: CliArgs) -> Self {
         let registry = Arc::new(Registry::with_builtins());
@@ -798,6 +877,8 @@ impl PixelView {
             .map(|n| n.get())
             .unwrap_or(4);
         let thumbs = ThumbBuilder::new(Arc::clone(&registry), workers);
+        // A few HTTP workers for 16colo.rs thumbnail PNGs (don't hammer the server).
+        let colo_thumbs = RemoteThumbs::new(workers.min(6));
 
         // Restore the UI scale the user last set with Ctrl +/- (defaults to 1.0).
         let ui_zoom = cc
@@ -846,6 +927,7 @@ impl PixelView {
         let get_bool = |k| cc.storage.and_then(|s| eframe::get_value::<bool>(s, k));
         let sort_key = SortKey::from_u8(get_u8(Self::SORT_KEY).unwrap_or(0));
         let sort_desc = get_bool(Self::SORT_DESC).unwrap_or(false);
+        let table_view = get_bool(Self::TABLE_VIEW_KEY).unwrap_or(false);
         let dirs_first = get_bool(Self::DIRS_FIRST).unwrap_or(true);
         let min_rating = get_u8(Self::MIN_RATING).unwrap_or(0);
         let show_explorer = get_bool(Self::EXPLORER_KEY).unwrap_or(false);
@@ -1170,6 +1252,15 @@ impl PixelView {
             want_repaint: false,
             ui_zoom,
             thumb_size,
+            table_view,
+            colo_flat: false,
+            colo_pieces: HashMap::new(),
+            colo_rx: None,
+            colo_cancel: None,
+            colo_thumbs,
+            colo_files: HashMap::new(),
+            colo_open_rx: None,
+            colo_save_rx: None,
         };
 
         // Reopen wherever we left off so the grid, breadcrumb, and favorites are
@@ -1613,6 +1704,7 @@ impl PixelView {
             self.min_rating,
             self.search.as_deref(),
             &self.img_meta,
+            &self.colo_pieces,
         );
     }
 
@@ -2456,17 +2548,29 @@ impl PixelView {
         let mut min_rating = self.min_rating;
 
         ui.horizontal(|ui| {
+            // View toggle: thumbnail grid vs sortable table (an alternate layout of the
+            // same browse mode). Two selectable labels read clearer than one glyph.
+            ui.label("View:");
+            if ui.selectable_label(!self.table_view, "Grid").clicked() {
+                self.table_view = false;
+            }
+            if ui.selectable_label(self.table_view, "Table").clicked() {
+                self.table_view = true;
+            }
+            ui.separator();
             ui.label("Sort:");
             let cr = egui::ComboBox::from_id_salt("sort_key")
                 .selected_text(key.label())
                 .show_ui(ui, |ui| {
-                    for k in SortKey::ALL {
+                    for k in SortKey::COMMON {
                         ui.selectable_value(&mut key, k, k.label());
                     }
                 });
-            let mut ki = SortKey::ALL.iter().position(|&k| k == key).unwrap_or(0);
-            if wheel_cycle(ui, &cr.response, &mut ki, SortKey::ALL.len()) {
-                key = SortKey::ALL[ki];
+            // Wheel-cycle within the common keys; a scene key (set via the table) maps
+            // to its position if present, else stays put.
+            let mut ki = SortKey::COMMON.iter().position(|&k| k == key).unwrap_or(0);
+            if wheel_cycle(ui, &cr.response, &mut ki, SortKey::COMMON.len()) {
+                key = SortKey::COMMON[ki];
             }
             if ui
                 .button(if desc { "↓ Desc" } else { "↑ Asc" })
@@ -4444,67 +4548,15 @@ impl PixelView {
                             clicked = Some((idx, ui.input(|i| i.modifiers)));
                         }
                         resp.context_menu(|ui| {
-                            if entry.is_dir {
-                                let pinned = self.favorites.iter().any(|f| f == &entry.path);
-                                if ui
-                                    .add_enabled(!pinned, egui::Button::new("📌 Pin to Places"))
-                                    .clicked()
-                                {
-                                    pin_dir = Some(idx);
-                                    ui.close();
-                                }
-                                ui.separator();
-                            } else {
-                                ui.menu_button("🔍 Smart filter on…", |ui| {
-                                    let mut pick = |ui: &mut egui::Ui, label: &str, c| {
-                                        if ui.button(label).clicked() {
-                                            smart_on = Some((idx, c));
-                                            ui.close();
-                                        }
-                                    };
-                                    pick(ui, "Type", SmartCriterion::Type);
-                                    pick(ui, "File name", SmartCriterion::Name);
-                                    pick(ui, "File size (±20%)", SmartCriterion::Size);
-                                    pick(ui, "Date modified", SmartCriterion::Date);
-                                    if entry.rating > 0 {
-                                        pick(ui, "Rating (this ★ or more)", SmartCriterion::Rating);
-                                    }
-                                    if is_textmode_ext(&entry.path) {
-                                        ui.separator();
-                                        pick(ui, "SAUCE group", SmartCriterion::Group);
-                                        pick(ui, "SAUCE artist", SmartCriterion::Artist);
-                                    }
-                                });
-                                ui.separator();
-                            }
-                            if ui.button("Copy").clicked() {
-                                ctx_action = Some((idx, FileAction::Copy));
-                                ui.close();
-                            }
-                            if ui.button("Cut").clicked() {
-                                ctx_action = Some((idx, FileAction::Cut));
-                                ui.close();
-                            }
-                            if ui
-                                .add_enabled(can_paste, egui::Button::new("Paste"))
-                                .clicked()
+                            let pinned = self.favorites.iter().any(|f| f == &entry.path);
+                            if let Some(pick) =
+                                entry_context_menu(ui, &entry, can_paste, pinned)
                             {
-                                ctx_action = Some((idx, FileAction::Paste));
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui.button("Rename…").clicked() {
-                                ctx_action = Some((idx, FileAction::Rename));
-                                ui.close();
-                            }
-                            if ui.button("Move to trash").clicked() {
-                                ctx_action = Some((idx, FileAction::Delete));
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui.button("New folder").clicked() {
-                                ctx_action = Some((idx, FileAction::NewFolder));
-                                ui.close();
+                                match pick {
+                                    TilePick::Pin => pin_dir = Some(idx),
+                                    TilePick::Smart(c) => smart_on = Some((idx, c)),
+                                    TilePick::File(a) => ctx_action = Some((idx, a)),
+                                }
                             }
                         });
                         ui.add_space(gap);
@@ -4550,6 +4602,377 @@ impl PixelView {
                 self.smart_filter_from(&e, crit);
             }
         }
+    }
+
+    /// Sortable table renderer for the browse mode (toggled via `table_view`). It
+    /// shares the grid's data (`entries`, `selection`, thumbnails) and click
+    /// semantics (`handle_click`) — `Mode` stays `Grid` — but lays each entry out as
+    /// a row with clickable column headers (click to sort, click again to reverse).
+    /// In a 16colo.rs flat listing (`colo_flat`) it shows scene columns (artist /
+    /// year / group / pack + a per-row download menu); elsewhere, file columns.
+    fn ui_table(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        if self.entries.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label("Nothing here. Open a folder.");
+            });
+            return;
+        }
+        let scene = self.colo_flat;
+        let row_h = 46.0_f32;
+
+        // Column set + widths. The name/filename (and scene artist) columns flex to
+        // absorb leftover width so the table always spans the panel; the rest are fixed.
+        struct Col {
+            label: &'static str,
+            sort: Option<SortKey>,
+            w: f32,
+            flex: bool,
+            num: bool, // right-align (numeric / short value columns)
+        }
+        let thumb_w = row_h; // a square thumbnail cell
+        let dl_col = 7usize; // index of the scene download column (last)
+        let rating_col = 6usize; // index of the file rating column
+        let mut cols: Vec<Col> = if scene {
+            vec![
+                Col { label: "", sort: None, w: thumb_w, flex: false, num: false },
+                Col { label: "Filename", sort: Some(SortKey::Name), w: 0.0, flex: true, num: false },
+                Col { label: "Artist", sort: Some(SortKey::Artist), w: 0.0, flex: true, num: false },
+                Col { label: "Type", sort: Some(SortKey::Type), w: 56.0, flex: false, num: false },
+                Col { label: "Year", sort: Some(SortKey::Year), w: 52.0, flex: false, num: true },
+                Col { label: "Group", sort: Some(SortKey::Group), w: 130.0, flex: false, num: false },
+                Col { label: "Pack", sort: Some(SortKey::Pack), w: 130.0, flex: false, num: false },
+                Col { label: "", sort: None, w: 96.0, flex: false, num: false },
+            ]
+        } else {
+            vec![
+                Col { label: "", sort: None, w: thumb_w, flex: false, num: false },
+                Col { label: "Name", sort: Some(SortKey::Name), w: 0.0, flex: true, num: false },
+                Col { label: "Type", sort: Some(SortKey::Type), w: 64.0, flex: false, num: false },
+                Col { label: "Size", sort: Some(SortKey::Size), w: 84.0, flex: false, num: true },
+                Col { label: "Dimensions", sort: Some(SortKey::Dimensions), w: 96.0, flex: false, num: true },
+                Col { label: "Colors", sort: Some(SortKey::Colors), w: 68.0, flex: false, num: true },
+                Col { label: "Rating", sort: Some(SortKey::Rating), w: 72.0, flex: false, num: false },
+                Col { label: "Modified", sort: Some(SortKey::Modified), w: 110.0, flex: false, num: false },
+            ]
+        };
+        let bar = ui.spacing().scroll.bar_width + 2.0;
+        let avail = (ui.available_width() - bar).max(200.0);
+        let fixed: f32 = cols.iter().filter(|c| !c.flex).map(|c| c.w).sum();
+        let flex_n = cols.iter().filter(|c| c.flex).count().max(1);
+        let flex_w = ((avail - fixed) / flex_n as f32).max(90.0);
+        for c in cols.iter_mut().filter(|c| c.flex) {
+            c.w = flex_w;
+        }
+
+        // Deferred actions (the body closure borrows `&mut self`).
+        let mut clicked: Option<(usize, egui::Modifiers)> = None;
+        let mut hovered: Option<usize> = None;
+        let mut header_sort: Option<SortKey> = None;
+        let mut ctx_action: Option<(usize, FileAction)> = None;
+        let mut pin_dir: Option<usize> = None;
+        let mut smart_on: Option<(usize, SmartCriterion)> = None;
+        let mut dl: Option<(usize, bool)> = None; // (idx, want_pack)
+        let can_paste = self.clipboard.is_some();
+        let (sort_key, sort_desc) = (self.sort_key, self.sort_desc);
+
+        // Header row (above the scroll area so it stays put), sharing the body widths.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            for c in &cols {
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(c.w, 22.0),
+                    if c.sort.is_some() {
+                        egui::Sense::click()
+                    } else {
+                        egui::Sense::hover()
+                    },
+                );
+                ui.painter().rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
+                if !c.label.is_empty() {
+                    let active = c.sort == Some(sort_key);
+                    let arrow = if active {
+                        if sort_desc {
+                            " ⬇"
+                        } else {
+                            " ⬆"
+                        }
+                    } else {
+                        ""
+                    };
+                    let fg = if active {
+                        ui.visuals().strong_text_color()
+                    } else {
+                        ui.visuals().weak_text_color()
+                    };
+                    let (anchor, pos) = if c.num {
+                        (egui::Align2::RIGHT_CENTER, rect.right_center() - egui::vec2(6.0, 0.0))
+                    } else {
+                        (egui::Align2::LEFT_CENTER, rect.left_center() + egui::vec2(6.0, 0.0))
+                    };
+                    ui.painter().text(
+                        pos,
+                        anchor,
+                        format!("{}{arrow}", c.label),
+                        egui::FontId::proportional(12.5),
+                        fg,
+                    );
+                }
+                if resp.clicked() {
+                    header_sort = c.sort;
+                }
+            }
+        });
+        ui.separator();
+
+        let dark = ui.visuals().dark_mode;
+        let mut scroll = egui::ScrollArea::vertical()
+            .id_salt("table")
+            .auto_shrink([false; 2]);
+        if let Some(idx) = self.scroll_target.take() {
+            scroll = scroll.vertical_scroll_offset(idx as f32 * row_h);
+        }
+        scroll.show_rows(ui, row_h, self.entries.len(), |ui, range| {
+            // Rows must be exactly `row_h` tall to align with `show_rows`' virtualization.
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            for idx in range {
+                let entry = self.entries[idx].clone();
+                let path = entry.path.clone();
+                let is_selected = self.selection.contains(&path);
+                let meta = self.img_meta.get(&path).copied();
+                let piece = self.colo_pieces.get(&path).cloned();
+
+                // Request the thumbnail once: a remote piece via the HTTP pool (its `tn`
+                // PNG), any other file via the local decoder; both land in `thumb_tex`.
+                let tex = self.thumb_tex.get(&path).cloned();
+                if tex.is_none() && !entry.is_dir {
+                    if let Some(p) = &piece {
+                        self.colo_thumbs.request(&path, &p.tn_url, THUMB_PX);
+                    } else {
+                        self.thumbs.request(&path, THUMB_PX);
+                    }
+                    self.want_repaint = true;
+                }
+
+                // Predict the row rect to highlight on hover the same frame it's drawn.
+                let row_rect =
+                    egui::Rect::from_min_size(ui.cursor().min, egui::vec2(avail, row_h));
+                let hover_row = ui.rect_contains_pointer(row_rect);
+                let bg = if is_selected {
+                    ui.visuals().selection.bg_fill
+                } else if hover_row {
+                    ui.visuals().widgets.hovered.bg_fill
+                } else if idx % 2 == 1 {
+                    ui.visuals().faint_bg_color
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                let fg = if is_selected {
+                    ui.visuals().strong_text_color()
+                } else if dark {
+                    egui::Color32::from_gray(205)
+                } else {
+                    ui.visuals().text_color()
+                };
+
+                let mut row_resp: Option<egui::Response> = None;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    for (i, c) in cols.iter().enumerate() {
+                        // The scene download column is an interactive menu, not a cell.
+                        if scene && i == dl_col && !entry.is_dir {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(c.w, row_h),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.set_min_size(egui::vec2(c.w, row_h));
+                                    ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
+                                    ui.add_space(8.0);
+                                    ui.menu_button("⬇", |ui| {
+                                        if ui.button("Download file").clicked() {
+                                            dl = Some((idx, false));
+                                            ui.close();
+                                        }
+                                        if ui.button("Download pack .zip").clicked() {
+                                            dl = Some((idx, true));
+                                            ui.close();
+                                        }
+                                    });
+                                },
+                            );
+                            continue;
+                        }
+                        let (rect, resp) =
+                            ui.allocate_exact_size(egui::vec2(c.w, row_h), egui::Sense::click());
+                        ui.painter().rect_filled(rect, 0.0, bg);
+                        if i == 0 {
+                            // Thumbnail (or a folder glyph for directory rows).
+                            if entry.is_dir {
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "📁",
+                                    egui::FontId::proportional(row_h * 0.5),
+                                    fg,
+                                );
+                            } else if let Some(tex) = &tex {
+                                let fit = fit_centered(rect.shrink(4.0), tex.size_vec2());
+                                ui.painter().image(
+                                    tex.id(),
+                                    fit,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                        } else if !scene && i == rating_col {
+                            if entry.rating > 0 {
+                                ui.painter().text(
+                                    rect.left_center() + egui::vec2(6.0, 0.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    "★".repeat(entry.rating as usize),
+                                    egui::FontId::proportional(13.0),
+                                    egui::Color32::from_rgb(255, 200, 60),
+                                );
+                            }
+                        } else {
+                            let txt = table_cell_text(&entry, meta, piece.as_ref(), scene, i);
+                            if !txt.is_empty() {
+                                let max_chars = ((c.w - 10.0) / 6.5).max(1.0) as usize;
+                                let (anchor, pos) = if c.num {
+                                    (
+                                        egui::Align2::RIGHT_CENTER,
+                                        rect.right_center() - egui::vec2(6.0, 0.0),
+                                    )
+                                } else {
+                                    (
+                                        egui::Align2::LEFT_CENTER,
+                                        rect.left_center() + egui::vec2(6.0, 0.0),
+                                    )
+                                };
+                                ui.painter().text(
+                                    pos,
+                                    anchor,
+                                    elide(&txt, max_chars),
+                                    egui::FontId::proportional(12.5),
+                                    fg,
+                                );
+                            }
+                        }
+                        row_resp = Some(match row_resp.take() {
+                            Some(r) => r.union(resp),
+                            None => resp,
+                        });
+                    }
+                });
+
+                if let Some(resp) = row_resp {
+                    let resp = resp.on_hover_ui(|ui| hover_details(ui, &entry, meta));
+                    if resp.hovered() {
+                        hovered = Some(idx);
+                    }
+                    if resp.clicked() {
+                        clicked = Some((idx, ui.input(|i| i.modifiers)));
+                    }
+                    let pinned = self.favorites.iter().any(|f| f == &entry.path);
+                    resp.context_menu(|ui| {
+                        if let Some(pick) = entry_context_menu(ui, &entry, can_paste, pinned) {
+                            match pick {
+                                TilePick::Pin => pin_dir = Some(idx),
+                                TilePick::Smart(c) => smart_on = Some((idx, c)),
+                                TilePick::File(a) => ctx_action = Some((idx, a)),
+                            }
+                        }
+                    });
+                }
+            }
+        });
+
+        // Apply the deferred actions (now that the body's `&mut self` borrow is done).
+        self.hovered = hovered;
+        if let Some(i) = hovered {
+            self.last_inspected = self.entries.get(i).map(|e| e.path.clone());
+        }
+        if let Some(k) = header_sort {
+            // Click the active column again to reverse; a new column starts ascending.
+            if self.sort_key == k {
+                self.sort_desc = !self.sort_desc;
+            } else {
+                self.sort_key = k;
+                self.sort_desc = false;
+            }
+            self.rebuild_view();
+        }
+        if let Some((idx, mods)) = clicked {
+            self.handle_click(ctx, idx, mods);
+        }
+        if let Some((idx, a)) = ctx_action {
+            if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
+                if !self.selection.contains(&p)
+                    && !matches!(a, FileAction::Paste | FileAction::NewFolder)
+                {
+                    self.selection.clear();
+                    self.selection.insert(p);
+                    self.hovered = Some(idx);
+                }
+            }
+            self.do_file_action(a);
+        }
+        if let Some(idx) = pin_dir {
+            if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
+                if !self.favorites.contains(&p) {
+                    self.favorites.push(p);
+                    self.status = "Pinned to Places".into();
+                }
+            }
+        }
+        if let Some((idx, crit)) = smart_on {
+            if let Some(e) = self.entries.get(idx).cloned() {
+                self.smart_filter_from(&e, crit);
+            }
+        }
+        if let Some((idx, want_pack)) = dl {
+            if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
+                self.download_piece(&p, want_pack);
+            }
+        }
+    }
+
+    /// "Download file/pack" from a 16colo.rs flat-listing row: ask the user where to
+    /// save, then fetch on a background thread (the file's `raw` URL, or its pack zip)
+    /// and report completion via `colo_save_rx`. No-op for a non-piece path.
+    fn download_piece(&mut self, path: &Path, want_pack: bool) {
+        let Some(piece) = self.colo_pieces.get(path) else {
+            return;
+        };
+        let (url, default_name) = if want_pack {
+            (
+                crate::sixteen::pack_url(piece.year, &piece.pack),
+                format!("{}.zip", piece.pack),
+            )
+        } else {
+            (
+                piece.raw_url.clone(),
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("download")
+                    .to_string(),
+            )
+        };
+        let Some(dest) = rfd::FileDialog::new().set_file_name(&default_name).save_file() else {
+            return; // user cancelled
+        };
+        self.status = format!("Downloading {default_name}…");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let msg = match crate::sixteen::download_to(&url, &dest) {
+                Ok(()) => format!("Saved {}", short_name(&dest)),
+                Err(e) => format!("Download failed: {e}"),
+            };
+            let _ = tx.send(msg);
+        });
+        self.colo_save_rx = Some(rx);
     }
 
     fn ui_single(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
@@ -5684,6 +6107,15 @@ impl PixelView {
             });
             ui.menu_button("View", |ui| {
                 if ui
+                    .selectable_label(self.table_view, "Table view")
+                    .on_hover_text("Show the current folder as a sortable table")
+                    .clicked()
+                {
+                    action = Some(MenuAction::ToggleTable);
+                    ui.close();
+                }
+                ui.separator();
+                if ui
                     .selectable_label(self.show_explorer, "Explorer pane")
                     .clicked()
                 {
@@ -5715,7 +6147,7 @@ impl PixelView {
                 }
             });
             ui.menu_button("Sort", |ui| {
-                for k in SortKey::ALL {
+                for k in SortKey::COMMON {
                     if ui.selectable_label(self.sort_key == k, k.label()).clicked() {
                         action = Some(MenuAction::Sort(k));
                         ui.close();
@@ -5776,6 +6208,7 @@ impl PixelView {
             MenuAction::ToggleExplorer => self.show_explorer = !self.show_explorer,
             MenuAction::ToggleDetails => self.show_details = !self.show_details,
             MenuAction::ToggleRecolor => self.show_recolor = !self.show_recolor,
+            MenuAction::ToggleTable => self.table_view = !self.table_view,
             MenuAction::Up => {
                 // Compute the parent in *display* space so "up" from an archive root
                 // lands in the archive's real parent folder, not its temp dir.
@@ -6345,6 +6778,9 @@ impl eframe::App for PixelView {
             central
         };
         central.show_inside(ui, |ui| match self.mode {
+            // The table is an alternate renderer for the browse mode (not a third
+            // `Mode`), so selection/ratings/keyboard-nav all keep working unchanged.
+            Mode::Grid if self.table_view => self.ui_table(&ctx, ui),
             Mode::Grid => self.ui_grid(&ctx, ui),
             Mode::Single => self.ui_single(&ctx, ui),
         });
@@ -6551,6 +6987,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::FOLDER_KEY, &self.folder);
         eframe::set_value(storage, Self::SORT_KEY, &self.sort_key.to_u8());
         eframe::set_value(storage, Self::SORT_DESC, &self.sort_desc);
+        eframe::set_value(storage, Self::TABLE_VIEW_KEY, &self.table_view);
         eframe::set_value(storage, Self::DIRS_FIRST, &self.dirs_first);
         eframe::set_value(storage, Self::MIN_RATING, &self.min_rating);
         eframe::set_value(storage, Self::EXPLORER_KEY, &self.show_explorer);
@@ -7779,6 +8216,7 @@ fn sorted_filtered_view(
     min_rating: u8,
     name_filter: Option<&str>,
     meta: &HashMap<PathBuf, ImgMeta>,
+    pieces: &HashMap<PathBuf, ColoPiece>,
 ) -> Vec<Entry> {
     use std::cmp::Ordering;
     let needle = name_filter
@@ -7804,6 +8242,14 @@ fn sorted_filtered_view(
     // images (and the "too many colors" cap) read as None and sort *after* every
     // known count, so the order settles toward the front as tiles decode.
     let colors = |e: &Entry| meta.get(&e.path).and_then(|m| m.colors);
+    // Pixel dimensions (area, then width), also from the thumbnailer's lazy metadata.
+    let dims = |e: &Entry| meta.get(&e.path).map(|m| (m.w as u64 * m.h as u64, m.w));
+    // 16colo.rs scene metadata for the flat-listing sort keys (empty for local folders).
+    let piece = |e: &Entry| pieces.get(&e.path);
+    let artist = |e: &Entry| piece(e).map(|p| p.artist.to_ascii_lowercase());
+    let group = |e: &Entry| piece(e).map(|p| p.group.to_ascii_lowercase());
+    let year = |e: &Entry| piece(e).map(|p| p.year);
+    let pack = |e: &Entry| piece(e).map(|p| p.pack.to_ascii_lowercase());
 
     // Archives sort alongside folders (they're navigated into like folders).
     let folder_like = |e: &Entry| e.is_dir || e.is_archive;
@@ -7835,10 +8281,29 @@ fn sorted_filtered_view(
                 (None, Some(_)) => Ordering::Greater,
                 (None, None) => Ordering::Equal,
             },
+            // Dimensions: same "unknown (not-yet-decoded) sorts last" rule as Colors.
+            SortKey::Dimensions => match (dims(a), dims(b)) {
+                (Some(x), Some(y)) => {
+                    let ord = x.cmp(&y);
+                    if desc {
+                        ord.reverse()
+                    } else {
+                        ord
+                    }
+                }
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            },
+            // 16colo.rs scene keys (None only for non-piece entries → sorts first asc).
+            SortKey::Artist => artist(a).cmp(&artist(b)),
+            SortKey::Group => group(a).cmp(&group(b)),
+            SortKey::Year => year(a).cmp(&year(b)),
+            SortKey::Pack => pack(a).cmp(&pack(b)),
         };
-        // Colors already applied its own direction (so unknowns stay last); the
-        // other keys flip here.
-        let primary = if desc && key != SortKey::Colors {
+        // Colors/Dimensions already applied their own direction (so unknowns stay
+        // last); the other keys flip here.
+        let primary = if desc && !matches!(key, SortKey::Colors | SortKey::Dimensions) {
             primary.reverse()
         } else {
             primary
@@ -8075,6 +8540,125 @@ fn make_entry(path: PathBuf, is_dir: bool) -> Entry {
 }
 
 /// Hover-tooltip contents for a grid tile.
+/// A deferred right-click-menu choice for a grid tile / table row — applied by the
+/// caller (which holds `&mut self`), so the menu closure needn't borrow `self`.
+enum TilePick {
+    Pin,
+    Smart(SmartCriterion),
+    File(FileAction),
+}
+
+/// The shared right-click context menu for a browse entry (used by both the grid tile
+/// and the table row). Returns the chosen action, or `None` while the menu is still
+/// open. `pinned` (already-a-favorite) and `can_paste` are passed in so this needn't
+/// touch `self`.
+fn entry_context_menu(
+    ui: &mut egui::Ui,
+    entry: &Entry,
+    can_paste: bool,
+    pinned: bool,
+) -> Option<TilePick> {
+    let mut pick = None;
+    if entry.is_dir {
+        if ui
+            .add_enabled(!pinned, egui::Button::new("📌 Pin to Places"))
+            .clicked()
+        {
+            pick = Some(TilePick::Pin);
+            ui.close();
+        }
+        ui.separator();
+    } else {
+        ui.menu_button("🔍 Smart filter on…", |ui| {
+            let mut on = |ui: &mut egui::Ui, label: &str, c| {
+                if ui.button(label).clicked() {
+                    pick = Some(TilePick::Smart(c));
+                    ui.close();
+                }
+            };
+            on(ui, "Type", SmartCriterion::Type);
+            on(ui, "File name", SmartCriterion::Name);
+            on(ui, "File size (±20%)", SmartCriterion::Size);
+            on(ui, "Date modified", SmartCriterion::Date);
+            if entry.rating > 0 {
+                on(ui, "Rating (this ★ or more)", SmartCriterion::Rating);
+            }
+            if is_textmode_ext(&entry.path) {
+                ui.separator();
+                on(ui, "SAUCE group", SmartCriterion::Group);
+                on(ui, "SAUCE artist", SmartCriterion::Artist);
+            }
+        });
+        ui.separator();
+    }
+    let mut file = |ui: &mut egui::Ui, label: &str, enabled: bool, a: FileAction| {
+        if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+            pick = Some(TilePick::File(a));
+            ui.close();
+        }
+    };
+    file(ui, "Copy", true, FileAction::Copy);
+    file(ui, "Cut", true, FileAction::Cut);
+    file(ui, "Paste", can_paste, FileAction::Paste);
+    ui.separator();
+    file(ui, "Rename…", true, FileAction::Rename);
+    file(ui, "Move to trash", true, FileAction::Delete);
+    ui.separator();
+    file(ui, "New folder", true, FileAction::NewFolder);
+    pick
+}
+
+/// The text shown in table column `col` for `entry` (column 0 = thumbnail and the
+/// rating column are painted by the caller, so they're not produced here).
+fn table_cell_text(
+    entry: &Entry,
+    meta: Option<ImgMeta>,
+    piece: Option<&ColoPiece>,
+    scene: bool,
+    col: usize,
+) -> String {
+    let fname = || {
+        entry
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let ext = || {
+        entry
+            .path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_uppercase())
+            .unwrap_or_default()
+    };
+    if scene {
+        match col {
+            1 => fname(),
+            2 => piece.map(|p| p.artist.clone()).unwrap_or_default(),
+            3 => ext(),
+            4 => piece.map(|p| p.year.to_string()).unwrap_or_default(),
+            5 => piece.map(|p| p.group.clone()).unwrap_or_default(),
+            6 => piece.map(|p| p.pack.clone()).unwrap_or_default(),
+            _ => String::new(),
+        }
+    } else {
+        match col {
+            1 => fname(),
+            2 => ext(),
+            3 => human_size(entry.size),
+            4 => meta.map(|m| format!("{}×{}", m.w, m.h)).unwrap_or_default(),
+            5 => meta
+                .and_then(|m| m.colors)
+                .map(|c| c.to_string())
+                .unwrap_or_default(),
+            7 => entry.mtime.map(date_ymd).unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+}
+
 fn hover_details(ui: &mut egui::Ui, entry: &Entry, meta: Option<ImgMeta>) {
     // Pin the tooltip to a consistent width. Without this, egui shrinks it to the
     // space available near a panel/screen edge (the leftmost grid column), which
@@ -8752,7 +9336,16 @@ mod tests {
             img_entry("a.png", 20, 0),
             dir_entry("z_dir"),
         ];
-        let v = sorted_filtered_view(&all, SortKey::Name, false, true, 0, None, &HashMap::new());
+        let v = sorted_filtered_view(
+            &all,
+            SortKey::Name,
+            false,
+            true,
+            0,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let names: Vec<_> = v.iter().map(|e| e.path.to_str().unwrap()).collect();
         assert_eq!(names, vec!["z_dir", "a.png", "b.png"]);
     }
@@ -8764,7 +9357,16 @@ mod tests {
             img_entry("high.png", 1, 5),
             dir_entry("d"),
         ];
-        let v = sorted_filtered_view(&all, SortKey::Name, false, true, 3, None, &HashMap::new());
+        let v = sorted_filtered_view(
+            &all,
+            SortKey::Name,
+            false,
+            true,
+            3,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let names: Vec<_> = v.iter().map(|e| e.path.to_str().unwrap()).collect();
         assert_eq!(names, vec!["d", "high.png"]);
     }
@@ -8776,7 +9378,16 @@ mod tests {
             img_entry("b", 30, 0),
             img_entry("c", 20, 0),
         ];
-        let v = sorted_filtered_view(&all, SortKey::Size, true, false, 0, None, &HashMap::new());
+        let v = sorted_filtered_view(
+            &all,
+            SortKey::Size,
+            true,
+            false,
+            0,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let sizes: Vec<_> = v.iter().map(|e| e.size).collect();
         assert_eq!(sizes, vec![30, 20, 10]);
     }
@@ -8804,11 +9415,29 @@ mod tests {
                 })
                 .collect();
         // Ascending by count; the not-yet-decoded image sorts last.
-        let v = sorted_filtered_view(&all, SortKey::Colors, false, true, 0, None, &meta);
+        let v = sorted_filtered_view(
+            &all,
+            SortKey::Colors,
+            false,
+            true,
+            0,
+            None,
+            &meta,
+            &HashMap::new(),
+        );
         let names: Vec<_> = v.iter().map(|e| e.path.to_str().unwrap()).collect();
         assert_eq!(names, vec!["few.png", "mid.png", "many.png", "unknown.png"]);
         // Descending flips the known counts but keeps unknowns last.
-        let v = sorted_filtered_view(&all, SortKey::Colors, true, true, 0, None, &meta);
+        let v = sorted_filtered_view(
+            &all,
+            SortKey::Colors,
+            true,
+            true,
+            0,
+            None,
+            &meta,
+            &HashMap::new(),
+        );
         let names: Vec<_> = v.iter().map(|e| e.path.to_str().unwrap()).collect();
         assert_eq!(names, vec!["many.png", "mid.png", "few.png", "unknown.png"]);
     }
@@ -8827,6 +9456,7 @@ mod tests {
             true,
             0,
             Some("cat"),
+            &HashMap::new(),
             &HashMap::new(),
         );
         let names: Vec<_> = v.iter().map(|e| e.path.to_str().unwrap()).collect();

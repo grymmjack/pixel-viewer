@@ -166,6 +166,22 @@ pub fn download(url: &str) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
+/// Download `url` straight to `dest` (the "Download file / pack" action — the user
+/// already picked the destination). Streams to a temp sibling then renames, so a
+/// partial download never leaves a truncated file at `dest`.
+pub fn download_to(url: &str, dest: &Path) -> Result<(), String> {
+    let resp = ureq::get(url).call().map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(256 * 1024 * 1024)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    let tmp = dest.with_extension("part");
+    std::fs::write(&tmp, &buf).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, dest).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn hash(s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
