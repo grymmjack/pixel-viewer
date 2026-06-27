@@ -482,7 +482,17 @@ with matched rasterization a residual gap in some complex art can leak, so `floo
 **missing region (line art preserved) rather than a full-screen colour flood**, the
 right failure for a viewer. The cost: a genuinely huge legit background fill (>50%, e.g.
 jdraw/bg-svhnd) is also skipped — a known tradeoff (size can't tell a leak from a big
-fill; a `border:0` coloring-book scene like garfield needs the net). **Text:**
+fill; a `border:0` coloring-book scene like garfield needs the net). **Patterned fills
+(two BGI quirks — get both or layered dithered art is wrong):** (1) `fill_poly` borders
+the shape in the draw colour **only when that colour isn't 0** (`if self.color != 0`,
+matching icy_engine + PabloDraw's `FillPoly`/`BGICanvas`) — drawing it unconditionally
+painted a black contour seam around every band of a halftone-shaded portrait whose draw
+colour is 0 (e.g. ACiD's `US-HUMA1.RIP`). (2) A BGI fill is **opaque**: `fill_span`/
+`flood` paint a pattern's *clear* bits with `bkcolor` (black, the BGI default), **not**
+leave them transparent — otherwise a 50% dither (`0x55/0xAA`) drawn over an earlier solid
+band lets it bleed through the off-bits and the halftone reads too dense. Solid fills
+(pattern `0xFF`) and on-black floods are unaffected, so the reference scenes don't move.
+**Text:**
 font 0 is the 8×8 bitmap; fonts 1–10 (the spec's scalable BGI fonts) are real stroke
 fonts in `rip_chr.rs` — the `.CHR` glyphs are stroke lists we render with the same
 `line()`. **Buttons:** RIP_BUTTON_STYLE/RIP_BUTTON draw the beveled/recessed/chiseled

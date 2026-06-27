@@ -531,7 +531,11 @@ mod tests {
         let img = AnsiDecoder.decode(&file).unwrap();
         // 1 col → 8px wide; the 8×8 cell shows as a 25-row screen of 8px rows (200),
         // vs the 8×16 default which would be 25×16 = 400. Height distinguishes the cell.
-        assert_eq!((img.width, img.height), (8, 25 * 8), "VGA50 → 8px-tall cell");
+        assert_eq!(
+            (img.width, img.height),
+            (8, 25 * 8),
+            "VGA50 → 8px-tall cell"
+        );
     }
 
     #[test]
@@ -540,9 +544,16 @@ mod tests {
         // CR/LF — so a line of exactly `wrap` chars then CRLF advances TWO rows, leaving a
         // blank row between. Overstrike art (gj-9703c.ans) steps rows via this. wrap=4.
         let (g, _) = parse(b"AAAA\r\nB", 4, true);
-        assert_eq!(g.len(), 3, "4 chars + CRLF + B = a blank row between (rows 0,1,2)");
+        assert_eq!(
+            g.len(),
+            3,
+            "4 chars + CRLF + B = a blank row between (rows 0,1,2)"
+        );
         assert_eq!(g[0].iter().filter(|c| c.ch != 0).count(), 4);
-        assert!(g[1].iter().all(|c| c.ch == 0), "row 1 is the blank wrap row");
+        assert!(
+            g[1].iter().all(|c| c.ch == 0),
+            "row 1 is the blank wrap row"
+        );
         assert_eq!(g[2][0].ch, b'B');
     }
 
@@ -576,7 +587,11 @@ mod tests {
         // A lone/trailing ESC (e.g. a baud-playback prefix cut mid-sequence) must not
         // render as CP437 0x1B (a ← arrow) flickering at the cursor — ansilove eats it.
         let (g, _) = parse(b"AB\x1b", 80, true);
-        assert_eq!(g[0].iter().filter(|c| c.ch != 0).count(), 2, "only A and B, no ←");
+        assert_eq!(
+            g[0].iter().filter(|c| c.ch != 0).count(),
+            2,
+            "only A and B, no ←"
+        );
         // ESC followed by a non-CSI byte: ESC is dropped, the next byte still prints.
         let (g, _) = parse(b"A\x1bZ", 80, true);
         let chars: Vec<u8> = g[0].iter().filter(|c| c.ch != 0).map(|c| c.ch).collect();
@@ -623,7 +638,11 @@ mod tests {
         // auto-scroll can reach the final blank line.
         let tall = b"X\r\n".repeat(30);
         let img = AnsiDecoder.decode(&tall).unwrap();
-        assert_eq!(img.height, 31 * 16, "30 content rows + the trailing cursor row");
+        assert_eq!(
+            img.height,
+            31 * 16,
+            "30 content rows + the trailing cursor row"
+        );
     }
 
     #[test]
@@ -632,16 +651,31 @@ mod tests {
         assert!(dot_on(0b1000_0000, 0, b'A'), "MSB lights column 0");
         assert!(dot_on(0b0000_0001, 7, b'A'), "LSB lights column 7");
         // The 9th dot (rx=8) is background for an ordinary glyph like 'A'…
-        assert!(!dot_on(0b0000_0001, 8, b'A'), "9th dot is blank off the line-draw range");
+        assert!(
+            !dot_on(0b0000_0001, 8, b'A'),
+            "9th dot is blank off the line-draw range"
+        );
         // …but repeats column 8 for the box/line-draw range 0xC0..=0xDF, so a
         // horizontal rule (0xC4 '─', whose lit rows end in a set LSB) connects.
-        assert!(dot_on(0b0000_0001, 8, 0xC4), "9th dot repeats col 8 for 0xC4");
-        assert!(!dot_on(0b0000_0000, 8, 0xC4), "…but only when col 8 was lit");
+        assert!(
+            dot_on(0b0000_0001, 8, 0xC4),
+            "9th dot repeats col 8 for 0xC4"
+        );
+        assert!(
+            !dot_on(0b0000_0000, 8, 0xC4),
+            "…but only when col 8 was lit"
+        );
         // Boundaries of the line-draw range.
         assert!(dot_on(0b0000_0001, 8, 0xC0));
         assert!(dot_on(0b0000_0001, 8, 0xDF));
-        assert!(!dot_on(0b0000_0001, 8, 0xBF), "just below the range stays blank");
-        assert!(!dot_on(0b0000_0001, 8, 0xE0), "just above the range stays blank");
+        assert!(
+            !dot_on(0b0000_0001, 8, 0xBF),
+            "just below the range stays blank"
+        );
+        assert!(
+            !dot_on(0b0000_0001, 8, 0xE0),
+            "just above the range stays blank"
+        );
     }
 
     #[test]
@@ -660,8 +694,15 @@ mod tests {
         // `…fill row…[s\r\n[u…` shears (ACID-RN.ANS, gj-os.ans). ESC[u then 'B' → (0,1).
         let (g, _) = parse(b"AAAA\x1b[s\x1b[uB", 4, true);
         assert_eq!(g.len(), 2, "cursor wrapped to row 1 before the save");
-        assert_eq!(g[1][0].ch, b'B', "save/restore captured the wrapped position");
-        assert_eq!(g[0].iter().filter(|c| c.ch != 0).count(), 4, "row 0 stayed full");
+        assert_eq!(
+            g[1][0].ch, b'B',
+            "save/restore captured the wrapped position"
+        );
+        assert_eq!(
+            g[0].iter().filter(|c| c.ch != 0).count(),
+            4,
+            "row 0 stayed full"
+        );
     }
 
     #[test]
@@ -760,7 +801,10 @@ mod tests {
         set_font_9px(std::env::var("FONT_9PX").is_ok()); // FONT_9PX=1 → 9-dot cell
         let bytes = std::fs::read(&path).unwrap();
         // PREFIX_PCT=NN renders the first NN% of bytes (baud-playback frame check).
-        let img = match std::env::var("PREFIX_PCT").ok().and_then(|p| p.parse::<usize>().ok()) {
+        let img = match std::env::var("PREFIX_PCT")
+            .ok()
+            .and_then(|p| p.parse::<usize>().ok())
+        {
             Some(pct) => {
                 let s = TextStream::new(&bytes).unwrap();
                 s.render(s.len() * pct.min(100) / 100)

@@ -76,12 +76,9 @@ fn sauce_offset(data: &[u8]) -> Option<usize> {
         return None;
     }
     let max_k = MAX_TRAIL.min(len - 128);
-    (0..=max_k)
-        .map(|k| len - 128 - k)
-        .find(|&start| {
-            data[start..].starts_with(b"SAUCE00")
-                && data[start + 128..].iter().all(|&b| b <= 0x20)
-        })
+    (0..=max_k).map(|k| len - 128 - k).find(|&start| {
+        data[start..].starts_with(b"SAUCE00") && data[start + 128..].iter().all(|&b| b <= 0x20)
+    })
 }
 
 /// Parse the trailing SAUCE record, if present. `data` is the whole file.

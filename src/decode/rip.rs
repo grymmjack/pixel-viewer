@@ -143,10 +143,11 @@ struct Rip {
     color: u8,       // current drawing colour
     x: i32,          // current position
     y: i32,
-    line_pat: u16,              // 16-bit line dash pattern (solid = 0xFFFF)
-    thick: i32,                 // line thickness (1 or 3 in RIP)
-    fill_pat: [u8; 8],          // 8×8 fill pattern
-    fill_color: u8,             // fill colour
+    line_pat: u16,                          // 16-bit line dash pattern (solid = 0xFFFF)
+    thick: i32,                             // line thickness (1 or 3 in RIP)
+    fill_pat: [u8; 8],                      // 8×8 fill pattern
+    fill_color: u8,                         // fill colour
+    bkcolor: u8,                // background colour painted on pattern OFF-bits (BGI: 0)
     xor: bool,                  // XOR write mode
     clip: (i32, i32, i32, i32), // viewport (x0,y0,x1,y1 inclusive)
     fsize: i32,                 // text size (font 0 = ×N pixels; fonts 1-10 = BGI scale)
@@ -186,6 +187,7 @@ impl Rip {
             thick: 1,
             fill_pat: [0xFF; 8],
             fill_color: 15,
+            bkcolor: 0,
             xor: false,
             clip: (0, 0, W - 1, H - 1),
             fsize: 1,
@@ -264,15 +266,17 @@ impl Rip {
         self.px[i] = if self.xor { self.px[i] ^ c } else { c };
     }
 
-    /// A horizontal span honouring the current fill pattern (set bit → fill colour).
+    /// A horizontal span honouring the current fill pattern. BGI fills are *opaque*:
+    /// a set bit gets the fill colour, a clear bit gets the **background colour** (not
+    /// left transparent) — matching icy_engine's `bar_rect` / PabloDraw's `Bar`, so a
+    /// dithered band drawn over an earlier solid fill doesn't let it bleed through.
     fn fill_span(&mut self, x0: i32, x1: i32, y: i32) {
         let (a, b) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
-        let fc = self.fill_color;
+        let (fc, bk) = (self.fill_color, self.bkcolor);
         for x in a..=b {
             let row = self.fill_pat[(y.rem_euclid(8)) as usize];
-            if (row >> (7 - x.rem_euclid(8))) & 1 == 1 {
-                self.put(x, y, fc);
-            }
+            let on = (row >> (7 - x.rem_euclid(8))) & 1 == 1;
+            self.put(x, y, if on { fc } else { bk });
         }
     }
 
@@ -523,7 +527,14 @@ impl Rip {
                 self.fill_span(pair[0], pair[1], y);
             }
         }
-        self.poly(pts, true); // outline in the draw colour (BGI fillpoly behaviour)
+        // BGI fill_poly borders the shape in the draw colour — but icy_engine /
+        // PabloDraw *skip the border when the colour is black* (`if self.color != 0`).
+        // Drawing it unconditionally painted a black contour seam around every band of
+        // this dithered portrait (the bands are filled with colour 0 as the draw colour);
+        // honouring the guard makes adjacent bands merge smoothly like the reference.
+        if self.color != 0 {
+            self.poly(pts, true);
+        }
     }
 
     /// Cubic Bézier through 4 control points in `cnt` segments — matching icy_engine's
@@ -614,12 +625,11 @@ impl Rip {
                 return; // leaked through a gap — leave the outline untouched
             }
         }
-        let fc = self.fill_color;
+        let (fc, bk) = (self.fill_color, self.bkcolor);
         for (px, py) in region {
             let row = self.fill_pat[py.rem_euclid(8) as usize];
-            if (row >> (7 - px.rem_euclid(8))) & 1 == 1 {
-                self.put(px, py, fc);
-            }
+            let on = (row >> (7 - px.rem_euclid(8))) & 1 == 1;
+            self.put(px, py, if on { fc } else { bk });
         }
     }
 
@@ -1227,6 +1237,50 @@ mod tests {
     }
 
     #[test]
+    fn fill_poly_skips_black_border_but_keeps_coloured_one() {
+        // BGI `fill_poly` borders the shape in the draw colour *only when it isn't 0*
+        // (icy_engine + PabloDraw). A grey rectangle's left edge must stay the fill
+        // colour when the draw colour is 0 (no black contour seam), and take the draw
+        // colour otherwise. This is the US-HUMA1 dithered-portrait contour-seam bug.
+        let rect = [10u16, 10, 50, 10, 50, 40, 10, 40];
+        let edge = (25 * W + 10) as usize; // (x=10, y=25) — on the left edge
+
+        let mut black_border = Rip::new();
+        black_border.fill_color = 7;
+        black_border.color = 0;
+        black_border.fill_poly(&rect);
+        assert_eq!(
+            black_border.px[edge], 7,
+            "a colour-0 border must be skipped (no contour seam between bands)"
+        );
+
+        let mut green_border = Rip::new();
+        green_border.fill_color = 7;
+        green_border.color = 2;
+        green_border.fill_poly(&rect);
+        assert_eq!(green_border.px[edge], 2, "a non-black border is still drawn");
+    }
+
+    #[test]
+    fn pattern_fill_paints_bkcolor_on_off_bits() {
+        // A BGI fill is *opaque*: a 50% dither drawn over an existing solid band paints
+        // black (bkcolor) on its clear bits, not let the band bleed through. With
+        // pattern 0xAA, even x%8 → fill colour, odd x%8 → bkcolor.
+        let mut r = Rip::new();
+        r.px.iter_mut().for_each(|p| *p = 7); // pre-existing solid grey-7 everywhere
+        r.fill_pat = [0xAA; 8];
+        r.fill_color = 8;
+        r.color = 0; // no border
+        r.fill_poly(&[10u16, 10, 50, 10, 50, 40, 10, 40]);
+        assert_eq!(r.px[(20 * W + 20) as usize], 8, "set bit → fill colour");
+        assert_eq!(
+            r.px[(20 * W + 21) as usize],
+            0,
+            "clear bit → bkcolor (black), not the grey it covered"
+        );
+    }
+
+    #[test]
     fn rip_stream_prefix_is_fixed_size_and_clamps() {
         // "Watch it draw" replays byte prefixes; every frame is the fixed 640×350 EGA
         // canvas, a 0-byte prefix is a blank screen, and an over-length prefix clamps.
@@ -1267,6 +1321,33 @@ mod tests {
         let _ = RipDecoder.decode(&bytes);
     }
 
+    /// Dev harness (ignored): render `RIP_FILE` to `RIP_OUT` (default /tmp/rip_one.png).
+    /// Run: `RIP_FILE=/path/x.rip cargo test rip::tests::dump_one -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dump_one() {
+        let path = std::env::var("RIP_FILE").expect("set RIP_FILE");
+        let out = std::env::var("RIP_OUT").unwrap_or_else(|_| "/tmp/rip_one.png".into());
+        let bytes = std::fs::read(&path).unwrap();
+        let img = RipDecoder.decode(&bytes).unwrap();
+        use image::ImageEncoder;
+        let mut buf = Vec::new();
+        let mut rgba = Vec::with_capacity((img.width * img.height * 4) as usize);
+        for px in &img.pixels {
+            rgba.extend_from_slice(px);
+        }
+        image::codecs::png::PngEncoder::new(&mut buf)
+            .write_image(
+                &rgba,
+                img.width,
+                img.height,
+                image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+        std::fs::write(&out, buf).unwrap();
+        eprintln!("wrote {out}");
+    }
+
     /// Dev harness (ignored): render every `.rip` in icy_engine's reference dir to
     /// `/tmp/rip_out/<stem>.png` so they can be AE-pixel-diffed against icy's golden
     /// PNGs. Hardcoded paths point at the icy_tools cargo-git checkout on this box.
@@ -1300,11 +1381,13 @@ mod tests {
                 )
                 .unwrap();
             std::fs::write(
-                format!("/tmp/rip_out/{}.png", p.file_stem().unwrap().to_str().unwrap()),
+                format!(
+                    "/tmp/rip_out/{}.png",
+                    p.file_stem().unwrap().to_str().unwrap()
+                ),
                 buf,
             )
             .unwrap();
         }
     }
-
 }

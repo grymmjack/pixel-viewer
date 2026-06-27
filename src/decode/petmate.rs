@@ -51,7 +51,9 @@ impl Decoder for PetmateDecoder {
             .filter_map(render_framebuf)
             .collect();
         if panels.is_empty() {
-            return Err(DecodeError::Malformed("petmate: no renderable screens".into()));
+            return Err(DecodeError::Malformed(
+                "petmate: no renderable screens".into(),
+            ));
         }
         let w = panels.iter().map(|p| p.0).max().unwrap_or(0);
         let h: usize = panels.iter().map(|p| p.1).sum();

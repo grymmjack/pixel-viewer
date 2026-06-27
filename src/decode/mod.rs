@@ -166,7 +166,11 @@ fn decode_caught(d: &dyn Decoder, bytes: &[u8]) -> Result<PixImage, DecodeError>
     DECODING.with(|f| f.set(true));
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.decode(bytes)));
     DECODING.with(|f| f.set(false));
-    r.unwrap_or_else(|_| Err(DecodeError::Malformed("decoder panicked on this file".into())))
+    r.unwrap_or_else(|_| {
+        Err(DecodeError::Malformed(
+            "decoder panicked on this file".into(),
+        ))
+    })
 }
 
 #[cfg(test)]

@@ -220,7 +220,10 @@ impl Stream {
         let ext = ext.as_deref();
         if ext == Some("rip") || bytes.starts_with(b"!|") {
             Some(Stream::Rip(crate::decode::RipStream::new(bytes)))
-        } else if matches!(ext, Some("ans" | "asc" | "nfo" | "diz" | "ice" | "cia" | "txt") | None) {
+        } else if matches!(
+            ext,
+            Some("ans" | "asc" | "nfo" | "diz" | "ice" | "cia" | "txt") | None
+        ) {
             crate::decode::TextStream::new(bytes).map(Stream::Text)
         } else {
             None
@@ -252,10 +255,10 @@ struct Player {
     path: PathBuf,
     stream: Stream,
     len: usize,
-    pos: usize,      // current byte position (0..=len)
+    pos: usize, // current byte position (0..=len)
     playing: bool,
-    acc: f32,        // fractional bytes accumulated toward `pos`
-    cursor_px: u32,  // content bottom in source px at `pos` (0 = no auto-scroll)
+    acc: f32,                           // fractional bytes accumulated toward `pos`
+    cursor_px: u32,                     // content bottom in source px at `pos` (0 = no auto-scroll)
     tex: Option<(usize, TiledTexture)>, // cached (pos, frame)
 }
 
@@ -650,11 +653,11 @@ pub struct PixelView {
     zoom_lock: bool, // viewer: snap zoom to 100% steps (¼ steps below 100%)
     offset: egui::Vec2,
     view_to_top: bool, // viewer: a freshly opened image starts at its top-left (set on
-                       // load, applied once its pixel size is known in draw_image_view)
+    // load, applied once its pixel size is known in draw_image_view)
     fit_width_on_open: bool, // viewer: cap a freshly opened text-mode image's zoom so its
-                             // full width fits the viewport (wide ANSIs don't clip)
+    // full width fits the viewport (wide ANSIs don't clip)
     nav_drag: bool, // viewer: the active drag began on the navigator minimap, so it
-                    // stays in navigator mode even if the cursor leaves the strip
+    // stays in navigator mode even if the cursor leaves the strip
     // viewer: a crisp minimap built from the full-res pixels at the strip's device
     // resolution (path, [w,h] device px, texture), rebuilt on image/size change.
     minimap: Option<(PathBuf, [usize; 2], egui::TextureHandle)>,
@@ -673,7 +676,7 @@ pub struct PixelView {
     font_9px: bool,         // render the VGA font in a 9-dot cell (true DOS width)
     baud_ansi: Baud,        // simulated modem speed for ANSImation playback (persisted)
     baud_rip: Baud,         // simulated modem speed for RIP playback — independent (persisted)
-    crt_scanline_dark: f32,  // retro-monitor scanline darkness, 0 = off (persisted)
+    crt_scanline_dark: f32, // retro-monitor scanline darkness, 0 = off (persisted)
     crt_scanline_scale: bool, // scale scanline spacing with the zoom (persisted)
     glow: bool,             // phosphor-glow bloom around bright pixels (persisted)
     glow_amt: f32,          // phosphor-glow intensity (persisted)
@@ -2121,8 +2124,8 @@ impl PixelView {
         self.full_src = None;
         self.full_reduced = None;
         self.minimap = None; // rebuilt for the new image at its first draw
-        // Zoom was set per-kind above (persistent within raster / text-mode);
-        // re-center the pan for the freshly loaded image.
+                             // Zoom was set per-kind above (persistent within raster / text-mode);
+                             // re-center the pan for the freshly loaded image.
         self.offset = egui::Vec2::ZERO;
         self.view_to_top = true; // start at the top-left, not centered, for tall art
         self.auto_next_dwell = 0.0; // restart the slideshow dwell for the new file
@@ -2320,7 +2323,10 @@ impl PixelView {
             .clone()
             .filter(|p| sixteen::is_remote(p))
             .or_else(|| self.archive_mount.as_ref().map(|m| m.archive.clone()));
-        let parts = ctx_path.as_deref().map(sixteen::rel_parts).unwrap_or_default();
+        let parts = ctx_path
+            .as_deref()
+            .map(sixteen::rel_parts)
+            .unwrap_or_default();
         let first = parts.first().map(String::as_str);
         let in_years = first.is_none_or(|s| s.parse::<u32>().is_ok());
         let mut nav: Option<PathBuf> = None;
@@ -4591,8 +4597,8 @@ impl PixelView {
                     self.auto_next_dwell = 0.0;
                     let before = self.selected;
                     self.step_image(ctx, true); // next file
-                    // End of the pack (step was a no-op) + Shuffle → jump to another
-                    // random pack and keep going: an endless real-art screensaver.
+                                                // End of the pack (step was a no-op) + Shuffle → jump to another
+                                                // random pack and keep going: an endless real-art screensaver.
                     if self.selected == before && self.shuffle && self.random_rx.is_none() {
                         self.start_random_pack();
                     }
@@ -4819,19 +4825,30 @@ impl PixelView {
         let ctx = painter.ctx().clone();
         let full = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         painter.image(tex, art_rect, full, egui::Color32::WHITE); // flat, panned
-        // Phosphor glow: redraw the art a few times, offset in a ring, with ADDITIVE
-        // blending — a premultiplied tint with alpha 0 turns egui's "over" blend into
-        // src+dst. Dark areas add ~nothing; bright glyphs bloom into a soft halo (that
-        // late-night-BBS phosphor vibe). The radius tracks the zoom so it stays visible.
+                                                                  // Phosphor glow: redraw the art a few times, offset in a ring, with ADDITIVE
+                                                                  // blending — a premultiplied tint with alpha 0 turns egui's "over" blend into
+                                                                  // src+dst. Dark areas add ~nothing; bright glyphs bloom into a soft halo (that
+                                                                  // late-night-BBS phosphor vibe). The radius tracks the zoom so it stays visible.
         if self.glow && self.glow_amt > 0.0 {
             let r = (src_px_dpx * 0.5).clamp(1.0, 4.0) / ppp; // glow radius in points
             let k = (self.glow_amt * 32.0).round() as u8;
             let add = egui::Color32::from_rgba_premultiplied(k, k, k, 0);
             for (dx, dy) in [
-                (-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0),
-                (-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0),
+                (-1.0, 0.0),
+                (1.0, 0.0),
+                (0.0, -1.0),
+                (0.0, 1.0),
+                (-1.0, -1.0),
+                (1.0, -1.0),
+                (-1.0, 1.0),
+                (1.0, 1.0),
             ] {
-                painter.image(tex, art_rect.translate(egui::vec2(dx * r, dy * r)), full, add);
+                painter.image(
+                    tex,
+                    art_rect.translate(egui::vec2(dx * r, dy * r)),
+                    full,
+                    add,
+                );
             }
         }
         if self.crt_scanline_dark > 0.0 {
@@ -5050,8 +5067,7 @@ impl PixelView {
         // ANSImation scrolls as it draws, like a BBS terminal. The clamp below pins it to
         // the top until the content actually overflows (short art never scrolls).
         if let Some(cursor_src_y) = self.play_autoscroll {
-            self.offset.y =
-                resp.rect.height() / 2.0 + img_px.y / 2.0 - cursor_src_y * scale.y;
+            self.offset.y = resp.rect.height() / 2.0 + img_px.y / 2.0 - cursor_src_y * scale.y;
         }
         // Clamp the pan to the overflow bounds (a fitting axis stays centered). Scrolling
         // a long file simply stops at the top/bottom — it never steps to the prev/next
@@ -5380,11 +5396,12 @@ impl PixelView {
                         // Changing it restarts the open file.
                         if self.player.is_some() {
                             ui.separator();
-                            let is_rip = self
-                                .player
-                                .as_ref()
-                                .is_some_and(|p| p.stream.is_rip());
-                            let mut baud = if is_rip { self.baud_rip } else { self.baud_ansi };
+                            let is_rip = self.player.as_ref().is_some_and(|p| p.stream.is_rip());
+                            let mut baud = if is_rip {
+                                self.baud_rip
+                            } else {
+                                self.baud_ansi
+                            };
                             let old = baud;
                             egui::ComboBox::from_id_salt("baud_pick")
                                 .selected_text(format!("⚡ {}", baud.label()))
@@ -5462,7 +5479,11 @@ impl PixelView {
                             .selected_text(format!("{}s", self.auto_next_secs))
                             .show_ui(ui, |ui| {
                                 for s in [1u8, 3, 5, 10] {
-                                    ui.selectable_value(&mut self.auto_next_secs, s, format!("{s}s"));
+                                    ui.selectable_value(
+                                        &mut self.auto_next_secs,
+                                        s,
+                                        format!("{s}s"),
+                                    );
                                 }
                             })
                             .response
@@ -5907,7 +5928,8 @@ impl eframe::App for PixelView {
         // F11 — immersive mode: hide every bar/dock, drop the window decorations, and go
         // OS-fullscreen, showing only the art. Bars reveal when the mouse reaches the
         // matching screen edge; the cursor auto-hides after a moment of stillness.
-        let typing = self.path_edit.is_some() || self.renaming.is_some() || self.rebinding.is_some();
+        let typing =
+            self.path_edit.is_some() || self.renaming.is_some() || self.rebinding.is_some();
         if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
             self.immersive = !self.immersive;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.immersive));
@@ -5962,11 +5984,7 @@ impl eframe::App for PixelView {
         // first art file. Both async ops idle ⇒ the listing has settled.
         if self.pending_autoplay && self.random_rx.is_none() && self.remote_rx.is_none() {
             self.pending_autoplay = false;
-            if let Some(idx) = self
-                .entries
-                .iter()
-                .position(|e| !e.is_dir && !e.is_archive)
-            {
+            if let Some(idx) = self.entries.iter().position(|e| !e.is_dir && !e.is_archive) {
                 self.activate(&ctx, idx);
             } else if self.shuffle {
                 self.start_random_pack(); // empty/failed pack → try the next one
@@ -6254,7 +6272,10 @@ impl eframe::App for PixelView {
 
         // Favorites bar (top), then the path/breadcrumb bar directly under it.
         // Favorites stay visible even before a folder is open, for quick jumps.
-        let in_colo = self.folder.as_deref().is_some_and(crate::sixteen::is_remote)
+        let in_colo = self
+            .folder
+            .as_deref()
+            .is_some_and(crate::sixteen::is_remote)
             || self
                 .archive_mount
                 .as_ref()
@@ -6542,8 +6563,16 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::FONT_9PX_KEY, &self.font_9px);
         eframe::set_value(storage, Self::BAUD_ANSI_KEY, &self.baud_ansi.to_u8());
         eframe::set_value(storage, Self::BAUD_RIP_KEY, &self.baud_rip.to_u8());
-        eframe::set_value(storage, Self::CRT_SCANLINE_DARK_KEY, &self.crt_scanline_dark);
-        eframe::set_value(storage, Self::CRT_SCANLINE_SCALE_KEY, &self.crt_scanline_scale);
+        eframe::set_value(
+            storage,
+            Self::CRT_SCANLINE_DARK_KEY,
+            &self.crt_scanline_dark,
+        );
+        eframe::set_value(
+            storage,
+            Self::CRT_SCANLINE_SCALE_KEY,
+            &self.crt_scanline_scale,
+        );
         eframe::set_value(storage, Self::BLACK_BG_KEY, &self.black_bg);
         eframe::set_value(storage, Self::AUTO_NEXT_KEY, &self.auto_next);
         eframe::set_value(storage, Self::AUTO_NEXT_SECS_KEY, &self.auto_next_secs);
