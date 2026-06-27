@@ -3430,22 +3430,31 @@ impl PixelView {
                             want_pack = mount_pack.clone();
                         }
                     });
-                    // SAUCE metadata (scene art) — shown when the file carries a record.
-                    if let Some(sc) = self.cached_sauce(&entry.path) {
+                    // SAUCE metadata — always shown for scene art / 16colo pieces so the
+                    // panel doesn't vanish when a file has no record (it reads "no record"
+                    // and the fields show "—"). Hidden for ordinary images (never SAUCE).
+                    if is_textmode_ext(&entry.path) || self.colo_pieces.contains_key(&entry.path) {
+                        let sauce = self.cached_sauce(&entry.path);
+                        let none = sauce.is_none();
+                        let sc = sauce.unwrap_or_default();
                         ui.add_space(8.0);
                         ui.separator();
-                        ui.strong("SAUCE");
+                        ui.horizontal(|ui| {
+                            ui.strong("SAUCE");
+                            if none {
+                                ui.weak("· no record");
+                            }
+                        });
                         ui.add_space(2.0);
                         egui::Grid::new("details_sauce")
                             .num_columns(2)
                             .spacing([12.0, 5.0])
                             .show(ui, |ui| {
+                                // Absent field (or no record at all) → an em-dash, never blank.
                                 let mut field = |k: &str, v: &str| {
-                                    if !v.is_empty() {
-                                        ui.weak(k);
-                                        ui.label(v);
-                                        ui.end_row();
-                                    }
+                                    ui.weak(k);
+                                    ui.label(if none || v.is_empty() { "—" } else { v });
+                                    ui.end_row();
                                 };
                                 field("Title", &sc.title);
                                 field("Author", &sc.author);
@@ -3454,13 +3463,12 @@ impl PixelView {
                                 field("Kind", sc.kind_label());
                                 field("Font", &sc.font);
                                 // Character/binary art (ANSI/BIN/XBin/…) stores its size
-                                // in *cells*: TInfo1 = columns, TInfo2 = lines. Show those
-                                // SAUCE values alongside the pixel dimensions above.
-                                if matches!(sc.data_type, 1 | 5 | 6) {
+                                // in *cells*: TInfo1 = columns, TInfo2 = lines.
+                                if !none && matches!(sc.data_type, 1 | 5 | 6) {
                                     let cols = (sc.tinfo1 > 0).then(|| sc.tinfo1.to_string());
                                     let lines = (sc.tinfo2 > 0).then(|| sc.tinfo2.to_string());
-                                    field("Columns", cols.as_deref().unwrap_or(""));
-                                    field("Lines", lines.as_deref().unwrap_or(""));
+                                    field("Columns", cols.as_deref().unwrap_or("—"));
+                                    field("Lines", lines.as_deref().unwrap_or("—"));
                                 }
                             });
                     }
