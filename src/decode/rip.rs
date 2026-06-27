@@ -155,6 +155,7 @@ struct Rip {
     font: u16,                  // RIP font number: 0 = 8×8 bitmap, 1-10 = BGI stroke
     btn: Btn,                   // current RIP_BUTTON_STYLE (beveled menu panels)
     rip_image: Option<(i32, i32, Vec<u8>)>, // GetImage clipboard: (w, h, palette indices)
+    leak_n: u32,                // diagnostic: count of abandoned (leaking) fills so far
 }
 
 /// RIP button style — the beveled "panel" look BBS menus are built from. Colours and
@@ -195,6 +196,7 @@ impl Rip {
             font: 0,
             btn: Btn::default(),
             rip_image: None,
+            leak_n: 0,
         }
     }
 
@@ -587,7 +589,13 @@ impl Rip {
         if x < 0 || y < 0 || x >= W || y >= H || self.px[(y * W + x) as usize] == border {
             return;
         }
-        let cap = (W * H / 2) as usize;
+        let cap = if let Some(c) = std::env::var("RIP_FLOOD_CAP").ok().and_then(|s| s.parse::<usize>().ok()) {
+            c
+        } else if std::env::var_os("RIP_NO_FLOODGUARD").is_some() {
+            (W * H) as usize + 1
+        } else {
+            (W * H / 2) as usize
+        };
         let mut region: Vec<(i32, i32)> = Vec::new();
         let mut seen = vec![false; (W * H) as usize];
         let mut stack = vec![(x, y)];
@@ -622,6 +630,30 @@ impl Rip {
                 }
             }
             if region.len() > cap {
+                if std::env::var_os("RIP_FLOOD_DEBUG").is_some() {
+                    let (mut x0, mut y0, mut x1, mut y1) = (W, H, 0, 0);
+                    for &(px, py) in &region {
+                        x0 = x0.min(px);
+                        y0 = y0.min(py);
+                        x1 = x1.max(px);
+                        y1 = y1.max(py);
+                    }
+                    eprintln!(
+                        "LEAK seed=({x},{y}) fill={} border={border} region={} bbox=({x0},{y0})-({x1},{y1})",
+                        self.fill_color,
+                        region.len()
+                    );
+                    // RIP_FLOOD_PAINT=N: paint *this* leak's region (the Nth, 0-based)
+                    // bright magenta so the saved PNG shows the escape neck visually.
+                    if let Some(want) = std::env::var("RIP_FLOOD_PAINT").ok().and_then(|s| s.parse::<u32>().ok()) {
+                        if want == self.leak_n {
+                            for &(px, py) in &region {
+                                self.px[(py * W + px) as usize] = 13;
+                            }
+                        }
+                    }
+                    self.leak_n += 1;
+                }
                 return; // leaked through a gap — leave the outline untouched
             }
         }
