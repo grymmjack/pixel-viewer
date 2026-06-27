@@ -9861,6 +9861,85 @@ mod tests {
         assert_eq!(names, vec!["catdir", "Cat.png"]); // dir first; "dog" excluded
     }
 
+    fn piece(artist: &str, group: &str, year: u32, pack: &str) -> ColoPiece {
+        ColoPiece {
+            artist: artist.into(),
+            group: group.into(),
+            year,
+            pack: pack.into(),
+            raw_url: String::new(),
+            tn_url: String::new(),
+        }
+    }
+
+    #[test]
+    fn scene_sort_keys_use_the_piece_map() {
+        // Three pieces with distinct artist/year, fed via the colo_pieces map.
+        let all = vec![
+            img_entry("c.ans", 0, 0),
+            img_entry("a.ans", 0, 0),
+            img_entry("b.ans", 0, 0),
+        ];
+        let mut pieces = HashMap::new();
+        pieces.insert(PathBuf::from("c.ans"), piece("zinc", "acid", 1994, "p3"));
+        pieces.insert(PathBuf::from("a.ans"), piece("aja", "blocktronics", 2002, "p1"));
+        pieces.insert(PathBuf::from("b.ans"), piece("mistress", "acid", 1991, "p2"));
+
+        // Artist ascending: aja, mistress, zinc.
+        let v = sorted_filtered_view(
+            &all,
+            SortKey::Artist,
+            false,
+            false,
+            0,
+            None,
+            &HashMap::new(),
+            &pieces,
+        );
+        let names: Vec<_> = v.iter().map(|e| e.path.to_str().unwrap()).collect();
+        assert_eq!(names, vec!["a.ans", "b.ans", "c.ans"]);
+
+        // Year descending: 2002, 1994, 1991.
+        let v = sorted_filtered_view(
+            &all,
+            SortKey::Year,
+            true,
+            false,
+            0,
+            None,
+            &HashMap::new(),
+            &pieces,
+        );
+        let years: Vec<_> = v
+            .iter()
+            .map(|e| pieces[&e.path].year)
+            .collect::<Vec<_>>();
+        assert_eq!(years, vec![2002, 1994, 1991]);
+    }
+
+    #[test]
+    fn table_cell_text_scene_vs_file_columns() {
+        let e = img_entry("MIDNACD3.ANS", 2048, 3);
+        let p = piece("jed", "acid", 1992, "acdu0892");
+        // Scene columns: filename / artist / type / year / group / pack.
+        assert_eq!(table_cell_text(&e, None, Some(&p), true, 1), "MIDNACD3.ANS");
+        assert_eq!(table_cell_text(&e, None, Some(&p), true, 2), "jed");
+        assert_eq!(table_cell_text(&e, None, Some(&p), true, 3), "ANS");
+        assert_eq!(table_cell_text(&e, None, Some(&p), true, 4), "1992");
+        assert_eq!(table_cell_text(&e, None, Some(&p), true, 5), "acid");
+        assert_eq!(table_cell_text(&e, None, Some(&p), true, 6), "acdu0892");
+        // File columns: name / type / size (dims/colors need ImgMeta; rating is painted).
+        let meta = Some(ImgMeta {
+            w: 320,
+            h: 200,
+            colors: Some(16),
+        });
+        assert_eq!(table_cell_text(&e, meta, None, false, 1), "MIDNACD3.ANS");
+        assert_eq!(table_cell_text(&e, meta, None, false, 2), "ANS");
+        assert_eq!(table_cell_text(&e, meta, None, false, 4), "320×200");
+        assert_eq!(table_cell_text(&e, meta, None, false, 5), "16");
+    }
+
     #[test]
     fn is_image_ext_recognizes_formats() {
         use std::path::Path;
@@ -10591,6 +10670,20 @@ mod gui_tests {
         harness.run();
         harness.get_by_label("Explorer pane");
         harness.get_by_label("Details pane");
+    }
+
+    #[test]
+    fn table_view_toggle_present_and_switches_without_panic() {
+        let mut harness =
+            Harness::builder().build_eframe(|cc| PixelView::new(cc, CliArgs::default()));
+        harness.run();
+        harness.get_by_label("View").click();
+        harness.run();
+        // The new Table-view toggle is in the View menu; clicking it swaps the central
+        // panel renderer (Mode stays Grid) — must render without panicking.
+        harness.get_by_label("Table view").click();
+        harness.run();
+        harness.run();
     }
 
     #[test]

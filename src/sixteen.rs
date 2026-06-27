@@ -477,6 +477,22 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "hits the live 16colo.rs API + network"]
+    fn fetch_artist_pieces_live() {
+        let pieces = fetch_artist_pieces("jed").expect("fetch jed");
+        assert!(!pieces.is_empty(), "jed should have pieces");
+        let p = &pieces[0];
+        assert!(p.tn_url.starts_with("https://16colo.rs/"), "tn: {}", p.tn_url);
+        assert!(p.raw_url.starts_with("https://16colo.rs/"), "raw: {}", p.raw_url);
+        assert!(!p.pack.is_empty() && p.year >= 1990);
+        // The thumbnail URL serves a decodable image (what RemoteThumbs relies on).
+        let resp = ureq::get(&p.tn_url).call().expect("tn GET");
+        let mut buf = Vec::new();
+        resp.into_reader().read_to_end(&mut buf).expect("tn body");
+        image::load_from_memory(&buf).expect("tn is a valid image");
+    }
+
+    #[test]
     fn artist_json_flattens_to_pieces() {
         let v: serde_json::Value = serde_json::from_str(
             r#"{ "results": { "1992": { "acdu0892": {
