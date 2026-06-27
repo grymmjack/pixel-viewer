@@ -1675,6 +1675,10 @@ impl PixelView {
             Ok(Ok((vpath, local))) => {
                 self.colo_open_rx = None;
                 self.colo_files.insert(vpath.clone(), local);
+                // Drop any stale SAUCE cached while the piece had no local file (e.g.
+                // inspected in the table before opening — search/artist pieces carry no
+                // API SAUCE), so `cached_sauce` re-reads it from the downloaded file.
+                self.sauce_cache.remove(&vpath);
                 self.load_full(ctx, vpath);
                 self.mode = Mode::Single;
                 self.want_repaint = true;
