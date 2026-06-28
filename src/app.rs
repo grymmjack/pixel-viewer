@@ -879,10 +879,13 @@ pub struct PixelView {
     // the Details panel inspects a piece with no SAUCE we fetch its whole pack's SAUCE
     // (`?sauce=true`) once and seed every file. Shared channel (tx cloned per fetch)
     // since several packs can be in flight; `colo_sauce_done` dedupes per "year/pack".
+    // Each seed is (virtual path, optional SAUCE, filesize) — one per file in the pack,
+    // so the same fetch backfills both the SAUCE panel and the "0 B" Size (the listing
+    // endpoint omits both). filesize is 0 when unknown.
     #[allow(clippy::type_complexity)]
-    colo_sauce_tx: std::sync::mpsc::Sender<Vec<(PathBuf, crate::sauce::Sauce)>>,
+    colo_sauce_tx: std::sync::mpsc::Sender<Vec<(PathBuf, Option<crate::sauce::Sauce>, u64)>>,
     #[allow(clippy::type_complexity)]
-    colo_sauce_rx: std::sync::mpsc::Receiver<Vec<(PathBuf, crate::sauce::Sauce)>>,
+    colo_sauce_rx: std::sync::mpsc::Receiver<Vec<(PathBuf, Option<crate::sauce::Sauce>, u64)>>,
     colo_sauce_done: HashSet<String>,
 }
 
@@ -1753,21 +1756,19 @@ impl PixelView {
         }
         let tx = self.colo_sauce_tx.clone();
         std::thread::spawn(move || {
-            let seeds: Vec<(PathBuf, crate::sauce::Sauce)> =
+            let seeds: Vec<(PathBuf, Option<crate::sauce::Sauce>, u64)> =
                 crate::sixteen::fetch_pack_pieces(&group, year, &pack)
                     .map(|pieces| {
                         pieces
                             .into_iter()
-                            .filter_map(|p| {
+                            .map(|p| {
                                 // Rebuild the same virtual display path `emit_piece` uses
                                 // (ROOT/year/pack/filename) so the key matches the cache.
-                                p.sauce.map(|s| {
-                                    let vp = Path::new(crate::sixteen::ROOT)
-                                        .join(p.year.to_string())
-                                        .join(&p.pack)
-                                        .join(&p.filename);
-                                    (vp, s)
-                                })
+                                let vp = Path::new(crate::sixteen::ROOT)
+                                    .join(p.year.to_string())
+                                    .join(&p.pack)
+                                    .join(&p.filename);
+                                (vp, p.sauce, p.filesize)
                             })
                             .collect()
                     })
@@ -1777,11 +1778,33 @@ impl PixelView {
         self.want_repaint = true;
     }
 
-    /// Drain finished pack-SAUCE fetches into `sauce_cache` (see `ensure_colo_sauce`).
+    /// Drain finished pack-SAUCE fetches into `sauce_cache` and backfill file sizes (the
+    /// listing endpoint reports `0 B`; the pack endpoint carries the real size). See
+    /// `ensure_colo_sauce`.
     fn poll_colo_sauce(&mut self) {
         while let Ok(seeds) = self.colo_sauce_rx.try_recv() {
-            for (vpath, sauce) in seeds {
-                self.sauce_cache.insert(vpath, Some(sauce));
+            let mut sizes: HashMap<PathBuf, u64> = HashMap::new();
+            for (vpath, sauce, filesize) in seeds {
+                if sauce.is_some() {
+                    self.sauce_cache.insert(vpath.clone(), sauce);
+                }
+                if filesize > 0 {
+                    sizes.insert(vpath, filesize);
+                }
+            }
+            // Backfill the size into both the raw list and the rendered view so it shows
+            // in Details and survives a later re-sort/filter (`rebuild_view`).
+            if !sizes.is_empty() {
+                for e in &mut self.all_entries {
+                    if let Some(&sz) = sizes.get(&e.path) {
+                        e.size = sz;
+                    }
+                }
+                for e in &mut self.entries {
+                    if let Some(&sz) = sizes.get(&e.path) {
+                        e.size = sz;
+                    }
+                }
             }
             self.want_repaint = true;
         }
