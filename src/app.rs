@@ -149,7 +149,9 @@ enum ColoMsg {
 enum ColoSource {
     Artist(String),
     Group(String),
-    Search(String),
+    Search(String),        // substring across artists *and* groups
+    SearchArtists(String), // substring across artist names only
+    SearchGroups(String),  // substring across group names only
 }
 
 /// A virtual (non-on-disk) directory `Entry`, used for the 16colo.rs year/pack tree.
@@ -1553,6 +1555,13 @@ impl PixelView {
             [s, query] if s.as_str() == sixteen::SEARCH => {
                 self.start_colo_pieces(dir, ColoSource::Search(query.clone()));
             }
+            // Facet-scoped search: SEARCH/<scope>/<query> (built by the nav bar).
+            [s, scope, query] if s.as_str() == sixteen::SEARCH && scope == "artist" => {
+                self.start_colo_pieces(dir, ColoSource::SearchArtists(query.clone()));
+            }
+            [s, scope, query] if s.as_str() == sixteen::SEARCH && scope == "group" => {
+                self.start_colo_pieces(dir, ColoSource::SearchGroups(query.clone()));
+            }
             [year] if year.parse::<u32>().is_ok() => {
                 let year: u32 = year.parse().unwrap_or(0);
                 self.status = format!("Loading {year} packs…");
@@ -1607,6 +1616,8 @@ impl PixelView {
             ColoSource::Artist(a) => format!("Loading {a}…"),
             ColoSource::Group(g) => format!("Loading {g}…"),
             ColoSource::Search(q) => format!("Searching “{q}”…"),
+            ColoSource::SearchArtists(q) => format!("Searching artists “{q}”…"),
+            ColoSource::SearchGroups(q) => format!("Searching groups “{q}”…"),
         };
         self.show_folder(dir.clone(), Vec::new());
         self.colo_flat = true;
@@ -2081,16 +2092,114 @@ impl PixelView {
 
     /// Kick off a recursive image search from the current folder on a background
     /// thread. Results stream into `search_results` (see [`poll_search`]).
+    /// Filter the currently-loaded entries (a 16colo.rs flat listing / remote view) by
+    /// `search_spec`, in memory — there's no on-disk tree to walk. Evaluates the fields
+    /// we can from memory: filename, extension, size (after the pack backfill), rating,
+    /// and SAUCE (the piece's artist/group + any cached SAUCE title/author/group/font).
+    /// Dimensions / colours / modified-date aren't known for virtual pieces, so those
+    /// filters are simply ignored here rather than rejecting everything.
+    fn colo_filter_in_memory(&self) -> Vec<Entry> {
+        let spec = &self.search_spec;
+        let name_q = spec.name.trim().to_ascii_lowercase();
+        let exts: Vec<String> = spec
+            .ext
+            .split([',', ' ', ';'])
+            .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let sauce_q = spec.sauce.trim().to_ascii_lowercase();
+        let (smin, smax) = (parse_dim(&spec.smin), parse_dim(&spec.smax)); // KB
+        let rmin = parse_dim(&spec.rmin).unwrap_or(0).min(5) as u8;
+        self.all_entries
+            .iter()
+            .filter(|e| {
+                let fname = e
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if !name_q.is_empty() {
+                    // "Find in this listing" matches the visible row text — filename plus
+                    // the scene columns (artist / group / pack) — so e.g. Ctrl+F "tainted"
+                    // finds artist tainted's pieces, whose filenames are e.g. "67C21.ANS".
+                    let mut hay = fname.clone();
+                    if let Some(p) = self.colo_pieces.get(&e.path) {
+                        for f in [&p.artist, &p.group, &p.pack] {
+                            hay.push(' ');
+                            hay.push_str(&f.to_ascii_lowercase());
+                        }
+                    }
+                    if !hay.contains(&name_q) {
+                        return false;
+                    }
+                }
+                if !exts.is_empty() {
+                    let ext = e
+                        .path
+                        .extension()
+                        .and_then(|x| x.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if !exts.contains(&ext) {
+                        return false;
+                    }
+                }
+                if smin.is_some() || smax.is_some() {
+                    let kb = e.size / 1024;
+                    if smin.is_some_and(|v| kb < v as u64) || smax.is_some_and(|v| kb > v as u64) {
+                        return false;
+                    }
+                }
+                if rmin > 0 && e.rating < rmin {
+                    return false;
+                }
+                if !sauce_q.is_empty() {
+                    // The artist/group columns + any cached SAUCE are the searchable text
+                    // for a virtual piece (its raw file isn't on disk to parse).
+                    let mut hay = String::new();
+                    if let Some(p) = self.colo_pieces.get(&e.path) {
+                        hay.push_str(&p.artist.to_ascii_lowercase());
+                        hay.push(' ');
+                        hay.push_str(&p.group.to_ascii_lowercase());
+                    }
+                    if let Some(Some(s)) = self.sauce_cache.get(&e.path) {
+                        for f in [&s.title, &s.author, &s.group, &s.font] {
+                            hay.push(' ');
+                            hay.push_str(&f.to_ascii_lowercase());
+                        }
+                    }
+                    if !hay.contains(&sauce_q) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect()
+    }
+
     fn start_search(&mut self) {
         let Some(root) = self.folder.clone() else {
             return;
         };
-        if crate::sixteen::is_remote(&root) {
-            self.status = "Search isn't available in the 16colo.rs listing".into();
-            return;
-        }
         if self.search_spec.is_blank() {
             self.status = "Enter at least one search field".into();
+            return;
+        }
+        // A 16colo.rs listing (or any remote view) has no on-disk tree to walk, so filter
+        // the pieces already loaded into `all_entries` in memory instead of crawling.
+        if crate::sixteen::is_remote(&root) || self.colo_flat {
+            self.cancel_search();
+            let results = self.colo_filter_in_memory();
+            let n = results.len();
+            self.search_root = Some(root);
+            self.search_results = Some(results);
+            self.search_running = false;
+            self.status = format!("{n} match(es) in this listing");
+            self.mode = Mode::Grid;
+            self.selection.clear();
+            self.rebuild_view();
             return;
         }
         self.cancel_search(); // stop any prior run
@@ -2832,18 +2941,37 @@ impl PixelView {
                 nav = Some(root.join(sixteen::ARTISTS));
             }
             ui.separator();
-            // Server-side search across artists + groups (16colo's ?filter=).
+            // The search is scoped to the active facet: on the Artists tab it matches
+            // artist names only, on Groups it matches group names only, otherwise both.
+            let scope = if first == Some(sixteen::ARTISTS) {
+                Some("artist")
+            } else if first == Some(sixteen::GROUPS) {
+                Some("group")
+            } else {
+                None
+            };
+            let hint = match scope {
+                Some("artist") => "search artists",
+                Some("group") => "search groups",
+                _ => "search artist / group",
+            };
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.colo_search)
                     .desired_width(150.0)
-                    .hint_text("search artist / group"),
+                    .hint_text(hint),
             );
             let go = ui.small_button("🔍").clicked()
                 || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
             if go {
                 let q = self.colo_search.trim();
                 if !q.is_empty() {
-                    nav = Some(root.join(sixteen::SEARCH).join(q));
+                    // Scoped search adds a token segment (SEARCH/<scope>/<query>) so the
+                    // dispatch can tell it from a plain both-fields SEARCH/<query>.
+                    let base = root.join(sixteen::SEARCH);
+                    nav = Some(match scope {
+                        Some(s) => base.join(s).join(q),
+                        None => base.join(q),
+                    });
                 }
             }
         });
@@ -9442,6 +9570,66 @@ fn colo_walk(
     use std::sync::atomic::Ordering::Relaxed;
     let mut count = 0usize;
 
+    // A search can match many artists/groups; cap the fan-out so a broad query can't
+    // fetch thousands of packs. (The status reports the final count.)
+    const MAX_ARTISTS: usize = 25;
+    const MAX_GROUPS: usize = 15;
+    const MAX_PIECES: usize = 4000;
+    // Fetch + emit every piece by artists/groups whose name matches `query` (substring).
+    // Returns false when the caller should stop (cancelled, channel dropped, or the
+    // piece cap was hit — in which case a `Done` was already sent).
+    let do_artists = |query: &str, count: &mut usize| -> bool {
+        for a in sixteen::search_artists(query)
+            .unwrap_or_default()
+            .into_iter()
+            .take(MAX_ARTISTS)
+        {
+            if cancel.load(Relaxed) {
+                return false;
+            }
+            if let Ok(pieces) = sixteen::fetch_artist_pieces(&a) {
+                for p in pieces {
+                    if cancel.load(Relaxed) || !emit_piece(&tx, p, count) {
+                        return false;
+                    }
+                    if *count >= MAX_PIECES {
+                        let _ = tx.send(ColoMsg::Done(*count));
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    };
+    let do_groups = |query: &str, count: &mut usize| -> bool {
+        for g in sixteen::search_groups(query)
+            .unwrap_or_default()
+            .into_iter()
+            .take(MAX_GROUPS)
+        {
+            if cancel.load(Relaxed) {
+                return false;
+            }
+            for (year, pack) in sixteen::fetch_group_pack_refs(&g).unwrap_or_default() {
+                if cancel.load(Relaxed) {
+                    return false;
+                }
+                if let Ok(pieces) = sixteen::fetch_pack_pieces(&g, year, &pack) {
+                    for p in pieces {
+                        if cancel.load(Relaxed) || !emit_piece(&tx, p, count) {
+                            return false;
+                        }
+                        if *count >= MAX_PIECES {
+                            let _ = tx.send(ColoMsg::Done(*count));
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
+    };
+
     match source {
         ColoSource::Artist(name) => match sixteen::fetch_artist_pieces(&name) {
             Ok(pieces) => {
@@ -9478,50 +9666,18 @@ fn colo_walk(
             }
         },
         ColoSource::Search(query) => {
-            // A search can match many artists/groups; cap the fan-out so a broad query
-            // can't fetch thousands of packs. (The status reports the final count.)
-            const MAX_ARTISTS: usize = 25;
-            const MAX_GROUPS: usize = 15;
-            const MAX_PIECES: usize = 4000;
-            let artists = sixteen::search_artists(&query).unwrap_or_default();
-            let groups = sixteen::search_groups(&query).unwrap_or_default();
-            for a in artists.into_iter().take(MAX_ARTISTS) {
-                if cancel.load(Relaxed) {
-                    return;
-                }
-                if let Ok(pieces) = sixteen::fetch_artist_pieces(&a) {
-                    for p in pieces {
-                        if cancel.load(Relaxed) || !emit_piece(&tx, p, &mut count) {
-                            return;
-                        }
-                        if count >= MAX_PIECES {
-                            let _ = tx.send(ColoMsg::Done(count));
-                            return;
-                        }
-                    }
-                }
+            if !do_artists(&query, &mut count) || !do_groups(&query, &mut count) {
+                return;
             }
-            for g in groups.into_iter().take(MAX_GROUPS) {
-                if cancel.load(Relaxed) {
-                    return;
-                }
-                let refs = sixteen::fetch_group_pack_refs(&g).unwrap_or_default();
-                for (year, pack) in refs {
-                    if cancel.load(Relaxed) {
-                        return;
-                    }
-                    if let Ok(pieces) = sixteen::fetch_pack_pieces(&g, year, &pack) {
-                        for p in pieces {
-                            if cancel.load(Relaxed) || !emit_piece(&tx, p, &mut count) {
-                                return;
-                            }
-                            if count >= MAX_PIECES {
-                                let _ = tx.send(ColoMsg::Done(count));
-                                return;
-                            }
-                        }
-                    }
-                }
+        }
+        ColoSource::SearchArtists(query) => {
+            if !do_artists(&query, &mut count) {
+                return;
+            }
+        }
+        ColoSource::SearchGroups(query) => {
+            if !do_groups(&query, &mut count) {
+                return;
             }
         }
     }

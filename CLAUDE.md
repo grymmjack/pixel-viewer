@@ -244,9 +244,19 @@ into the table (the requested flat view), keyed by virtual path `<16colo.rs>/<ye
 drains them, resolves each rating, appends to `all_entries` + the `colo_pieces` map, and
 re-sorts. Pieces come from the JSON API with **no pack download**: an artist = one call
 (`fetch_artist_pieces`), a group = per-pack (`fetch_group_pack_refs` → `fetch_pack_pieces`),
-a search = matched artists + groups (capped). Thumbnails are 16colo's pre-rendered `tn`
-PNGs fetched by the `RemoteThumbs` HTTP pool (`colo_thumb.rs`) and uploaded to `thumb_tex`
-by virtual path (LINEAR — they're rendered previews, not pixel-art). Opening a piece
+a search = matched artists + groups (capped). The nav-bar search is **facet-scoped**:
+on the Artists tab it builds `SEARCH/artist/<q>` → `ColoSource::SearchArtists` (artist
+names only), on Groups `SEARCH/group/<q>` → `SearchGroups`, otherwise `SEARCH/<q>` →
+`Search` (both) — so "tainted" under Artists no longer drags in the *group* "tainted".
+`do_artists`/`do_groups` closures in `colo_walk` are shared by all three. Thumbnails are
+16colo's pre-rendered render PNGs fetched by the `RemoteThumbs` HTTP pool (`colo_thumb.rs`)
+and uploaded to `thumb_tex` by virtual path (LINEAR — they're rendered previews, not
+pixel-art); we fetch the **larger `/x1/`** render (≈768px, derived from the `tn` path via
+`sixteen::x1_url`), not the tiny `/tn/`, so big grid tiles aren't a blurry upscale. **The
+advanced search (Ctrl+F) filters a remote/flat listing in memory** (`colo_filter_in_memory`)
+instead of walking disk: name matches the visible row text (filename + artist/group/pack),
+SAUCE matches artist/group + cached SAUCE, plus ext/size/rating; dims/colours/date are
+unknown for virtual pieces so those filters are ignored. Opening a piece
 downloads just its single `raw` file (`start_piece_open`/`poll_colo_open` → `colo_files`
 map; `load_full` decodes via `resolve_local`, keeping the virtual path as identity).
 Per-row ⬇ menu saves the file or its pack `.zip` to disk (`download_piece` → rfd +
