@@ -58,8 +58,14 @@ fn decode_xbin(data: &[u8]) -> Result<PixImage, DecodeError> {
     let nonblink = flags & 0x08 != 0; // iCE colors (bit 7 of attr = bg intensity)
     let is_512 = flags & 0x10 != 0; // 512-char font (attr bit 3 selects the bank)
 
-    if width == 0 || height == 0 || fontsize == 0 {
+    if width == 0 || height == 0 {
         return Err(malformed("empty XBIN"));
+    }
+    // `fontsize` is the glyph height of an *embedded* font; it's legitimately 0 when
+    // there's no embedded font (flag bit 1 clear), in which case the default 8×16 VGA
+    // cell is used (see `glyph_h` below). Only reject a zero-height embedded font.
+    if has_font && fontsize == 0 {
+        return Err(malformed("XBIN embedded font has zero height"));
     }
     let cells = width
         .checked_mul(height)
@@ -286,6 +292,17 @@ mod tests {
         d.push(0xC0); // bg = 0xC (bright red) in iCE mode, fg = 0
         let img = XBinDecoder.decode(&d).unwrap();
         assert_eq!(img.pixels[0], [255, 85, 85, 255]); // bright red
+    }
+
+    #[test]
+    fn fontsize_zero_without_embedded_font_decodes() {
+        // fontsize 0 + no embedded-font flag is legal (use the default 8×16 cell);
+        // it used to be rejected as "empty XBIN". Regression for 6730302020_NFO.xb.
+        let mut d = header(2, 1, 0, 0); // w=2, h=1, fontsize=0, flags=0
+        d.extend_from_slice(&[0xDB, 0x04, 0xDB, 0x04]); // two red blocks
+        let img = XBinDecoder.decode(&d).unwrap();
+        assert_eq!((img.width, img.height), (16, 16)); // 2×8px wide, default 16px tall
+        assert_eq!(img.pixels[0], [170, 0, 0, 255]); // red (VGA index 4)
     }
 
     #[test]
