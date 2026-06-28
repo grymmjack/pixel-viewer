@@ -3243,22 +3243,17 @@ impl PixelView {
                     ui.close();
                 }
                 ui.separator();
-                ui.weak("Color");
+                if ui.button("✕ Clear color").clicked() {
+                    set_color = Some((i, None));
+                    ui.close();
+                }
+                // The ANSI32 swatches packed tight in an 8×4 grid.
                 egui::Grid::new(("fav_color_grid", i))
-                    .spacing([3.0, 3.0])
+                    .spacing([1.0, 1.0])
+                    .min_col_width(0.0)
                     .show(ui, |ui| {
-                        // Clear (no color), then the ANSI32 swatches, 8 per row.
-                        if ui
-                            .add(egui::Button::new("✕").min_size(egui::vec2(18.0, 18.0)))
-                            .on_hover_text("No color")
-                            .clicked()
-                        {
-                            set_color = Some((i, None));
-                            ui.close();
-                        }
-                        let mut n = 1usize;
-                        for &c in ansi32_palette() {
-                            if n % 8 == 0 {
+                        for (n, &c) in ansi32_palette().iter().enumerate() {
+                            if n > 0 && n % 8 == 0 {
                                 ui.end_row();
                             }
                             let mut sw = egui::Button::new("")
@@ -3271,7 +3266,6 @@ impl PixelView {
                                 set_color = Some((i, Some(c)));
                                 ui.close();
                             }
-                            n += 1;
                         }
                     });
             });
