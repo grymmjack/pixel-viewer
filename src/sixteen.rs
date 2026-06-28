@@ -346,6 +346,9 @@ pub struct Piece {
     pub year: u32,
     pub pack: String,
     pub raw_url: String,
+    /// The pre-rendered preview PNG we fetch for the grid/table thumbnail. Points at
+    /// 16colo's larger `/x1/` render (≈768px), not the tiny `/tn/`, so big grid tiles
+    /// stay crisp (see [`x1_url`]).
     pub tn_url: String,
     /// SAUCE record from the API (`?sauce=true`, pack endpoint only) — `None` when the
     /// file has no SAUCE or the endpoint doesn't carry it (e.g. the artist view).
@@ -397,6 +400,15 @@ fn abs_url(p: &str) -> String {
     }
 }
 
+/// 16colo renders each piece at two parallel sizes: `/tn/` (a 160px thumbnail) and
+/// `/x1/` (≈768px). We fetch the larger `x1` for the grid/table so a big tile is a
+/// crisp box-downscale instead of a blurry upscale of the tiny `tn`. The artist
+/// endpoint only lists `tn`, but the paths are parallel, so derive `x1` by swapping
+/// the one path segment. Empty stays empty (`abs_url` then yields "").
+fn x1_url(tn_uri: &str) -> String {
+    tn_uri.replacen("/tn/", "/x1/", 1)
+}
+
 /// Flatten an artist's `/v1/artist/:name` body into pieces. Shape:
 /// `results → "<year>" → "<pack>" → { group, files: [{ file, raw, tn }] }`.
 /// Pure (no network) so it's unit-testable; [`fetch_artist_pieces`] just feeds it.
@@ -426,7 +438,7 @@ fn pieces_from_artist_json(artist: &str, v: &serde_json::Value) -> Vec<Piece> {
                     year,
                     pack: pack.clone(),
                     raw_url: abs_url(f["raw"].as_str().unwrap_or("")),
-                    tn_url: abs_url(f["tn"].as_str().unwrap_or("")),
+                    tn_url: abs_url(&x1_url(f["tn"].as_str().unwrap_or(""))),
                     // The artist view carries no SAUCE; extract it anyway in case a
                     // future response adds it (harmless `None` today).
                     sauce: sauce_from_json(&f["sauce"]),
@@ -474,7 +486,7 @@ fn pieces_from_pack_json(
                 year,
                 pack: pack.to_string(),
                 raw_url: format!("{SITE}/pack/{}/raw/{}", enc(pack), filename),
-                tn_url: abs_url(tn),
+                tn_url: abs_url(&x1_url(tn)),
                 sauce: sauce_from_json(&fobj["sauce"]),
                 filesize: fobj["sauce"]["Filesize"].as_u64().unwrap_or(0),
             });
@@ -570,9 +582,10 @@ mod tests {
             p.raw_url,
             "https://16colo.rs/pack/acdu0892/raw/MIDNACD3.ANS"
         );
+        // We fetch the larger `x1` render (derived from the `tn` path) for crisp tiles.
         assert_eq!(
             p.tn_url,
-            "https://16colo.rs/pack/acdu0892/tn/MIDNACD3.ANS.png"
+            "https://16colo.rs/pack/acdu0892/x1/MIDNACD3.ANS.png"
         );
     }
 
@@ -598,7 +611,7 @@ mod tests {
         assert_eq!(p.raw_url, "https://16colo.rs/pack/acdu0892/raw/ACID-BR.ANS");
         assert_eq!(
             p.tn_url,
-            "https://16colo.rs/pack/acdu0892/tn/ACID-BR.ANS.png"
+            "https://16colo.rs/pack/acdu0892/x1/ACID-BR.ANS.png"
         );
     }
 
