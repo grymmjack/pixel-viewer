@@ -282,11 +282,83 @@ impl Baud {
     }
 }
 
-/// A progressive (byte-prefix) renderable: ANSI/text or RIP. Both render the first
-/// `n` bytes into a fixed-size canvas, which is the whole baud-playback engine.
+/// A progressive renderable for baud playback. `Text`/`Rip` render the first `n`
+/// *bytes* of a character/command stream; `Cells` reveals the first `n` *cells* of an
+/// already-decoded image — the binary scene formats (XBin/BIN/Tundra/IDF/ADF/PETSCII)
+/// aren't byte streams (RLE/headers/embedded font+palette), so they "type out" by
+/// revealing the decoded grid cell-by-cell instead.
 enum Stream {
     Text(crate::decode::TextStream),
     Rip(crate::decode::RipStream),
+    Cells(CellReveal),
+}
+
+/// Progressive cell reveal of an already-decoded text-mode image: paint the first `n`
+/// cells (reading order, top→bottom, left→right) over a black background. This is the
+/// baud "typeout" for the binary scene formats, which can't be rendered from a byte
+/// prefix. Cell size is the format's glyph box (8×16, or 8×8 for the C64/PETSCII font).
+struct CellReveal {
+    pixels: Vec<[u8; 4]>, // the full decoded image, row-major
+    w: usize,
+    h: usize,
+    cell_w: usize,
+    cell_h: usize,
+    cols: usize,
+    cells: usize, // total cell count (cols × rows)
+}
+
+impl CellReveal {
+    fn new(pixels: Vec<[u8; 4]>, w: usize, h: usize, cell_w: usize, cell_h: usize) -> CellReveal {
+        let cols = (w / cell_w.max(1)).max(1);
+        let rows = (h / cell_h.max(1)).max(1);
+        CellReveal {
+            pixels,
+            w,
+            h,
+            cell_w,
+            cell_h,
+            cols,
+            cells: cols * rows,
+        }
+    }
+
+    /// The frame with the first `limit` cells revealed (rest black), plus the revealed
+    /// bottom in source pixels (for BBS-style auto-scroll).
+    fn render(&self, limit: usize) -> (crate::image_types::PixImage, u32) {
+        let lim = limit.min(self.cells);
+        let full_rows = lim / self.cols;
+        let partial = lim % self.cols;
+        let mut out = vec![[0u8, 0, 0, 255]; self.w * self.h];
+        let rows_px = (full_rows * self.cell_h).min(self.h);
+        out[..rows_px * self.w].copy_from_slice(&self.pixels[..rows_px * self.w]);
+        // The partially-typed current row: reveal its first `partial` cells.
+        if partial > 0 && rows_px < self.h {
+            let pw = (partial * self.cell_w).min(self.w);
+            let y1 = (rows_px + self.cell_h).min(self.h);
+            for y in rows_px..y1 {
+                let base = y * self.w;
+                out[base..base + pw].copy_from_slice(&self.pixels[base..base + pw]);
+            }
+        }
+        let cursor_px = ((full_rows + 1) * self.cell_h).min(self.h) as u32;
+        (
+            crate::image_types::PixImage::from_rgba(self.w as u32, self.h as u32, out),
+            cursor_px,
+        )
+    }
+}
+
+/// The glyph-box (cell) size for a text-mode file: 8×8 for the C64/PETSCII font,
+/// otherwise the standard 8×16 VGA cell. Used to drive [`CellReveal`].
+fn textmode_cell(path: &Path) -> (usize, usize) {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("seq" | "pet" | "petscii" | "petmate") => (8, 8),
+        _ => (8, 16),
+    }
 }
 
 impl Stream {
@@ -315,6 +387,7 @@ impl Stream {
         match self {
             Stream::Text(s) => s.len(),
             Stream::Rip(s) => s.len(),
+            Stream::Cells(c) => c.cells,
         }
     }
     fn is_rip(&self) -> bool {
@@ -327,6 +400,7 @@ impl Stream {
         match self {
             Stream::Text(s) => s.render_frame(limit),
             Stream::Rip(s) => (s.render(limit), 0),
+            Stream::Cells(c) => c.render(limit),
         }
     }
 }
@@ -2781,6 +2855,21 @@ impl PixelView {
                     &rgba,
                     egui::TextureOptions::NEAREST_REPEAT,
                 );
+                // Binary scene formats (XBin/BIN/Tundra/IDF/ADF/PETSCII) aren't byte
+                // streams, so `for_file` gave no player — drive a cell-reveal "typeout"
+                // off the decoded image instead, so they animate at the baud rate too.
+                if self.player.is_none() && is_textmode_ext(&path) {
+                    let (cw, ch) = textmode_cell(&path);
+                    let reveal = CellReveal::new(img.pixels.clone(), size[0], size[1], cw, ch);
+                    if reveal.cells > 1 {
+                        let baud = self.baud_ansi;
+                        self.player = Some(Player::new(
+                            path.clone(),
+                            Stream::Cells(reveal),
+                            baud != Baud::None,
+                        ));
+                    }
+                }
                 // Keep the CPU pixels so the optional palette reduction can remap
                 // the full image without re-decoding.
                 self.full_src = Some((path.clone(), size, rgba));
@@ -10428,6 +10517,29 @@ fn parse_thumb_size(s: &str) -> Result<f32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cell_reveal_types_out_in_reading_order() {
+        // 2×2 grid of 1×1 cells, four distinct colours in reading order.
+        let px = vec![
+            [1, 1, 1, 255],
+            [2, 2, 2, 255],
+            [3, 3, 3, 255],
+            [4, 4, 4, 255],
+        ];
+        let cr = CellReveal::new(px, 2, 2, 1, 1);
+        assert_eq!(cr.cells, 4);
+        // 0 cells → all black.
+        assert_eq!(cr.render(0).0.pixels, vec![[0, 0, 0, 255]; 4]);
+        // 3 cells → first three revealed, the last still black.
+        let img = cr.render(3).0;
+        assert_eq!(img.pixels[0], [1, 1, 1, 255]);
+        assert_eq!(img.pixels[1], [2, 2, 2, 255]);
+        assert_eq!(img.pixels[2], [3, 3, 3, 255]);
+        assert_eq!(img.pixels[3], [0, 0, 0, 255]);
+        // All cells → the full image.
+        assert_eq!(cr.render(4).0.pixels[3], [4, 4, 4, 255]);
+    }
 
     #[test]
     fn baud_cps_and_roundtrip() {

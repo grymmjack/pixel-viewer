@@ -399,9 +399,14 @@ rematch**, and the *order* of all of it is user-controlled.
   modems compressed ANSI ~4:1, so 14.4k+ "feels fast" like a real board while ≤2400
   stays an authentic crawl. Rates are the modem ladder (300/1200/2400/4800/9600/14.4k/
   28.8k/33.6k/56k/115.2k); RIP and ANSI keep **independent** remembered speeds
-  (`baud_ansi`/`baud_rip`, picked by `Stream::is_rip()`). `Stream::for_file`
-  makes a player only for RIP + ANSI/CP437 streams (NOT the binary text-mode formats —
-  XBin/BIN/IDF/PETSCII aren't character streams). A controls row (▶/⏸ · ⏮ Replay · byte
+  (`baud_ansi`/`baud_rip`, picked by `Stream::is_rip()`). `Stream::for_file` makes a
+  byte-prefix player for RIP + ANSI/CP437 streams; the **binary** scene formats
+  (XBin/BIN/Tundra/IDF/ADF/PETSCII) aren't byte streams (RLE/headers/embedded
+  font+palette), so `load_full` instead wraps their *decoded* image in a
+  **`Stream::Cells(CellReveal)`** — a progressive **cell** reveal (first N cells in
+  reading order over black, `textmode_cell` gives the 8×16 / 8×8 box) — so they "type
+  out" at the baud rate too. The `Player` is unit-agnostic (it advances `pos` toward
+  `len()` at `cps`; for `Cells`, `pos`/`len` are *cells* not bytes). A controls row (▶/⏸ · ⏮ Replay · byte
   seek) shows above the art; the **baud picker** is in the status bar. `Baud::None`
   (default) → instant, so the player sits at-rest and the view falls through to the
   static `full_tex` path (recolor/minimap keep working). Picking a baud restarts the open
