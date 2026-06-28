@@ -2029,6 +2029,19 @@ impl PixelView {
         self.viewdb.as_ref().and_then(|db| db.get(&self.view_key(path)))
     }
 
+    /// Pin the current folder to Places (used inside a 16colo flat listing, whose rows
+    /// are pieces, so the dir "Pin" doesn't apply). A pinned artist/group/search path
+    /// re-runs that listing when clicked.
+    fn pin_current_folder(&mut self) {
+        if let Some(f) = self.folder.clone() {
+            if !self.favorites.contains(&f) {
+                let name = short_name(&f);
+                self.favorites.push(f);
+                self.status = format!("Pinned “{name}” to Places");
+            }
+        }
+    }
+
     /// Manually toggle visited state for `path` (grid/table context menu).
     fn set_viewed(&mut self, path: &Path, viewed: bool) {
         let key = self.view_key(path);
@@ -4858,7 +4871,18 @@ impl PixelView {
         let mut pin_dir: Option<usize> = None; // "Pin to Places" on a folder tile
         let mut smart_on: Option<(usize, SmartCriterion)> = None; // "Smart filter on…"
         let mut toggle_viewed: Option<(usize, bool)> = None; // "Mark as (not) viewed"
+        let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let can_paste = self.clipboard.is_some();
+        // In a 16colo flat listing the rows are pieces, so offer pinning the whole
+        // listing (the artist/group/search) — its virtual path re-runs the search.
+        let colo_pin_label = self
+            .colo_flat
+            .then(|| self.folder.as_ref().map(|f| short_name(f)))
+            .flatten();
+        let colo_pin_pinned = self
+            .folder
+            .as_ref()
+            .is_some_and(|f| self.favorites.contains(f));
         // When "Apply to grid" is on, tiles render with the active recolor.
         let grid_key = self.grid_recolor_key();
 
@@ -5116,11 +5140,14 @@ impl PixelView {
                         }
                         resp.context_menu(|ui| {
                             let pinned = self.favorites.iter().any(|f| f == &entry.path);
+                            let colo_pin =
+                                colo_pin_label.as_deref().map(|l| (l, colo_pin_pinned));
                             if let Some(pick) =
-                                entry_context_menu(ui, &entry, can_paste, pinned, viewed)
+                                entry_context_menu(ui, &entry, can_paste, pinned, viewed, colo_pin)
                             {
                                 match pick {
                                     TilePick::Pin => pin_dir = Some(idx),
+                                    TilePick::PinFolder => pin_current = true,
                                     TilePick::Smart(c) => smart_on = Some((idx, c)),
                                     TilePick::File(a) => ctx_action = Some((idx, a)),
                                     TilePick::ToggleViewed(b) => toggle_viewed = Some((idx, b)),
@@ -5181,6 +5208,9 @@ impl PixelView {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
                 self.set_viewed(&p, b);
             }
+        }
+        if pin_current {
+            self.pin_current_folder();
         }
     }
 
@@ -5372,9 +5402,19 @@ impl PixelView {
         let mut pin_dir: Option<usize> = None;
         let mut smart_on: Option<(usize, SmartCriterion)> = None;
         let mut toggle_viewed: Option<(usize, bool)> = None; // "Mark as (not) viewed"
+        let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // (idx, want_pack)
         let mut colo_link: Option<(usize, ColKind)> = None; // pack/year/group link click
         let can_paste = self.clipboard.is_some();
+        // In a flat listing the rows are pieces — offer pinning the whole listing.
+        let colo_pin_label = self
+            .colo_flat
+            .then(|| self.folder.as_ref().map(|f| short_name(f)))
+            .flatten();
+        let colo_pin_pinned = self
+            .folder
+            .as_ref()
+            .is_some_and(|f| self.favorites.contains(f));
         let (sort_key, sort_desc) = (self.sort_key, self.sort_desc);
 
         // Header row (above the scroll area so it stays put), sharing the body widths.
@@ -5659,12 +5699,14 @@ impl PixelView {
                         clicked = Some((idx, ui.input(|i| i.modifiers)));
                     }
                     let pinned = self.favorites.iter().any(|f| f == &entry.path);
+                    let colo_pin = colo_pin_label.as_deref().map(|l| (l, colo_pin_pinned));
                     resp.context_menu(|ui| {
                         if let Some(pick) =
-                            entry_context_menu(ui, &entry, can_paste, pinned, viewed)
+                            entry_context_menu(ui, &entry, can_paste, pinned, viewed, colo_pin)
                         {
                             match pick {
                                 TilePick::Pin => pin_dir = Some(idx),
+                                TilePick::PinFolder => pin_current = true,
                                 TilePick::Smart(c) => smart_on = Some((idx, c)),
                                 TilePick::File(a) => ctx_action = Some((idx, a)),
                                 TilePick::ToggleViewed(b) => toggle_viewed = Some((idx, b)),
@@ -5739,6 +5781,9 @@ impl PixelView {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
                 self.set_viewed(&p, b);
             }
+        }
+        if pin_current {
+            self.pin_current_folder();
         }
         if let Some((idx, want_pack)) = dl {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
@@ -9398,6 +9443,7 @@ fn make_entry(path: PathBuf, is_dir: bool) -> Entry {
 /// caller (which holds `&mut self`), so the menu closure needn't borrow `self`.
 enum TilePick {
     Pin,
+    PinFolder, // pin the *current* folder (e.g. the 16colo artist/group/search) to Places
     Smart(SmartCriterion),
     File(FileAction),
     ToggleViewed(bool), // mark this entry viewed (true) / not viewed (false)
@@ -9406,15 +9452,33 @@ enum TilePick {
 /// The shared right-click context menu for a browse entry (used by both the grid tile
 /// and the table row). Returns the chosen action, or `None` while the menu is still
 /// open. `pinned` (already-a-favorite) and `can_paste` are passed in so this needn't
-/// touch `self`.
+/// touch `self`. `colo_pin` is `Some(label)` inside a 16colo flat listing — the rows are
+/// *pieces* (not dirs), so this offers pinning the current artist/group/search itself.
 fn entry_context_menu(
     ui: &mut egui::Ui,
     entry: &Entry,
     can_paste: bool,
     pinned: bool,
     viewed: bool,
+    colo_pin: Option<(&str, bool)>, // (label, already-pinned)
 ) -> Option<TilePick> {
     let mut pick = None;
+    // In a flat artist/group/search listing, let the user bookmark the whole listing
+    // (a pinned `…/search/artist/x` re-runs that search when clicked).
+    if let Some((label, already)) = colo_pin {
+        if ui
+            .add_enabled(
+                !already,
+                egui::Button::new(format!("📌 Pin “{label}” to Places")),
+            )
+            .on_hover_text("Bookmark this artist / group / search")
+            .clicked()
+        {
+            pick = Some(TilePick::PinFolder);
+            ui.close();
+        }
+        ui.separator();
+    }
     if entry.is_dir {
         if ui
             .add_enabled(!pinned, egui::Button::new("📌 Pin to Places"))

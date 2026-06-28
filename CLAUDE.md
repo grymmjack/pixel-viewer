@@ -209,7 +209,12 @@ deferred → `favorites.push`). File tiles get a **🔍 Smart filter on…** sub
 (`smart_filter_from`): Type=its ext, File name=first ≥3-char word of the stem, File
 size=±20% KB, Date=its mtime day, Rating=its stars+ (shown only when rated), SAUCE
 group/artist=its SAUCE field (shown only for `is_textmode_ext`). Both are deferred
-`pin_dir`/`smart_on` locals applied after the tile closure.
+`pin_dir`/`smart_on` locals applied after the tile closure. **In a 16colo flat listing
+(`colo_flat`) the rows are *pieces*, not dirs**, so `entry_context_menu` also takes a
+`colo_pin: Option<(&str, bool)>` and offers **📌 Pin “<artist/group/search>” to Places**
+(`TilePick::PinFolder` → `pin_current` → `pin_current_folder` pins `self.folder`). Since
+the listing's virtual path encodes the search (`…/search/artist/x`), the pinned favorite
+re-runs that exact artist/group/search when clicked — the way to bookmark an artist.
 
 **Table view (`ui_table`, `table_view` bool, persisted)** — an *alternate renderer*
 for the browse mode, **not a third `Mode`**: `Mode` stays `Grid` and the central panel
