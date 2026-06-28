@@ -1,6 +1,7 @@
 mod anim;
 mod app;
 mod archive;
+mod cache;
 mod colo_thumb;
 mod decode;
 mod image_types;

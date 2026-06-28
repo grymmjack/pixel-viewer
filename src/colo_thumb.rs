@@ -6,7 +6,6 @@
 //! grid/table upload them into `thumb_tex` exactly like a locally-decoded thumbnail.
 
 use std::collections::HashSet;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -81,13 +80,10 @@ impl RemoteThumbs {
 }
 
 /// Download + decode one thumbnail PNG, area-downscaling if it's bigger than `target`.
+/// The PNG is immutable (a pre-rendered preview), so it goes through the persistent
+/// disk cache — re-browsing a pack/artist doesn't re-fetch it.
 fn fetch(job: &Job) -> Option<RemoteThumbResult> {
-    let resp = ureq::get(&job.url).call().ok()?;
-    let mut buf = Vec::new();
-    resp.into_reader()
-        .take(16 * 1024 * 1024) // a rendered ANSI preview is tiny; cap defensively
-        .read_to_end(&mut buf)
-        .ok()?;
+    let buf = crate::cache::get_bytes(&job.url, None).ok()?;
     let img = image::load_from_memory(&buf).ok()?.to_rgba8();
     let (sw, sh) = (img.width() as usize, img.height() as usize);
     if sw == 0 || sh == 0 {

@@ -1179,6 +1179,8 @@ impl PixelView {
         let ratings = crate::ratings::RatingStore::load(&data_dir);
         // View history lives alongside the ratings sidecar + eframe storage.
         let viewdb = crate::viewdb::ViewDb::open(&data_dir);
+        // Persistent on-disk HTTP cache (16colo JSON / thumbnails / files / zips).
+        crate::cache::init(&data_dir);
         let theme = get_u8(Self::THEME_KEY).unwrap_or(0);
         if theme == 1 {
             cc.egui_ctx.set_visuals(egui::Visuals::light());
@@ -8048,6 +8050,27 @@ impl eframe::App for PixelView {
                     if let Some(r) = new_rebind {
                         self.rebinding = r;
                     }
+
+                    ui.add_space(10.0);
+                    ui.label("16colo.rs cache");
+                    let (bytes, count) = crate::cache::stats();
+                    ui.horizontal(|ui| {
+                        ui.weak(format!(
+                            "{} · {count} items",
+                            human_size(bytes.max(0) as u64)
+                        ));
+                        if ui
+                            .button("Clear cache")
+                            .on_hover_text(
+                                "Delete all cached 16colo.rs JSON, thumbnails, files and \
+                                 pack zips (they'll re-download on demand)",
+                            )
+                            .clicked()
+                        {
+                            crate::cache::clear();
+                            self.status = "Cache cleared".into();
+                        }
+                    });
                 });
             self.show_prefs = open;
         }

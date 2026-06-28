@@ -46,7 +46,8 @@ pub struct Pack {
 const CURRENT_YEAR: u32 = 2026;
 
 fn cache_dir() -> PathBuf {
-    std::env::temp_dir().join("pixelview-16colo")
+    // The persistent cache dir (set at startup); falls back to temp before init / in tests.
+    crate::cache::dir().unwrap_or_else(|| std::env::temp_dir().join("pixelview-16colo"))
 }
 
 /// A disk-cached pack listing for `year`, if present and still fresh.
@@ -145,25 +146,15 @@ pub fn pack_url(year: u32, pack: &str) -> String {
     format!("{SITE}/archive/{year}/{pack}.zip")
 }
 
-/// Download `url` into a per-URL temp cache file and return its path. Cached: an
-/// already-downloaded pack is reused rather than re-fetched.
+/// Download a pack `url` to the persistent cache and return its path. Cached (by the
+/// shared HTTP cache) so an already-downloaded pack zip is reused across sessions.
 pub fn download(url: &str) -> Result<PathBuf, String> {
-    let dir = cache_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let dest = dir.join(format!("{:016x}.zip", hash(url)));
-    if dest.exists() {
-        return Ok(dest);
-    }
-    let resp = ureq::get(url).call().map_err(|e| e.to_string())?;
-    let mut buf = Vec::new();
-    resp.into_reader()
-        .take(256 * 1024 * 1024) // sanity cap: 256 MB
-        .read_to_end(&mut buf)
-        .map_err(|e| e.to_string())?;
-    let tmp = dest.with_extension("part");
-    std::fs::write(&tmp, &buf).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
-    Ok(dest)
+    let name = url
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("pack.zip");
+    crate::cache::get_file(url, name)
 }
 
 /// Download `url` straight to `dest` (the "Download file / pack" action — the user
@@ -186,24 +177,9 @@ pub fn download_to(url: &str, dest: &Path) -> Result<(), String> {
 /// real `filename` (so the decoder's extension dispatch still works), and return the
 /// local path. Cached: an already-downloaded piece is reused.
 pub fn download_file(url: &str, filename: &str) -> Result<PathBuf, String> {
-    let dir = cache_dir()
-        .join("files")
-        .join(format!("{:016x}", hash(url)));
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let dest = dir.join(filename);
-    if dest.exists() {
-        return Ok(dest);
-    }
-    download_to(url, &dest)?;
-    Ok(dest)
+    crate::cache::get_file(url, filename)
 }
 
-fn hash(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
-}
 
 /// The virtual sub-roots the nav bar exposes besides the year list.
 pub const GROUPS: &str = "groups";
@@ -224,13 +200,22 @@ fn enc(s: &str) -> String {
         .collect()
 }
 
+/// Cache lifetime for a JSON endpoint: a *pack*'s contents are immutable once published
+/// (never expire); the "latest" feed turns over fast (1 h); artist/group/search lists
+/// grow slowly (1 day). Force a refresh any time by clearing the cache (Preferences).
+fn json_ttl(url: &str) -> Option<i64> {
+    if url.contains("/pack/") {
+        None
+    } else if url.contains("/latest") {
+        Some(3600)
+    } else {
+        Some(86_400)
+    }
+}
+
 fn get_json(url: &str) -> Result<serde_json::Value, String> {
-    let body = ureq::get(url)
-        .call()
-        .map_err(|e| e.to_string())?
-        .into_string()
-        .map_err(|e| e.to_string())?;
-    serde_json::from_str(&body).map_err(|e| e.to_string())
+    let body = crate::cache::get_bytes(url, json_ttl(url))?;
+    serde_json::from_slice(&body).map_err(|e| e.to_string())
 }
 
 /// Walk a paginated endpoint (`base` already carries its query, sans `page`), calling

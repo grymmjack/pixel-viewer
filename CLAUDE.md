@@ -48,6 +48,11 @@ src/
   app.rs             PixelView: the whole UI — panels, grid/single views, model,
                      settings persistence, sort/filter, ratings, CLI parsing
   image_types.rs     PixImage (RGBA + optional indexed/palette)
+  cache.rs           persistent HTTP cache for 16colo (JSON/thumbnails/files/zips):
+                     blob files under <data>/cache/ + a SQLite index (cache.db) for
+                     TTL freshness, LRU eviction (2 GiB cap) + size stats; thread-safe
+                     via a global Mutex<Connection>. `init`/`get_bytes`/`get_file`/
+                     `stats`/`clear`. Used by sixteen.rs (get_json/download) + colo_thumb.
   thumb.rs           worker pool: thumbnails + image metadata (dims, color count)
   colo_thumb.rs      RemoteThumbs: HTTP worker pool fetching 16colo.rs `tn` PNGs
                      (mirrors ThumbBuilder; results uploaded to thumb_tex by path)
