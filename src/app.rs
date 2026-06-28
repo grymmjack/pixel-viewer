@@ -1732,6 +1732,17 @@ impl PixelView {
         for _ in 0..512 {
             match rx.try_recv() {
                 Ok(ColoMsg::Hit(mut entry, piece)) => {
+                    // Skip non-viewable files (music/exec/video: .s3m/.it/.mod/.xm/.exe/
+                    // .com/.mp4/…). 16colo has no thumbnail render for them, so their tile
+                    // would spin forever. `known_extension` is the canonical art allowlist.
+                    let viewable = entry
+                        .path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_none_or(|e| self.registry.known_extension(e));
+                    if !viewable {
+                        continue;
+                    }
                     entry.rating = self.read_rating(&entry.path);
                     // Pre-seed the SAUCE cache from the API so the Details panel shows
                     // title/author/group/dims for this piece without downloading it.
@@ -1763,10 +1774,12 @@ impl PixelView {
             self.want_repaint = true;
         }
         match done {
-            Some(Ok(n)) => {
+            Some(Ok(_)) => {
                 self.colo_rx = None;
                 self.colo_cancel = None;
-                self.status = format!("{n} pieces");
+                // Report the *shown* count (after the non-viewable filter), not the raw
+                // fetched total, so it matches the rows on screen.
+                self.status = format!("{} pieces", self.all_entries.len());
             }
             Some(Err(e)) => {
                 self.colo_rx = None;
@@ -2862,12 +2875,12 @@ impl PixelView {
                     let (cw, ch) = textmode_cell(&path);
                     let reveal = CellReveal::new(img.pixels.clone(), size[0], size[1], cw, ch);
                     if reveal.cells > 1 {
-                        let baud = self.baud_ansi;
-                        self.player = Some(Player::new(
-                            path.clone(),
-                            Stream::Cells(reveal),
-                            baud != Baud::None,
-                        ));
+                        // Show binary art *instantly* on open (autoplay=false → starts at
+                        // the end, fully revealed). The baud picker + ▶/Replay controls
+                        // then let you watch it "type out" on demand — unlike ANSI, which
+                        // auto-plays, these always rendered instantly, so keep that.
+                        self.player =
+                            Some(Player::new(path.clone(), Stream::Cells(reveal), false));
                     }
                 }
                 // Keep the CPU pixels so the optional palette reduction can remap
