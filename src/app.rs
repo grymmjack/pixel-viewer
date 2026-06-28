@@ -6021,7 +6021,28 @@ impl PixelView {
                 i.key_pressed(egui::Key::T),
             )
         });
-        if self.rebinding.is_none() {
+        // Any user input during baud playback finishes the animation *now* and hands
+        // control back — the auto-scroll stops following the cursor so the user can
+        // scroll/pan freely. Triggered by a scroll, a zoom gesture, or any key press;
+        // that input's own action is suppressed this frame (it just aborts the playback).
+        let playing = self.player.as_ref().is_some_and(|p| p.playing);
+        let interrupt = playing
+            && ctx.input(|i| {
+                i.smooth_scroll_delta != egui::Vec2::ZERO
+                    || (i.zoom_delta() - 1.0).abs() > 0.001
+                    || i.events
+                        .iter()
+                        .any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+            });
+        if interrupt {
+            if let Some(p) = self.player.as_mut() {
+                p.pos = p.len; // draw everything immediately
+                p.playing = false;
+                p.tex = None;
+            }
+            self.play_autoscroll = None; // release the cursor-follow so the user can scroll
+        }
+        if self.rebinding.is_none() && !interrupt {
             if prev {
                 self.step_image(ctx, false);
             }
@@ -6225,7 +6246,11 @@ impl PixelView {
             None => tex,
         };
         if let Some(forward) = self.draw_image_view(ui, &tex) {
-            self.step_image(ctx, forward);
+            // `interrupt` aborted a playback this frame → its scroll/key just stops the
+            // animation, it doesn't also step to the next image.
+            if !interrupt {
+                self.step_image(ctx, forward);
+            }
         }
     }
 
@@ -6519,6 +6544,23 @@ impl PixelView {
                 self.offset.y += scroll; // wheel scrolls a long file (clamped below)
             } else if !overflow_y && wheel != 0.0 {
                 advance = Some(wheel < 0.0); // a file that fits: wheel = prev/next
+            }
+        }
+        // Up/Down arrows scroll a long file (Left/Right are prev/next). Auto-repeat while
+        // held; one keypress nudges ~⅛ of the viewport. Only when there's overflow to pan.
+        if overflow_y {
+            let (up, down) = ui.input(|i| {
+                (
+                    i.key_pressed(egui::Key::ArrowUp),
+                    i.key_pressed(egui::Key::ArrowDown),
+                )
+            });
+            let step = resp.rect.height() * 0.125;
+            if down {
+                self.offset.y -= step; // scroll down → reveal lower content
+            }
+            if up {
+                self.offset.y += step;
             }
         }
         // Baud playback: keep the typing cursor at the bottom of the viewport so a long

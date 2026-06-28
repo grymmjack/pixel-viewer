@@ -417,6 +417,11 @@ rematch**, and the *order* of all of it is user-controlled.
   finish so the scroll lands exactly at the bottom (incl. a blank final line); the pan
   clamp keeps short (fits-the-screen) art put. Perf caveat: a frame re-parses+re-uploads
   the whole prefix, so very tall files at high baud are heavy (most ANSImations are 80×25).
+  **Interrupt:** any user input while playing (`interrupt` in `ui_single` — a scroll,
+  zoom gesture, or any key press) finishes the playback instantly (`pos=len`, `playing=
+  false`) and clears `play_autoscroll` so the user can scroll/pan the full art; that
+  input's own nav action is suppressed for the frame. The viewer also scrolls a long file
+  with **Up/Down arrows** (Left/Right stay prev/next image), alongside the wheel.
 - **Slideshow** (`auto_next` + `auto_next_secs` 1/3/5/10s, status bar, persisted). In the
   single view, once the file has *settled* (any baud transmission finished — `Player.playing`
   is the "busy" gate) and the delay elapses, `ui_single` steps to the next file. Dwell
