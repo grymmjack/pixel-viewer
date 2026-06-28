@@ -10,6 +10,7 @@ mod ratings;
 mod sauce;
 mod sixteen;
 mod thumb;
+mod viewdb;
 
 use eframe::egui;
 

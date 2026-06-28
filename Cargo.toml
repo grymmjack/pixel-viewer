@@ -32,6 +32,10 @@ trash = "5.2.6"
 # so ratings interoperate with Gwenview and the user's sort-by-rating tooling.
 xattr = "1"
 xcf = "0.4.0"
+# View-history store. Pinned to 0.37: rusqlite 0.40 pulls libsqlite3-sys 0.38, whose
+# build script uses the still-unstable `cfg_select!` and fails to compile on stable
+# rustc 1.92. `bundled` builds SQLite from source — no system libsqlite dependency.
+rusqlite = { version = "0.37", features = ["bundled"] }
 
 [profile.release]
 opt-level = 3

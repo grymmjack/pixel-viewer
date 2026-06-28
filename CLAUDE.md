@@ -497,6 +497,25 @@ real app — tofu has bitten this UI several times.
   ratable at all**, and it survives re-extraction because the key is the archive path,
   not the temp file. `set_rating` flushes immediately; `save()` re-flushes on exit.
 
+- **View history** (`viewdb.rs`, `ViewDb`): a **SQLite** store (`views.db` in eframe's
+  data dir, via `rusqlite` `bundled`) of visited-state + view count + first/last-viewed,
+  keyed by the same **stable display path** as ratings (`view_key` = `to_display` as a
+  string). All rows mirror into an in-memory `HashMap` on open so the grid/table can ask
+  `is_viewed` for every visible tile each frame without touching SQLite; writes go through
+  immediately (user-paced). `ViewDb::open` returns `None` on any SQLite error → the app
+  runs with tracking silently disabled (never crashes). **Recording:** `load_full` marks a
+  file viewed when opened in the viewer; the top of `open_folder` marks a folder/pack
+  viewed when entered (recorded *before* the remote/archive redirect so the key is the
+  tile's own path). **Surfaces:** the table filename is a browser-style visited link
+  (unvisited = `hyperlink_color` + underline, visited = `weak_text_color`, no underline);
+  grid + pack tiles get a *painted* check badge (top-right — `paint_check_badge`, painted
+  not glyphed because the bundled font lacks a reliable ✓); the Details pane shows
+  `Views`/`Last viewed`; and the shared `entry_context_menu` has **Mark as (not) viewed**
+  (`TilePick::ToggleViewed(bool)` → `set_viewed`). Timestamps are unix seconds
+  (`unix_now`), formatted via `date_ymd_unix`. **rusqlite is pinned to 0.37** — 0.40 pulls
+  `libsqlite3-sys` 0.38 whose build script uses the still-unstable `cfg_select!` and fails
+  on stable rustc 1.92 (see Cargo.toml comment).
+
 ## Adding a format (the common task)
 
 Copy `decode/pcx.rs`, implement the `Decoder` trait (`name`, `extensions`,

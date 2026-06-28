@@ -711,6 +711,9 @@ pub struct PixelView {
     // Cross-platform ratings sidecar — the source of truth for virtual art (inside
     // archives / 16colo.rs) that can't carry a `user.baloo.rating` xattr.
     ratings: crate::ratings::RatingStore,
+    // View history (visited state + counts + last-viewed), SQLite-backed. None if the
+    // db couldn't be opened — the app then runs with view-tracking disabled.
+    viewdb: Option<crate::viewdb::ViewDb>,
 
     // chrome (Phase 6 + round 2)
     show_explorer: bool,
@@ -1095,9 +1098,10 @@ impl PixelView {
         crate::decode::set_font_9px(font_9px);
         // Ratings sidecar lives alongside eframe's own storage (e.g.
         // ~/.local/share/pixelview/ratings.json); temp dir is a harmless fallback.
-        let ratings = crate::ratings::RatingStore::load(
-            &eframe::storage_dir("pixelview").unwrap_or_else(std::env::temp_dir),
-        );
+        let data_dir = eframe::storage_dir("pixelview").unwrap_or_else(std::env::temp_dir);
+        let ratings = crate::ratings::RatingStore::load(&data_dir);
+        // View history lives alongside the ratings sidecar + eframe storage.
+        let viewdb = crate::viewdb::ViewDb::open(&data_dir);
         let theme = get_u8(Self::THEME_KEY).unwrap_or(0);
         if theme == 1 {
             cc.egui_ctx.set_visuals(egui::Visuals::light());
@@ -1237,6 +1241,7 @@ impl PixelView {
             dirs_first,
             min_rating,
             ratings,
+            viewdb,
             show_explorer,
             show_details,
             show_recolor,
@@ -1373,6 +1378,9 @@ impl PixelView {
     /// Scan `dir` into folder + image entries (directories first, then images,
     /// each name-sorted — the default order; Phase 5 makes this configurable).
     fn open_folder(&mut self, dir: PathBuf) {
+        // Visiting a folder (incl. a 16colo.rs pack) marks it viewed — recorded here,
+        // before the remote/archive redirect, so the key is the tile's own path.
+        self.mark_viewed(&dir);
         // The virtual 16colo.rs tree (years → packs → downloaded pack contents).
         if crate::sixteen::is_remote(&dir) {
             self.open_remote(dir);
@@ -1982,6 +1990,43 @@ impl PixelView {
         disp.to_path_buf()
     }
 
+    /// The stable view-history key for a path (its display identity as a string), so a
+    /// piece inside a zip / on 16colo.rs is tracked across re-extraction / re-download.
+    fn view_key(&self, path: &Path) -> String {
+        self.to_display(path).to_string_lossy().into_owned()
+    }
+
+    /// Record one view of `path` (open in viewer, or open a folder/pack) — bumps its
+    /// count + last-viewed time. No-op if the view db couldn't be opened.
+    fn mark_viewed(&mut self, path: &Path) {
+        let key = self.view_key(path);
+        let now = unix_now();
+        if let Some(db) = self.viewdb.as_mut() {
+            db.record(&key, now);
+        }
+    }
+
+    /// True if `path` has been viewed at least once.
+    fn is_viewed(&self, path: &Path) -> bool {
+        self.viewdb
+            .as_ref()
+            .is_some_and(|db| db.is_viewed(&self.view_key(path)))
+    }
+
+    /// Full view record (count + first/last) for `path`, if tracked.
+    fn view_record(&self, path: &Path) -> Option<crate::viewdb::ViewRecord> {
+        self.viewdb.as_ref().and_then(|db| db.get(&self.view_key(path)))
+    }
+
+    /// Manually toggle visited state for `path` (grid/table context menu).
+    fn set_viewed(&mut self, path: &Path, viewed: bool) {
+        let key = self.view_key(path);
+        let now = unix_now();
+        if let Some(db) = self.viewdb.as_mut() {
+            db.set_viewed(&key, viewed, now);
+        }
+    }
+
     /// Resolve the star rating for a *real* entry path. Virtual art (inside an
     /// archive / 16colo.rs — i.e. its display path differs from disk) reads the
     /// sidecar; a plain on-disk file reads its `user.baloo.rating` xattr (so external
@@ -2517,6 +2562,8 @@ impl PixelView {
         if already {
             return;
         }
+        // Opening an image in the viewer counts as a view (bumps its count + last-viewed).
+        self.mark_viewed(&path);
         // `path` is the display identity (kept for stepping/ratings/full_tex keys); a
         // downloaded 16colo piece reads its bytes from the local cache file instead.
         let src = self.resolve_local(&path);
@@ -3452,6 +3499,8 @@ impl PixelView {
                     }
                 } else {
                     let meta = self.img_meta.get(&entry.path).copied();
+                    // View history (count + last-viewed) for the stats rows below.
+                    let views = self.view_record(&entry.path);
                     // Plain thumbnail (the recolored preview lives in the Recolor pane).
                     if let Some(tex) = self.thumb_tex.get(&entry.path) {
                         let tsz = tex.size_vec2();
@@ -3512,6 +3561,19 @@ impl PixelView {
                             ui.end_row();
                             ui.weak("Rating");
                             ui.label(stars_label(entry.rating));
+                            ui.end_row();
+                            // View history: count + last-viewed date (— when never viewed).
+                            ui.weak("Views");
+                            ui.label(match views {
+                                Some(v) if v.count > 0 => v.count.to_string(),
+                                _ => "—".to_string(),
+                            });
+                            ui.end_row();
+                            ui.weak("Last viewed");
+                            ui.label(match views {
+                                Some(v) if v.last > 0 => date_ymd_unix(v.last),
+                                _ => "—".to_string(),
+                            });
                             ui.end_row();
                             if let Some(t) = entry.mtime {
                                 ui.weak("Modified");
@@ -4667,6 +4729,7 @@ impl PixelView {
         let mut ctx_action: Option<(usize, FileAction)> = None;
         let mut pin_dir: Option<usize> = None; // "Pin to Places" on a folder tile
         let mut smart_on: Option<(usize, SmartCriterion)> = None; // "Smart filter on…"
+        let mut toggle_viewed: Option<(usize, bool)> = None; // "Mark as (not) viewed"
         let can_paste = self.clipboard.is_some();
         // When "Apply to grid" is on, tiles render with the active recolor.
         let grid_key = self.grid_recolor_key();
@@ -4703,6 +4766,7 @@ impl PixelView {
                         let path = &entry.path;
                         let is_selected = self.selection.contains(path);
                         let meta = self.img_meta.get(path).copied();
+                        let viewed = self.is_viewed(path); // visited check badge
                         let (cell_rect, resp) =
                             ui.allocate_exact_size(egui::vec2(tile, cell_h), egui::Sense::click());
                         // The thumbnail occupies the top square; any caption sits
@@ -4877,6 +4941,13 @@ impl PixelView {
                             );
                         }
 
+                        // Visited check badge (top-right) for files + folders/packs.
+                        if viewed {
+                            let r = (tile * 0.085).clamp(7.0, 12.0);
+                            let c = rect.right_top() + egui::vec2(-(r + 4.0), r + 4.0);
+                            paint_check_badge(&ui.painter_at(rect), c, r);
+                        }
+
                         // Configurable caption strip below the thumbnail.
                         if caption_h > 0.0 {
                             let folder = (in_search && !entry.is_dir)
@@ -4917,11 +4988,14 @@ impl PixelView {
                         }
                         resp.context_menu(|ui| {
                             let pinned = self.favorites.iter().any(|f| f == &entry.path);
-                            if let Some(pick) = entry_context_menu(ui, &entry, can_paste, pinned) {
+                            if let Some(pick) =
+                                entry_context_menu(ui, &entry, can_paste, pinned, viewed)
+                            {
                                 match pick {
                                     TilePick::Pin => pin_dir = Some(idx),
                                     TilePick::Smart(c) => smart_on = Some((idx, c)),
                                     TilePick::File(a) => ctx_action = Some((idx, a)),
+                                    TilePick::ToggleViewed(b) => toggle_viewed = Some((idx, b)),
                                 }
                             }
                         });
@@ -4973,6 +5047,11 @@ impl PixelView {
         if let Some((idx, crit)) = smart_on {
             if let Some(e) = self.entries.get(idx).cloned() {
                 self.smart_filter_from(&e, crit);
+            }
+        }
+        if let Some((idx, b)) = toggle_viewed {
+            if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
+                self.set_viewed(&p, b);
             }
         }
     }
@@ -5164,6 +5243,7 @@ impl PixelView {
         let mut ctx_action: Option<(usize, FileAction)> = None;
         let mut pin_dir: Option<usize> = None;
         let mut smart_on: Option<(usize, SmartCriterion)> = None;
+        let mut toggle_viewed: Option<(usize, bool)> = None; // "Mark as (not) viewed"
         let mut dl: Option<(usize, bool)> = None; // (idx, want_pack)
         let mut colo_link: Option<(usize, ColKind)> = None; // pack/year/group link click
         let can_paste = self.clipboard.is_some();
@@ -5244,6 +5324,7 @@ impl PixelView {
                 let is_selected = self.selection.contains(&path);
                 let meta = self.img_meta.get(&path).copied();
                 let piece = self.colo_pieces.get(&path).cloned();
+                let viewed = self.is_viewed(&path); // browser-style visited filename link
 
                 // Request the thumbnail once: a remote piece via the HTTP pool (its `tn`
                 // PNG), any other file via the local decoder; both land in `thumb_tex`.
@@ -5378,10 +5459,18 @@ impl PixelView {
                                     ColKind::Pack | ColKind::Year | ColKind::Group
                                 ) && piece.is_some();
                                 let hot = linkable && resp.hovered();
+                                // The filename is a browser-style visited link: unvisited
+                                // = accent colour + underline, visited = muted, no line.
+                                let name_link = c.kind == ColKind::Name;
+                                let name_unvisited = name_link && !viewed;
                                 let col = if hot {
                                     egui::Color32::from_rgb(120, 180, 255)
                                 } else if linkable {
                                     egui::Color32::from_rgb(95, 155, 235)
+                                } else if name_unvisited {
+                                    ui.visuals().hyperlink_color
+                                } else if name_link {
+                                    ui.visuals().weak_text_color()
                                 } else {
                                     fg
                                 };
@@ -5406,7 +5495,7 @@ impl PixelView {
                                 let p = ui
                                     .painter()
                                     .with_clip_rect(rect.shrink2(egui::vec2(cell_pad * 0.5, 0.0)));
-                                if hot {
+                                if hot || name_unvisited {
                                     let uy = tp.y + galley.size().y - 1.0;
                                     p.line_segment(
                                         [
@@ -5415,6 +5504,8 @@ impl PixelView {
                                         ],
                                         egui::Stroke::new(1.0, col),
                                     );
+                                }
+                                if resp.hovered() && (linkable || name_link) {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                 }
                                 p.galley(tp, galley, col);
@@ -5441,11 +5532,14 @@ impl PixelView {
                     }
                     let pinned = self.favorites.iter().any(|f| f == &entry.path);
                     resp.context_menu(|ui| {
-                        if let Some(pick) = entry_context_menu(ui, &entry, can_paste, pinned) {
+                        if let Some(pick) =
+                            entry_context_menu(ui, &entry, can_paste, pinned, viewed)
+                        {
                             match pick {
                                 TilePick::Pin => pin_dir = Some(idx),
                                 TilePick::Smart(c) => smart_on = Some((idx, c)),
                                 TilePick::File(a) => ctx_action = Some((idx, a)),
+                                TilePick::ToggleViewed(b) => toggle_viewed = Some((idx, b)),
                             }
                         }
                     });
@@ -5511,6 +5605,11 @@ impl PixelView {
         if let Some((idx, crit)) = smart_on {
             if let Some(e) = self.entries.get(idx).cloned() {
                 self.smart_filter_from(&e, crit);
+            }
+        }
+        if let Some((idx, b)) = toggle_viewed {
+            if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
+                self.set_viewed(&p, b);
             }
         }
         if let Some((idx, want_pack)) = dl {
@@ -9173,6 +9272,7 @@ enum TilePick {
     Pin,
     Smart(SmartCriterion),
     File(FileAction),
+    ToggleViewed(bool), // mark this entry viewed (true) / not viewed (false)
 }
 
 /// The shared right-click context menu for a browse entry (used by both the grid tile
@@ -9184,6 +9284,7 @@ fn entry_context_menu(
     entry: &Entry,
     can_paste: bool,
     pinned: bool,
+    viewed: bool,
 ) -> Option<TilePick> {
     let mut pick = None;
     if entry.is_dir {
@@ -9218,6 +9319,19 @@ fn entry_context_menu(
         });
         ui.separator();
     }
+    // Toggle visited state (drives the table link colour + grid/pack check badge).
+    if ui
+        .button(if viewed {
+            "Mark as not viewed"
+        } else {
+            "Mark as viewed"
+        })
+        .clicked()
+    {
+        pick = Some(TilePick::ToggleViewed(!viewed));
+        ui.close();
+    }
+    ui.separator();
     let mut file = |ui: &mut egui::Ui, label: &str, enabled: bool, a: FileAction| {
         if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
             pick = Some(TilePick::File(a));
@@ -9651,6 +9765,35 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 /// A `SystemTime` as `YYYY-MM-DD` (UTC). YYYY-MM-DD sorts chronologically as text, so
 /// search date-range checks are plain string comparisons.
+/// Current wall-clock time as unix seconds (0 before the epoch). Used to stamp view
+/// history; the app already uses `SystemTime::now()` for the random-pack seed.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Format unix seconds as `YYYY-MM-DD` (view-history "last viewed", etc.).
+fn date_ymd_unix(secs: i64) -> String {
+    let (y, m, d) = civil_from_days(secs.div_euclid(86400));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Paint a small "viewed" check badge: a filled green disc with a white check stroke,
+/// centred at `c` with radius `r`. Painted rather than drawn as a glyph because egui's
+/// bundled font lacks a reliable check mark (see the font gotcha in CLAUDE.md).
+fn paint_check_badge(p: &egui::Painter, c: egui::Pos2, r: f32) {
+    p.circle_filled(c, r, egui::Color32::from_rgb(70, 175, 90));
+    p.circle_stroke(c, r, egui::Stroke::new(1.0, egui::Color32::from_black_alpha(130)));
+    let s = egui::Stroke::new((r * 0.30).max(1.5), egui::Color32::WHITE);
+    let a = c + egui::vec2(-r * 0.42, r * 0.02);
+    let b = c + egui::vec2(-r * 0.08, r * 0.38);
+    let d = c + egui::vec2(r * 0.46, -r * 0.40);
+    p.line_segment([a, b], s);
+    p.line_segment([b, d], s);
+}
+
 fn date_ymd(t: std::time::SystemTime) -> String {
     let secs = t
         .duration_since(std::time::UNIX_EPOCH)
