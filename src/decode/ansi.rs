@@ -14,7 +14,8 @@ const FONT_W: usize = 8;
 const FONT_H: usize = 16;
 const WRAP: usize = 80; // classic ANSI terminal width
 const MAX_COLS: usize = 300; // hard cap for cursor-addressed columns
-const MAX_ROWS: usize = 600; // cap very long files
+const MAX_ROWS: usize = 10000; // safety cap for very long files (canvas sizes to the
+                               // *actual* content rows; this is only the upper bound)
 
 /// Render the 8×16 VGA font in a 9-dot-wide cell, the way real VGA text mode did.
 /// The 9th column is background for every glyph except the line-draw range
