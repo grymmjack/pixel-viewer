@@ -898,6 +898,7 @@ pub struct PixelView {
     #[allow(clippy::type_complexity)]
     colo_sauce_rx: std::sync::mpsc::Receiver<Vec<(PathBuf, Option<crate::sauce::Sauce>, u64)>>,
     colo_sauce_done: HashSet<String>,
+    colo_sauce_pending: usize, // in-flight pack-SAUCE fetches (for the busy spinner)
 }
 
 impl PixelView {
@@ -1365,6 +1366,7 @@ impl PixelView {
             colo_sauce_tx,
             colo_sauce_rx,
             colo_sauce_done: HashSet::new(),
+            colo_sauce_pending: 0,
         };
 
         // Reopen wherever we left off so the grid, breadcrumb, and favorites are all
@@ -1789,6 +1791,7 @@ impl PixelView {
         if !self.colo_sauce_done.insert(format!("{year}/{pack}")) {
             return; // this pack is already fetched or in flight
         }
+        self.colo_sauce_pending += 1; // drives the SAUCE-panel + status spinner
         let tx = self.colo_sauce_tx.clone();
         std::thread::spawn(move || {
             let seeds: Vec<(PathBuf, Option<crate::sauce::Sauce>, u64)> =
@@ -1818,6 +1821,7 @@ impl PixelView {
     /// `ensure_colo_sauce`.
     fn poll_colo_sauce(&mut self) {
         while let Ok(seeds) = self.colo_sauce_rx.try_recv() {
+            self.colo_sauce_pending = self.colo_sauce_pending.saturating_sub(1);
             let mut sizes: HashMap<PathBuf, u64> = HashMap::new();
             for (vpath, sauce, filesize) in seeds {
                 if sauce.is_some() {
@@ -2027,6 +2031,17 @@ impl PixelView {
         self.viewdb
             .as_ref()
             .is_some_and(|db| db.is_viewed(&self.view_key(path)))
+    }
+
+    /// Any network request in flight (16colo listing / pack download / piece open /
+    /// file save / SAUCE fetch / random pack). Drives the status-bar busy spinner.
+    fn net_busy(&self) -> bool {
+        self.remote_rx.is_some()
+            || self.colo_rx.is_some()
+            || self.colo_open_rx.is_some()
+            || self.colo_save_rx.is_some()
+            || self.random_rx.is_some()
+            || self.colo_sauce_pending > 0
     }
 
     /// Full view record (count + first/last) for `path`, if tracked.
@@ -3757,12 +3772,20 @@ impl PixelView {
                         self.ensure_colo_sauce(&entry.path);
                         let sauce = self.cached_sauce(&entry.path);
                         let none = sauce.is_none();
+                        // A 16colo piece with no SAUCE yet + a fetch in flight → show a
+                        // spinner ("fetching…") rather than the misleading "no record".
+                        let fetching = none
+                            && self.colo_sauce_pending > 0
+                            && self.colo_pieces.contains_key(&entry.path);
                         let sc = sauce.unwrap_or_default();
                         ui.add_space(8.0);
                         ui.separator();
                         ui.horizontal(|ui| {
                             ui.strong("SAUCE");
-                            if none {
+                            if fetching {
+                                ui.add(egui::Spinner::new().size(13.0));
+                                ui.weak("fetching…");
+                            } else if none {
                                 ui.weak("· no record");
                             }
                         });
@@ -4790,8 +4813,14 @@ impl PixelView {
 
     fn ui_grid(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         if self.entries.is_empty() {
+            // A 16colo listing / pack download in flight → spinner, else the empty hint.
+            let loading = self.remote_rx.is_some() || self.colo_rx.is_some();
             ui.centered_and_justified(|ui| {
-                ui.label("Nothing here. Open a folder.");
+                if loading {
+                    ui.add(egui::Spinner::new().size(40.0));
+                } else {
+                    ui.label("Nothing here. Open a folder.");
+                }
             });
             return;
         }
@@ -5083,6 +5112,15 @@ impl PixelView {
                                 } else {
                                     self.thumbs.request(path, THUMB_PX);
                                 }
+                                // Spinner while the thumbnail decodes / downloads.
+                                let t = ui.input(|i| i.time);
+                                paint_spinner(
+                                    &ui.painter_at(rect),
+                                    rect.center(),
+                                    (tile * 0.11).clamp(8.0, 18.0),
+                                    t,
+                                    egui::Color32::from_gray(130),
+                                );
                                 self.want_repaint = true;
                             }
                         }
@@ -5227,8 +5265,14 @@ impl PixelView {
     /// year / group / pack + a per-row download menu); elsewhere, file columns.
     fn ui_table(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         if self.entries.is_empty() {
+            // A 16colo listing in flight (artist/group/search streams in) → spinner.
+            let loading = self.remote_rx.is_some() || self.colo_rx.is_some();
             ui.centered_and_justified(|ui| {
-                ui.label("Nothing here. Open a folder.");
+                if loading {
+                    ui.add(egui::Spinner::new().size(40.0));
+                } else {
+                    ui.label("Nothing here. Open a folder.");
+                }
             });
             return;
         }
@@ -5610,6 +5654,17 @@ impl PixelView {
                                         egui::pos2(1.0, 1.0),
                                     ),
                                     egui::Color32::WHITE,
+                                );
+                            } else if !entry.is_dir {
+                                // Spinner while the row's thumbnail loads (the request was
+                                // already issued above when tex was None).
+                                let t = ui.input(|i| i.time);
+                                paint_spinner(
+                                    &ui.painter_at(rect),
+                                    rect.center(),
+                                    (row_h * 0.26).clamp(6.0, 11.0),
+                                    t,
+                                    egui::Color32::from_gray(120),
                                 );
                             }
                         } else if c.kind == ColKind::Rating {
@@ -6830,6 +6885,14 @@ impl PixelView {
                     }
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    // Global "working" spinner: any network request (16colo listing /
+                    // download / piece open / SAUCE fetch / random pack) or a running
+                    // recursive search. The status text alongside says what it's doing.
+                    if self.net_busy() || self.search_running {
+                        ui.add(egui::Spinner::new().size(15.0))
+                            .on_hover_text("Working… (network / search in progress)");
+                        self.want_repaint = true;
+                    }
                     match self.mode {
                         Mode::Single => {
                             if ui.button("⬅ Grid").clicked() {
@@ -10015,6 +10078,26 @@ fn unix_now() -> i64 {
 fn date_ymd_unix(secs: i64) -> String {
     let (y, m, d) = civil_from_days(secs.div_euclid(86400));
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Paint a rotating "loading" spinner arc centred at `c`. `t` is `ctx.input().time`
+/// (drives the rotation; the caller must keep requesting repaints — `want_repaint` is
+/// set while thumbs are pending). Used on grid/table tiles whose thumbnail hasn't
+/// arrived yet (those are hand-painted, so egui's `Spinner` widget doesn't fit).
+fn paint_spinner(p: &egui::Painter, c: egui::Pos2, r: f32, t: f64, color: egui::Color32) {
+    const SEG: usize = 20;
+    let start = (t * 4.0) as f32; // radians/sec rotation
+    let sweep = std::f32::consts::PI * 1.5; // ~270° arc
+    let pts: Vec<egui::Pos2> = (0..=SEG)
+        .map(|i| {
+            let a = start + sweep * (i as f32 / SEG as f32);
+            c + r * egui::vec2(a.cos(), a.sin())
+        })
+        .collect();
+    p.add(egui::Shape::line(
+        pts,
+        egui::Stroke::new((r * 0.18).max(1.5), color),
+    ));
 }
 
 /// Paint a small "viewed" check badge: a filled green disc with a white check stroke,

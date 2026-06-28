@@ -51,6 +51,10 @@ src/
   thumb.rs           worker pool: thumbnails + image metadata (dims, color count)
   colo_thumb.rs      RemoteThumbs: HTTP worker pool fetching 16colo.rs `tn` PNGs
                      (mirrors ThumbBuilder; results uploaded to thumb_tex by path)
+                     Busy feedback: `net_busy()` (any *_rx in flight + colo_sauce_pending)
+                     drives a status-bar `egui::Spinner`; grid/table tiles paint a
+                     `paint_spinner` arc while a thumbnail loads; the empty grid/table
+                     and the SAUCE panel ("fetching…") show one too.
   rating.rs          read/write star ratings via the user.baloo.rating xattr
   ratings.rs         cross-platform ratings sidecar (ratings.json) for virtual art
   anim.rs            decode animated GIF frames + per-frame delays
