@@ -60,6 +60,24 @@ const TABLE_COLUMNS: &[(u16, &str)] = &[
 const TABLE_COLUMNS_DEFAULT: u16 =
     TC_TYPE | TC_SIZE | TC_DIMENSIONS | TC_COLORS | TC_RATING | TC_MODIFIED;
 
+// Which optional columns show in the 16colo scene layout (Filename + Download are
+// always shown). Toggled from the header right-click menu, persisted as a bitmask.
+const CS_ARTIST: u16 = 1 << 0;
+const CS_TYPE: u16 = 1 << 1;
+const CS_YEAR: u16 = 1 << 2;
+const CS_GROUP: u16 = 1 << 3;
+const CS_PACK: u16 = 1 << 4;
+const CS_RATING: u16 = 1 << 5;
+const COLO_COLUMNS: &[(u16, &str)] = &[
+    (CS_ARTIST, "Artist"),
+    (CS_TYPE, "Type"),
+    (CS_YEAR, "Year"),
+    (CS_GROUP, "Group"),
+    (CS_PACK, "Pack"),
+    (CS_RATING, "Rating"),
+];
+const COLO_COLUMNS_DEFAULT: u16 = CS_ARTIST | CS_TYPE | CS_YEAR | CS_GROUP | CS_PACK | CS_RATING;
+
 /// A table column's identity — drives both its content and its sort key. Kept separate
 /// from the on/off bitmask so the render + sort logic key off meaning, not position.
 #[derive(Clone, Copy, PartialEq)]
@@ -940,6 +958,10 @@ pub struct PixelView {
     table_view: bool,
     // Which optional file columns show in the table (bitmask of TC_*). Persisted.
     table_columns: u16,
+    // Which optional 16colo *scene* columns show (bitmask of CS_*). Persisted.
+    colo_columns: u16,
+    // Per-column width overrides (ColKind as u8 → points), for drag-to-resize. Persisted.
+    col_widths: HashMap<u8, f32>,
     // 16colo.rs flat-piece listing state. `colo_flat` marks the current view as a
     // flattened artist/group/search listing (→ the table shows scene columns). The
     // map carries per-piece metadata keyed by virtual display path (see [`ColoPiece`]).
@@ -1034,6 +1056,8 @@ impl PixelView {
     const TABLE_VIEW_KEY: &'static str = "table_view";
     /// Bitmask of optional table columns shown (TC_*).
     const TABLE_COLUMNS_KEY: &'static str = "table_columns";
+    const COLO_COLUMNS_KEY: &'static str = "colo_columns";
+    const COL_WIDTHS_KEY: &'static str = "col_widths";
 
     pub fn new(cc: &eframe::CreationContext<'_>, cli: CliArgs) -> Self {
         let registry = Arc::new(Registry::with_builtins());
@@ -1096,6 +1120,15 @@ impl PixelView {
             .storage
             .and_then(|s| eframe::get_value::<u16>(s, Self::TABLE_COLUMNS_KEY))
             .unwrap_or(TABLE_COLUMNS_DEFAULT);
+        let colo_columns = cc
+            .storage
+            .and_then(|s| eframe::get_value::<u16>(s, Self::COLO_COLUMNS_KEY))
+            .unwrap_or(COLO_COLUMNS_DEFAULT);
+        let col_widths: HashMap<u8, f32> = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Vec<(u8, f32)>>(s, Self::COL_WIDTHS_KEY))
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default();
         let dirs_first = get_bool(Self::DIRS_FIRST).unwrap_or(true);
         let min_rating = get_u8(Self::MIN_RATING).unwrap_or(0);
         let show_explorer = get_bool(Self::EXPLORER_KEY).unwrap_or(false);
@@ -1431,6 +1464,8 @@ impl PixelView {
             thumb_size,
             table_view,
             table_columns,
+            colo_columns,
+            col_widths,
             colo_flat: false,
             colo_pieces: HashMap::new(),
             colo_rx: None,
@@ -5421,7 +5456,9 @@ impl PixelView {
         let mut cols: Vec<Col> = Vec::new();
         cols.push(col(ColKind::Thumb, "", None, thumb_w, false, false));
         if scene {
-            // 16colo flat-piece layout — a fixed set (the requested columns).
+            // 16colo flat-piece layout. Filename + Download always show; the rest are
+            // toggled from the header right-click menu (CS_* bitmask).
+            let cs = self.colo_columns;
             cols.push(col(
                 ColKind::Name,
                 "Filename",
@@ -5430,54 +5467,31 @@ impl PixelView {
                 true,
                 false,
             ));
-            cols.push(col(
-                ColKind::Artist,
-                "Artist",
-                Some(SortKey::Artist),
-                0.0,
-                true,
-                false,
-            ));
-            cols.push(col(
-                ColKind::Type,
-                "Type",
-                Some(SortKey::Type),
-                56.0,
-                false,
-                false,
-            ));
-            cols.push(col(
-                ColKind::Year,
-                "Year",
-                Some(SortKey::Year),
-                52.0,
-                false,
-                true,
-            ));
-            cols.push(col(
-                ColKind::Group,
-                "Group",
-                Some(SortKey::Group),
-                130.0,
-                false,
-                false,
-            ));
-            cols.push(col(
-                ColKind::Pack,
-                "Pack",
-                Some(SortKey::Pack),
-                130.0,
-                false,
-                false,
-            ));
-            cols.push(col(
-                ColKind::Rating,
-                "Rating",
-                Some(SortKey::Rating),
-                72.0,
-                false,
-                false,
-            ));
+            if cs & CS_ARTIST != 0 {
+                cols.push(col(
+                    ColKind::Artist,
+                    "Artist",
+                    Some(SortKey::Artist),
+                    0.0,
+                    true,
+                    false,
+                ));
+            }
+            if cs & CS_TYPE != 0 {
+                cols.push(col(ColKind::Type, "Type", Some(SortKey::Type), 56.0, false, false));
+            }
+            if cs & CS_YEAR != 0 {
+                cols.push(col(ColKind::Year, "Year", Some(SortKey::Year), 52.0, false, true));
+            }
+            if cs & CS_GROUP != 0 {
+                cols.push(col(ColKind::Group, "Group", Some(SortKey::Group), 130.0, false, false));
+            }
+            if cs & CS_PACK != 0 {
+                cols.push(col(ColKind::Pack, "Pack", Some(SortKey::Pack), 130.0, false, false));
+            }
+            if cs & CS_RATING != 0 {
+                cols.push(col(ColKind::Rating, "Rating", Some(SortKey::Rating), 72.0, false, false));
+            }
             cols.push(col(ColKind::Download, "", None, 96.0, false, false));
         } else {
             // File layout — Name is always shown; the rest are user-toggled (TC_* mask).
@@ -5561,6 +5575,16 @@ impl PixelView {
                 ));
             }
         }
+        // Apply persisted drag-to-resize width overrides to the fixed-width columns
+        // (the flex columns — Filename/Artist — absorb whatever's left).
+        for c in cols
+            .iter_mut()
+            .filter(|c| !c.flex && !matches!(c.kind, ColKind::Thumb | ColKind::Download))
+        {
+            if let Some(&w) = self.col_widths.get(&(c.kind as u8)) {
+                c.w = w.clamp(40.0, 600.0);
+            }
+        }
         let bar = ui.spacing().scroll.bar_width + 2.0;
         let avail = (ui.available_width() - bar).max(200.0);
         let fixed: f32 = cols.iter().filter(|c| !c.flex).map(|c| c.w).sum();
@@ -5574,6 +5598,10 @@ impl PixelView {
         let mut clicked: Option<(usize, egui::Modifiers)> = None;
         let mut hovered: Option<usize> = None;
         let mut header_sort: Option<SortKey> = None;
+        let mut menu_sort: Option<(SortKey, bool)> = None; // right-click: (key, descending)
+        let mut toggle_col: Option<u16> = None; // right-click: show/hide a column bit
+        let mut resize: Option<(u8, f32)> = None; // drag a column border: (ColKind, width)
+        let (tc_cur, cs_cur) = (self.table_columns, self.colo_columns);
         let mut ctx_action: Option<(usize, FileAction)> = None;
         let mut pin_dir: Option<usize> = None;
         let mut smart_on: Option<(usize, SmartCriterion)> = None;
@@ -5594,17 +5622,17 @@ impl PixelView {
         let (sort_key, sort_desc) = (self.sort_key, self.sort_desc);
 
         // Header row (above the scroll area so it stays put), sharing the body widths.
+        // Left-click a header sorts (re-click reverses); right-click → sort asc/desc +
+        // show/hide columns; drag a column's right border to resize it.
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             for c in &cols {
-                let (rect, resp) = ui.allocate_exact_size(
-                    egui::vec2(c.w, 22.0),
-                    if c.sort.is_some() {
-                        egui::Sense::click()
-                    } else {
-                        egui::Sense::hover()
-                    },
-                );
+                // A fixed (non-flex) data column ends in a thin drag-to-resize border.
+                let resizable = !c.flex && !matches!(c.kind, ColKind::Thumb | ColKind::Download);
+                let handle_w = if resizable { 5.0 } else { 0.0 };
+                let cell_w = (c.w - handle_w).max(1.0);
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(cell_w, 22.0), egui::Sense::click());
                 ui.painter()
                     .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
                 if !c.label.is_empty() {
@@ -5647,6 +5675,56 @@ impl PixelView {
                 }
                 if resp.clicked() {
                     header_sort = c.sort;
+                }
+                resp.context_menu(|ui| {
+                    if let Some(sk) = c.sort {
+                        if ui.button("Sort ascending").clicked() {
+                            menu_sort = Some((sk, false));
+                            ui.close();
+                        }
+                        if ui.button("Sort descending").clicked() {
+                            menu_sort = Some((sk, true));
+                            ui.close();
+                        }
+                        ui.separator();
+                    }
+                    ui.weak("Show columns");
+                    let (list, mask) = if scene {
+                        (COLO_COLUMNS, cs_cur)
+                    } else {
+                        (TABLE_COLUMNS, tc_cur)
+                    };
+                    for &(bit, label) in list {
+                        let mut on = mask & bit != 0;
+                        if ui.checkbox(&mut on, label).changed() {
+                            toggle_col = Some(bit);
+                        }
+                    }
+                });
+                // Resize border: drag to set this column's width.
+                if resizable {
+                    let (hrect, hresp) =
+                        ui.allocate_exact_size(egui::vec2(handle_w, 22.0), egui::Sense::drag());
+                    let hot = hresp.hovered() || hresp.dragged();
+                    ui.painter().vline(
+                        hrect.center().x,
+                        hrect.y_range(),
+                        egui::Stroke::new(
+                            1.0,
+                            if hot {
+                                ui.visuals().strong_text_color()
+                            } else {
+                                ui.visuals().weak_text_color().gamma_multiply(0.4)
+                            },
+                        ),
+                    );
+                    if hot {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
+                    if hresp.dragged() {
+                        let w = (c.w + hresp.drag_delta().x).clamp(40.0, 600.0);
+                        resize = Some((c.kind as u8, w));
+                    }
                 }
             }
         });
@@ -5920,6 +5998,24 @@ impl PixelView {
                 self.sort_desc = false;
             }
             self.rebuild_view();
+        }
+        // Right-click menu: explicit ascending / descending sort.
+        if let Some((k, desc)) = menu_sort {
+            self.sort_key = k;
+            self.sort_desc = desc;
+            self.rebuild_view();
+        }
+        // Right-click menu: show/hide a column (toggle the layout's bitmask).
+        if let Some(bit) = toggle_col {
+            if self.colo_flat {
+                self.colo_columns ^= bit;
+            } else {
+                self.table_columns ^= bit;
+            }
+        }
+        // Drag-to-resize: remember this column's new width (used next frame).
+        if let Some((kind, w)) = resize {
+            self.col_widths.insert(kind, w);
         }
         // A pack/year/group link click navigates the 16colo browser; it takes priority
         // over the row's open-the-art click (the link cell is part of the row response).
@@ -8159,6 +8255,9 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::SORT_DESC, &self.sort_desc);
         eframe::set_value(storage, Self::TABLE_VIEW_KEY, &self.table_view);
         eframe::set_value(storage, Self::TABLE_COLUMNS_KEY, &self.table_columns);
+        eframe::set_value(storage, Self::COLO_COLUMNS_KEY, &self.colo_columns);
+        let widths: Vec<(u8, f32)> = self.col_widths.iter().map(|(&k, &w)| (k, w)).collect();
+        eframe::set_value(storage, Self::COL_WIDTHS_KEY, &widths);
         eframe::set_value(storage, Self::DIRS_FIRST, &self.dirs_first);
         eframe::set_value(storage, Self::MIN_RATING, &self.min_rating);
         eframe::set_value(storage, Self::EXPLORER_KEY, &self.show_explorer);

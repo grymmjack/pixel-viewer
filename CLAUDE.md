@@ -245,7 +245,12 @@ tile in the single view), shown in Preferences → Hotkeys + the Help window. Ea
 has `cell_pad` breathing room and clips its text to the cell, so columns never touch.
 Columns key off a `ColKind` (not a position), so the **file** layout's optional columns
 are user-toggled via a `TC_*` bitmask (`table_columns`, persisted; Preferences → "Table
-columns") while Name + thumbnail are always shown; archive rows (.zip/…) render the
+columns" *and* the header right-click menu) and the **scene** layout's via a parallel
+`CS_*` bitmask (`colo_columns`); Name + thumbnail are always shown. **Header UX:**
+left-click a header sorts (re-click reverses); **right-click** → Sort ascending/descending
++ a "Show columns" checklist (toggles the layout's bitmask, no Preferences trip); and a
+thin border at each fixed column's right edge **drag-resizes** it (`col_widths`: ColKind
+→ points, persisted; flex columns absorb the slack). Archive rows (.zip/…) render the
 folder glyph + a format badge like the grid. In the scene layout the **Pack / Year /
 Group** cells are clickable links into the 16colo browser (`colo_link` deferred →
 `open_folder` of the pack / year / `groups/<group>` path; the link click takes priority
