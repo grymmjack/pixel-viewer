@@ -5470,6 +5470,14 @@ impl PixelView {
                 false,
                 false,
             ));
+            cols.push(col(
+                ColKind::Rating,
+                "Rating",
+                Some(SortKey::Rating),
+                72.0,
+                false,
+                false,
+            ));
             cols.push(col(ColKind::Download, "", None, 96.0, false, false));
         } else {
             // File layout — Name is always shown; the rest are user-toggled (TC_* mask).
