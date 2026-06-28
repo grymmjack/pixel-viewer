@@ -9700,6 +9700,62 @@ fn emit_piece(
     tx.send(ColoMsg::Hit(entry, Box::new(piece))).is_ok()
 }
 
+/// Stream one 16colo artist's pieces into `tx`. Tries the direct `/artist/{name}`
+/// endpoint first (one call, works for single-word handles); when that comes back empty
+/// — which it does for names with a *space* (`fetch_artist_pieces` quirk) — falls back to
+/// the artist's pack list (search `details`) and fetches each pack, streaming the pieces
+/// credited to this artist. Returns false to stop (cancelled / channel closed / hit the
+/// piece cap, in which case a `Done` was already sent).
+fn emit_artist(
+    name: &str,
+    tx: &std::sync::mpsc::Sender<ColoMsg>,
+    cancel: &std::sync::atomic::AtomicBool,
+    count: &mut usize,
+    max_pieces: usize,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let emit = |p: crate::sixteen::Piece, count: &mut usize| -> Option<bool> {
+        if cancel.load(Relaxed) || !emit_piece(tx, p, count) {
+            return Some(false); // stop
+        }
+        if *count >= max_pieces {
+            let _ = tx.send(ColoMsg::Done(*count));
+            return Some(false);
+        }
+        None // keep going
+    };
+    // Direct endpoint — fast path for single-word handles.
+    if let Ok(pieces) = crate::sixteen::fetch_artist_pieces(name) {
+        if !pieces.is_empty() {
+            for p in pieces {
+                if let Some(stop) = emit(p, count) {
+                    return stop;
+                }
+            }
+            return true;
+        }
+    }
+    // Fallback: the multi-word artist's packs, each fetched + filtered to this artist.
+    let want = name.to_lowercase();
+    for pack in crate::sixteen::fetch_artist_packs(name).unwrap_or_default() {
+        if cancel.load(Relaxed) {
+            return false;
+        }
+        let Ok(pieces) = crate::sixteen::fetch_pack_pieces("", 0, &pack) else {
+            continue; // a single pack failing shouldn't abort the whole artist
+        };
+        for p in pieces
+            .into_iter()
+            .filter(|p| p.artist.to_lowercase().split(", ").any(|a| a == want))
+        {
+            if let Some(stop) = emit(p, count) {
+                return stop;
+            }
+        }
+    }
+    true
+}
+
 /// Background worker for a flat 16colo.rs piece listing (see
 /// [`PixelView::start_colo_pieces`]). Streams a `ColoMsg::Hit` per piece, then
 /// `Done(total)`. An artist is one API call; a group fetches each of its packs; a
@@ -9731,16 +9787,9 @@ fn colo_walk(
             if cancel.load(Relaxed) {
                 return false;
             }
-            if let Ok(pieces) = sixteen::fetch_artist_pieces(&a) {
-                for p in pieces {
-                    if cancel.load(Relaxed) || !emit_piece(&tx, p, count) {
-                        return false;
-                    }
-                    if *count >= MAX_PIECES {
-                        let _ = tx.send(ColoMsg::Done(*count));
-                        return false;
-                    }
-                }
+            // Streams the matched artist (direct endpoint, or pack-fallback for spaces).
+            if !emit_artist(&a, &tx, &cancel, count, MAX_PIECES) {
+                return false;
             }
         }
         true
@@ -9775,19 +9824,10 @@ fn colo_walk(
     };
 
     match source {
-        ColoSource::Artist(name) => match sixteen::fetch_artist_pieces(&name) {
-            Ok(pieces) => {
-                for p in pieces {
-                    if cancel.load(Relaxed) || !emit_piece(&tx, p, &mut count) {
-                        return;
-                    }
-                }
-            }
-            Err(e) => {
-                let _ = tx.send(ColoMsg::Err(e));
-                return;
-            }
-        },
+        ColoSource::Artist(name) => {
+            // Direct endpoint, or pack-fallback for multi-word names (see emit_artist).
+            emit_artist(&name, &tx, &cancel, &mut count, MAX_PIECES);
+        }
         ColoSource::Group(name) => match sixteen::fetch_group_pack_refs(&name) {
             Ok(refs) => {
                 for (year, pack) in refs {

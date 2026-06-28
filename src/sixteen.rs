@@ -496,9 +496,39 @@ fn pieces_from_pack_json(
 }
 
 /// Every piece by `artist` (one API call — the artist endpoint carries files inline).
+/// NB: `/v1/artist/{name}` returns an empty body for names containing a space (a server
+/// quirk), so a *multi-word* artist yields nothing here — the caller falls back to
+/// [`fetch_artist_packs`] + per-pack fetch (see `emit_artist` in app.rs).
 pub fn fetch_artist_pieces(artist: &str) -> Result<Vec<Piece>, String> {
     let v = get_json(&format!("{API}/artist/{}?pagesize=100", enc(artist)))?;
     Ok(pieces_from_artist_json(artist, &v))
+}
+
+/// The pack names an artist appears in, from the search endpoint's `details=true` view
+/// (`results[].artist.packs`). The artist *detail* endpoint 404s/empties on a space in
+/// the path, but search matches the display name fine — so this is how we reach a
+/// multi-word artist's work (fetch each pack, then filter to this artist).
+pub fn fetch_artist_packs(artist: &str) -> Result<Vec<String>, String> {
+    let v = get_json(&format!(
+        "{API}/artist?pagesize=1&details=true&filter={}",
+        enc(artist)
+    ))?;
+    let want = artist.to_lowercase();
+    let packs = v["results"]
+        .as_array()
+        .and_then(|rs| {
+            rs.iter()
+                .map(|r| &r["artist"])
+                .find(|a| a["name"].as_str().map(str::to_lowercase) == Some(want.clone()))
+        })
+        .and_then(|a| a["packs"].as_array())
+        .map(|ps| {
+            ps.iter()
+                .filter_map(|p| p.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(packs)
 }
 
 /// A group's packs as `(year, pack)` refs (newest year first), so the caller can fetch
