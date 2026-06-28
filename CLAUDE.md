@@ -169,7 +169,11 @@ system trash (`trash` crate) and push reversible `UndoOp`s for Ctrl+Z; they set
 `self.status` **after** `refresh()` (which re-scans via `open_folder`, clearing
 stale status). Favorites are drag-reorderable (`favorites_buttons` + a unioned
 drag sensor, *not* `dnd_drag_source` — its scope breaks `horizontal_wrapped`) and
-right-click-removable in both the toolbar and the Places dock. The explorer's
+right-click-removable in both the toolbar and the Places dock. Each favorite/pin can
+be **color-tagged** from its right-click menu (a popup grid of the bundled **ANSI32**
+swatches via `ansi32_palette`, + ✕ to clear); the chosen color fills the button (text
+flipped to black/white by `contrast_text`). Stored in `fav_colors` (path → RGB,
+persisted as `FAV_COLORS_KEY`); cleared when the favorite is removed. The explorer's
 folder tree uses `CollapsingState` (lazy: collapsed nodes do no I/O). The details
 dock shows a fit thumbnail + palette swatches + `.GPL` export (`to_gpl`), fed by
 the thumbnailer's `extract_palette` (authoritative palette for indexed art).

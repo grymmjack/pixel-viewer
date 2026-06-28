@@ -909,6 +909,9 @@ pub struct PixelView {
 
     // navigation (Phase 2 + round 4)
     favorites: Vec<PathBuf>,
+    // Optional color tag per favorite/pin (the favorite path → RGB), for organizing
+    // Places. Assigned from the favorite's right-click ANSI32 palette. Persisted.
+    fav_colors: HashMap<PathBuf, [u8; 3]>,
     path_edit: Option<String>, // Some(..) while the breadcrumb is in type-a-path mode
     focus_path: bool,          // request focus on the path field next frame
     dir_history: Vec<PathBuf>, // visited folders, for mouse back/forward
@@ -1008,6 +1011,7 @@ impl PixelView {
     const THUMB_KEY: &'static str = "thumb_size";
     /// Storage key for the persisted favorite folders.
     const FAV_KEY: &'static str = "favorites";
+    const FAV_COLORS_KEY: &'static str = "fav_colors";
     /// Storage key for saved searches ("smart filters"): `Vec<Vec<String>>`, each
     /// row = `[display_name, name, ext, wmin, wmax, hmin, hmax, sauce]`.
     const SAVED_FILTERS_KEY: &'static str = "saved_filters";
@@ -1094,6 +1098,11 @@ impl PixelView {
         let favorites = cc
             .storage
             .and_then(|s| eframe::get_value::<Vec<PathBuf>>(s, Self::FAV_KEY))
+            .unwrap_or_default();
+        let fav_colors: HashMap<PathBuf, [u8; 3]> = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Vec<(PathBuf, [u8; 3])>>(s, Self::FAV_COLORS_KEY))
+            .map(|v| v.into_iter().collect())
             .unwrap_or_default();
 
         // Saved searches: each persisted row is [display_name, ...7 spec fields].
@@ -1445,6 +1454,7 @@ impl PixelView {
             raster_zoom: img_zoom,
             adjust_drag: None,
             favorites,
+            fav_colors,
             path_edit: None,
             focus_path: false,
             dir_history: Vec::new(),
@@ -3203,15 +3213,23 @@ impl PixelView {
         let mut nav: Option<PathBuf> = None;
         let mut remove: Option<usize> = None;
         let mut reorder: Option<(usize, usize)> = None;
+        let mut set_color: Option<(usize, Option<[u8; 3]>)> = None;
         for (i, fav) in self.favorites.iter().enumerate() {
             let label = format!("{icon} {}", short_name(fav));
+            let color = self.fav_colors.get(fav).copied();
             // ONE widget that senses click *and* drag, so egui can tell a click
             // (jump there) from a drag (reorder). A separate drag sensor over the
             // button — the previous approach — swallowed the click. Note: NOT
             // dnd_drag_source, whose scope breaks horizontal_wrapped's wrapping.
-            let resp = ui
-                .add(egui::Button::new(label).sense(egui::Sense::click_and_drag()))
-                .on_hover_text(fav.to_string_lossy());
+            let text: egui::WidgetText = match color {
+                Some(c) => egui::RichText::new(label.as_str()).color(contrast_text(c)).into(),
+                None => label.as_str().into(),
+            };
+            let mut btn = egui::Button::new(text).sense(egui::Sense::click_and_drag());
+            if let Some(c) = color {
+                btn = btn.fill(egui::Color32::from_rgb(c[0], c[1], c[2]));
+            }
+            let resp = ui.add(btn).on_hover_text(fav.to_string_lossy());
             if resp.dragged() {
                 egui::DragAndDrop::set_payload(ui.ctx(), i);
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -3224,14 +3242,58 @@ impl PixelView {
                     remove = Some(i);
                     ui.close();
                 }
+                ui.separator();
+                ui.weak("Color");
+                egui::Grid::new(("fav_color_grid", i))
+                    .spacing([3.0, 3.0])
+                    .show(ui, |ui| {
+                        // Clear (no color), then the ANSI32 swatches, 8 per row.
+                        if ui
+                            .add(egui::Button::new("✕").min_size(egui::vec2(18.0, 18.0)))
+                            .on_hover_text("No color")
+                            .clicked()
+                        {
+                            set_color = Some((i, None));
+                            ui.close();
+                        }
+                        let mut n = 1usize;
+                        for &c in ansi32_palette() {
+                            if n % 8 == 0 {
+                                ui.end_row();
+                            }
+                            let mut sw = egui::Button::new("")
+                                .fill(egui::Color32::from_rgb(c[0], c[1], c[2]))
+                                .min_size(egui::vec2(18.0, 18.0));
+                            if color == Some(c) {
+                                sw = sw.stroke(egui::Stroke::new(2.0, egui::Color32::WHITE));
+                            }
+                            if ui.add(sw).clicked() {
+                                set_color = Some((i, Some(c)));
+                                ui.close();
+                            }
+                            n += 1;
+                        }
+                    });
             });
             if let Some(src) = resp.dnd_release_payload::<usize>() {
                 reorder = Some((*src, i));
             }
         }
-        if let Some(i) = remove {
+        if let Some((i, c)) = set_color {
+            if let Some(p) = self.favorites.get(i).cloned() {
+                match c {
+                    Some(col) => {
+                        self.fav_colors.insert(p, col);
+                    }
+                    None => {
+                        self.fav_colors.remove(&p);
+                    }
+                }
+            }
+        } else if let Some(i) = remove {
             if i < self.favorites.len() {
-                self.favorites.remove(i);
+                let p = self.favorites.remove(i);
+                self.fav_colors.remove(&p); // drop its color tag too
             }
         } else if let Some((from, to)) = reorder {
             reorder_favorites(&mut self.favorites, from, to);
@@ -8333,6 +8395,9 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::ZOOM_KEY, &self.ui_zoom);
         eframe::set_value(storage, Self::THUMB_KEY, &self.thumb_size);
         eframe::set_value(storage, Self::FAV_KEY, &self.favorites);
+        let fav_colors: Vec<(PathBuf, [u8; 3])> =
+            self.fav_colors.iter().map(|(p, &c)| (p.clone(), c)).collect();
+        eframe::set_value(storage, Self::FAV_COLORS_KEY, &fav_colors);
         let filters: Vec<Vec<String>> = self
             .saved_filters
             .iter()
@@ -8484,6 +8549,34 @@ fn builtin_palette_paths() -> Vec<PathBuf> {
         .iter()
         .map(|(name, _)| root.join(name))
         .collect()
+}
+
+/// The bundled ANSI32 palette as 32 RGB colors, parsed once — the swatch set offered
+/// when color-tagging a favorite/pin (Places).
+fn ansi32_palette() -> &'static [[u8; 3]] {
+    static PAL: std::sync::OnceLock<Vec<[u8; 3]>> = std::sync::OnceLock::new();
+    PAL.get_or_init(|| {
+        crate::palettes_builtin::BUILTIN_PALETTES
+            .iter()
+            .find(|(n, _)| n.starts_with("ANSI32"))
+            .map(|(_, c)| {
+                crate::thumb::parse_gpl(c)
+                    .iter()
+                    .map(|p| [p[0], p[1], p[2]])
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// Black or white text, whichever reads better on a favorite's color fill `c`.
+fn contrast_text(c: [u8; 3]) -> egui::Color32 {
+    let lum = 0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32;
+    if lum > 140.0 {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::WHITE
+    }
 }
 
 /// The embedded contents of a built-in palette, matched by file name. None if
@@ -10841,6 +10934,15 @@ fn parse_thumb_size(s: &str) -> Result<f32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ansi32_palette_loads_32_colors() {
+        // The favorite color picker depends on the bundled ANSI32 palette; guard against
+        // a rename/parse break (it'd silently leave the picker empty).
+        assert_eq!(ansi32_palette().len(), 32);
+        assert_eq!(contrast_text([255, 255, 255]), egui::Color32::BLACK);
+        assert_eq!(contrast_text([0, 0, 0]), egui::Color32::WHITE);
+    }
 
     #[test]
     fn cell_reveal_types_out_in_reading_order() {
