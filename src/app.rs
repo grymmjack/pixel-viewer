@@ -823,6 +823,12 @@ pub struct PixelView {
     #[allow(clippy::type_complexity)]
     remote_cache: HashMap<PathBuf, (Vec<Entry>, HashMap<PathBuf, String>)>, // year → packs (session)
     scroll_target: Option<usize>, // grid: scroll so this entry index becomes visible
+    // Per-folder grid scroll offset (y), so navigating back to a folder restores where
+    // you were. egui persists a ScrollArea by id, but the grid shares one id across all
+    // folders — so we key the offset by folder path ourselves. `grid_scroll_pending` is
+    // the offset to apply *once* on the next grid frame (set on every folder switch).
+    grid_scroll: HashMap<PathBuf, f32>,
+    grid_scroll_pending: Option<f32>,
     search: Option<String>,       // grid: live filename filter (vim-style '/')
     focus_search: bool,
     // advanced recursive search → a "Search results" grid
@@ -1318,6 +1324,8 @@ impl PixelView {
             dir_pos: 0,
             suppress_history: false,
             scroll_target: None,
+            grid_scroll: HashMap::new(),
+            grid_scroll_pending: None,
             search: None,
             focus_search: false,
             show_search: false,
@@ -1439,6 +1447,9 @@ impl PixelView {
             self.dir_pos = self.dir_history.len().saturating_sub(1);
         }
         self.suppress_history = false;
+        // Restore this folder's last grid scroll position (0 for a folder we've not seen
+        // — needed to override egui's shared "grid" offset left by the folder we left).
+        self.grid_scroll_pending = Some(self.grid_scroll.get(&dir).copied().unwrap_or(0.0));
         self.folder = Some(dir);
         // NB: keep `thumb_tex`/`img_meta` — persistent path-keyed caches (Phase 2 fix:
         // clearing them while the worker's `requested` set persists rendered black
@@ -4666,10 +4677,18 @@ impl PixelView {
         let mut scroll_area = egui::ScrollArea::vertical()
             .id_salt("grid")
             .auto_shrink([false; 2]);
+        // We force the offset this frame either to land on a target index (Home/End/
+        // select) or to restore a folder's remembered position — in both cases skip the
+        // capture below, since the returned state can lag the value we just set.
+        let mut forced_scroll = false;
         if let Some(idx) = self.scroll_target.take() {
             scroll_area = scroll_area.vertical_scroll_offset((idx / per_row) as f32 * row_h);
+            forced_scroll = true;
+        } else if let Some(off) = self.grid_scroll_pending.take() {
+            scroll_area = scroll_area.vertical_scroll_offset(off);
+            forced_scroll = true;
         }
-        scroll_area.show_rows(ui, row_h, rows, |ui, row_range| {
+        let grid_out = scroll_area.show_rows(ui, row_h, rows, |ui, row_range| {
             for row in row_range {
                 ui.horizontal(|ui| {
                     // Match the spacing the per_row math assumed (else the row's real
@@ -4911,6 +4930,13 @@ impl PixelView {
                 });
             }
         });
+        // Remember this folder's scroll position so navigating back restores it (skip the
+        // frame we forced an offset — the returned state lags the value we just applied).
+        if !forced_scroll {
+            if let Some(f) = self.folder.clone() {
+                self.grid_scroll.insert(f, grid_out.state.offset.y);
+            }
+        }
 
         self.hovered = hovered;
         if let Some(i) = hovered {
