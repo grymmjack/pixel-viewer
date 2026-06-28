@@ -83,7 +83,9 @@ fn decode_xbin(data: &[u8]) -> Result<PixImage, DecodeError> {
         pos += 48;
         p
     } else {
-        super::ansi::PALETTE
+        // No embedded palette → the default. Attribute bytes are VGA-ordered, so use the
+        // VGA palette (index 1=blue, 4=red), not the SGR-ordered ansi::PALETTE.
+        super::ansi::VGA_PALETTE
     };
 
     // Optional embedded font: fontsize bytes per glyph, 8px wide.
@@ -252,10 +254,11 @@ mod tests {
 
     #[test]
     fn decodes_uncompressed_cell() {
-        // 1×1, default font/palette, a red full-block.
+        // 1×1, default font/palette, a red full-block. Attribute bytes are VGA-ordered,
+        // so red is index 4 (not the SGR order's 1) — see ansi::VGA_PALETTE.
         let mut d = header(1, 1, 16, 0);
         d.push(0xDB); // full block
-        d.push(0x01); // attr: fg = red(1), bg = 0
+        d.push(0x04); // attr: fg = red(4), bg = 0
         let img = XBinDecoder.decode(&d).unwrap();
         assert_eq!((img.width, img.height), (8, 16));
         assert_eq!(img.pixels[0], [170, 0, 0, 255]); // red
@@ -267,7 +270,7 @@ mod tests {
         let mut d = header(2, 1, 16, 0x04);
         d.push(0b11_000001); // type 3, count = 1+1 = 2
         d.push(0xDB);
-        d.push(0x01);
+        d.push(0x04); // VGA red
         let img = XBinDecoder.decode(&d).unwrap();
         assert_eq!((img.width, img.height), (16, 16));
         assert_eq!(img.pixels[0], [170, 0, 0, 255]);
@@ -276,12 +279,13 @@ mod tests {
 
     #[test]
     fn ice_gives_bright_background() {
-        // Non-blink (iCE) flag: a space with bg nibble 0xC → bright blue background.
+        // Non-blink (iCE) flag: a space with bg nibble 0xC → bright background. In VGA
+        // attribute order 0xC = bright red (index 12).
         let mut d = header(1, 1, 16, 0x08);
         d.push(b' ');
-        d.push(0xC0); // bg = 0xC (bright blue) in iCE mode, fg = 0
+        d.push(0xC0); // bg = 0xC (bright red) in iCE mode, fg = 0
         let img = XBinDecoder.decode(&d).unwrap();
-        assert_eq!(img.pixels[0], [85, 85, 255, 255]); // bright blue
+        assert_eq!(img.pixels[0], [255, 85, 85, 255]); // bright red
     }
 
     #[test]

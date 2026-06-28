@@ -32,7 +32,8 @@ fn font_9px() -> bool {
     FONT_9PX.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Standard VGA/ANSI 16-color palette. Shared with the XBin decoder as its default.
+/// 16-color palette in **ANSI SGR** index order (SGR 31=red→1, 34=blue→4). This is
+/// what the ANSI parser maps SGR codes into, so it's indexed by `cell.fg/bg` here.
 pub(super) const PALETTE: [[u8; 3]; 16] = [
     [0, 0, 0],       // 0 black
     [170, 0, 0],     // 1 red
@@ -49,6 +50,29 @@ pub(super) const PALETTE: [[u8; 3]; 16] = [
     [85, 85, 255],   // 12 bright blue
     [255, 85, 255],  // 13 bright magenta
     [85, 255, 255],  // 14 bright cyan
+    [255, 255, 255], // 15 white
+];
+
+/// The same 16 colors in **VGA hardware (attribute byte)** index order (index 1=blue,
+/// 4=red — the bits are I·R·G·B). The binary text-mode formats (BIN/XBIN/…) store raw
+/// VGA attribute bytes, so their default palette MUST be this order, not [`PALETTE`] —
+/// otherwise red↔blue and cyan↔brown swap (the `ansi::PALETTE` order is for SGR codes).
+pub(super) const VGA_PALETTE: [[u8; 3]; 16] = [
+    [0, 0, 0],       // 0 black
+    [0, 0, 170],     // 1 blue
+    [0, 170, 0],     // 2 green
+    [0, 170, 170],   // 3 cyan
+    [170, 0, 0],     // 4 red
+    [170, 0, 170],   // 5 magenta
+    [170, 85, 0],    // 6 brown/yellow
+    [170, 170, 170], // 7 light grey
+    [85, 85, 85],    // 8 dark grey
+    [85, 85, 255],   // 9 bright blue
+    [85, 255, 85],   // 10 bright green
+    [85, 255, 255],  // 11 bright cyan
+    [255, 85, 85],   // 12 bright red
+    [255, 85, 255],  // 13 bright magenta
+    [255, 255, 85],  // 14 bright yellow
     [255, 255, 255], // 15 white
 ];
 

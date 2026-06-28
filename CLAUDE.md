@@ -66,7 +66,8 @@ src/
                      + SAUCE-driven 8×8 (VGA50/EGA43) vs 8×16 cell selection;
                      optional 9-dot VGA cell (font_9px); pads to a ≥25-row screen;
                      TextStream renders byte prefixes for baud-rate ANSImation playback
-    xbin.rs          .xb/.xbin — binary ANSI: palette/font + RLE; shared render_textmode
+    xbin.rs          .xb/.xbin — binary ANSI: palette/font + RLE; shared render_textmode;
+                     default palette is ansi::VGA_PALETTE (raw VGA attr order, not SGR)
     bin.rs           .bin — raw char/attr pairs (SAUCE width); idf/adf reuse render_textmode
     tundra.rs        .tnd — TundraDraw 24-bit truecolor command stream
     idf.rs           .idf — iCE Draw: bounds + RLE + end-of-file font/palette
@@ -481,6 +482,20 @@ The bundled egui font **lacks the Geometric Shapes block** — `▲`/`▼` (U+25
 `⬅`/`➡`/**`⬆`**/**`⬇`**, `⟲`/`⟳`, `…`/`×`/`›`/`★`/`📁`, `·`. For anything else prefer
 ASCII (`*`) or **paint it** (see `drag_handle`'s dots). When in doubt, test in the
 real app — tofu has bitten this UI several times.
+
+## Palette-order gotcha (ANSI SGR vs VGA attribute)
+
+There are **two index orderings** for the same 16 colours, and mixing them swaps
+red↔blue + cyan↔brown (and their bright variants). `ansi::PALETTE` is in **ANSI SGR**
+order (SGR 31=red→index 1, 34=blue→4) — correct for `.ans`, whose parser maps SGR codes
+to those indices. The **binary** text-mode formats (`.bin`/`.xbin`/iCE) store *raw VGA
+attribute bytes*, where index 1=blue and 4=red, so they must use `ansi::VGA_PALETTE`
+(the same colours in hardware order). `render_textmode` indexes whatever palette it's
+handed by the raw `attr & 0x0f`, so the **caller** picks the right order: `bin.rs` and
+`xbin.rs` (no embedded palette) pass `VGA_PALETTE`; XBIN/IDF/ADF *embedded* palettes are
+already VGA-ordered (raw RGB by attribute index) and are indexed directly. Bug symptom:
+a piece whose 16colo/ansilove thumbnail is red renders blue in the viewer
+(`MULTI-13.BIN`); guarded by `bin::tests::vga_attribute_indices_are_not_ansi_order`.
 
 ## Settings & ratings
 

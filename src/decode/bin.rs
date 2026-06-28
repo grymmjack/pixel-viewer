@@ -51,7 +51,9 @@ impl Decoder for BinDecoder {
             width,
             height,
             &pairs,
-            &super::ansi::PALETTE,
+            // Raw VGA attribute bytes → the VGA-ordered palette (index 1=blue, 4=red),
+            // NOT the SGR-ordered ansi::PALETTE (which would swap red↔blue).
+            &super::ansi::VGA_PALETTE,
             None,
             16,
             ice,
@@ -66,12 +68,26 @@ mod tests {
 
     #[test]
     fn decodes_a_bin_row() {
-        // No SAUCE → width defaults to 160; two cells: red block, then a blank.
-        let data = vec![0xDB, 0x01, 0x20, 0x00];
+        // No SAUCE → width defaults to 160; two cells: a red block (VGA attr 4 = red),
+        // then a blank. The attribute byte is a *VGA* index, so 4 = red (not the ANSI
+        // SGR order where 1 = red) — see VGA_PALETTE.
+        let data = vec![0xDB, 0x04, 0x20, 0x00];
         let img = BinDecoder.decode(&data).unwrap();
         // 160 wide × 1 row (height inferred), 8×16 cells.
         assert_eq!((img.width, img.height), (160 * 8, 16));
         assert_eq!(img.pixels[0], [170, 0, 0, 255]); // first cell red
+    }
+
+    #[test]
+    fn vga_attribute_indices_are_not_ansi_order() {
+        // Regression for the red↔blue swap: BIN attribute bytes are VGA-ordered, so
+        // index 1 must be BLUE and index 4 RED (the bug used the SGR-ordered palette,
+        // which has them the other way round). Two full-block cells, fg = 1 then 4.
+        let data = vec![0xDB, 0x01, 0xDB, 0x04];
+        let img = BinDecoder.decode(&data).unwrap();
+        assert_eq!(img.pixels[0], [0, 0, 170, 255], "VGA index 1 = blue");
+        // The second cell starts at x=8 in the same top row.
+        assert_eq!(img.pixels[8], [170, 0, 0, 255], "VGA index 4 = red");
     }
 
     #[test]
