@@ -3921,7 +3921,14 @@ impl PixelView {
                 }
             });
         if want_download {
-            self.download_file(&entry.path);
+            // A 16colo.rs piece's bytes aren't a plain local file (they live in the
+            // download cache, or aren't fetched yet) — grab the `raw` file instead of
+            // trying to copy a virtual path.
+            if self.colo_pieces.contains_key(&entry.path) {
+                self.download_piece(&entry.path, false);
+            } else {
+                self.download_file(&entry.path);
+            }
         }
         if let Some(vpath) = want_pack {
             self.download_pack(&vpath);
@@ -5008,6 +5015,7 @@ impl PixelView {
         let mut smart_on: Option<(usize, SmartCriterion)> = None; // "Smart filter on…"
         let mut toggle_viewed: Option<(usize, bool)> = None; // "Mark as (not) viewed"
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
+        let mut dl: Option<(usize, bool)> = None; // 16colo download (idx, want_pack)
         let can_paste = self.clipboard.is_some();
         // In a 16colo flat listing the rows are pieces, so offer pinning the whole
         // listing (the artist/group/search) — its virtual path re-runs the search.
@@ -5287,15 +5295,17 @@ impl PixelView {
                             let pinned = self.favorites.iter().any(|f| f == &entry.path);
                             let colo_pin =
                                 colo_pin_label.as_deref().map(|l| (l, colo_pin_pinned));
-                            if let Some(pick) =
-                                entry_context_menu(ui, &entry, can_paste, pinned, viewed, colo_pin)
-                            {
+                            let colo_piece = self.colo_pieces.contains_key(&entry.path);
+                            if let Some(pick) = entry_context_menu(
+                                ui, &entry, can_paste, pinned, viewed, colo_pin, colo_piece,
+                            ) {
                                 match pick {
                                     TilePick::Pin => pin_dir = Some(idx),
                                     TilePick::PinFolder => pin_current = true,
                                     TilePick::Smart(c) => smart_on = Some((idx, c)),
                                     TilePick::File(a) => ctx_action = Some((idx, a)),
                                     TilePick::ToggleViewed(b) => toggle_viewed = Some((idx, b)),
+                                    TilePick::Download(pack) => dl = Some((idx, pack)),
                                 }
                             }
                         });
@@ -5356,6 +5366,11 @@ impl PixelView {
         }
         if pin_current {
             self.pin_current_folder();
+        }
+        if let Some((idx, want_pack)) = dl {
+            if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
+                self.download_piece(&p, want_pack);
+            }
         }
     }
 
@@ -5862,16 +5877,18 @@ impl PixelView {
                     }
                     let pinned = self.favorites.iter().any(|f| f == &entry.path);
                     let colo_pin = colo_pin_label.as_deref().map(|l| (l, colo_pin_pinned));
+                    let colo_piece = piece.is_some();
                     resp.context_menu(|ui| {
-                        if let Some(pick) =
-                            entry_context_menu(ui, &entry, can_paste, pinned, viewed, colo_pin)
-                        {
+                        if let Some(pick) = entry_context_menu(
+                            ui, &entry, can_paste, pinned, viewed, colo_pin, colo_piece,
+                        ) {
                             match pick {
                                 TilePick::Pin => pin_dir = Some(idx),
                                 TilePick::PinFolder => pin_current = true,
                                 TilePick::Smart(c) => smart_on = Some((idx, c)),
                                 TilePick::File(a) => ctx_action = Some((idx, a)),
                                 TilePick::ToggleViewed(b) => toggle_viewed = Some((idx, b)),
+                                TilePick::Download(pack) => dl = Some((idx, pack)),
                             }
                         }
                     });
@@ -9628,7 +9645,8 @@ enum TilePick {
     PinFolder, // pin the *current* folder (e.g. the 16colo artist/group/search) to Places
     Smart(SmartCriterion),
     File(FileAction),
-    ToggleViewed(bool), // mark this entry viewed (true) / not viewed (false)
+    ToggleViewed(bool),     // mark this entry viewed (true) / not viewed (false)
+    Download(bool),         // save a 16colo piece (false) or its whole pack .zip (true)
 }
 
 /// The shared right-click context menu for a browse entry (used by both the grid tile
@@ -9643,8 +9661,29 @@ fn entry_context_menu(
     pinned: bool,
     viewed: bool,
     colo_pin: Option<(&str, bool)>, // (label, already-pinned)
+    colo_piece: bool,               // a 16colo.rs piece → offer Download
 ) -> Option<TilePick> {
     let mut pick = None;
+    // 16colo.rs piece: save the single file or the whole pack .zip to disk.
+    if colo_piece {
+        if ui
+            .button("⬇ Download file…")
+            .on_hover_text("Save this art file from 16colo.rs to your disk")
+            .clicked()
+        {
+            pick = Some(TilePick::Download(false));
+            ui.close();
+        }
+        if ui
+            .button("⬇ Download pack .zip…")
+            .on_hover_text("Save the whole pack archive")
+            .clicked()
+        {
+            pick = Some(TilePick::Download(true));
+            ui.close();
+        }
+        ui.separator();
+    }
     // In a flat artist/group/search listing, let the user bookmark the whole listing
     // (a pinned `…/search/artist/x` re-runs that search when clicked).
     if let Some((label, already)) = colo_pin {
