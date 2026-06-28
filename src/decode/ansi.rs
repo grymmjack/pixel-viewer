@@ -77,23 +77,6 @@ pub(super) const VGA_PALETTE: [[u8; 3]; 16] = [
     [255, 255, 255], // 15 white
 ];
 
-/// Nearest of the 16 VGA palette colors to an RGB triple (squared distance) — used
-/// to fold 256-color / truecolor SGR down to our 16-color renderer.
-fn nearest_vga(r: u8, g: u8, b: u8) -> u8 {
-    let mut best = 7u8;
-    let mut best_d = u32::MAX;
-    for (i, p) in PALETTE.iter().enumerate() {
-        let d = (r as i32 - p[0] as i32).pow(2)
-            + (g as i32 - p[1] as i32).pow(2)
-            + (b as i32 - p[2] as i32).pow(2);
-        if (d as u32) < best_d {
-            best_d = d as u32;
-            best = i as u8;
-        }
-    }
-    best
-}
-
 /// An xterm 256-color index → RGB: 0-15 = the base palette, 16-231 = a 6×6×6 cube,
 /// 232-255 = a 24-step grayscale ramp.
 fn xterm256_rgb(n: u8) -> (u8, u8, u8) {
@@ -121,14 +104,14 @@ fn xterm256_rgb(n: u8) -> (u8, u8, u8) {
 #[derive(Clone, Copy)]
 struct Cell {
     ch: u8,
-    fg: u8,
-    bg: u8,
+    fg: [u8; 3], // resolved RGB (so 24-bit PabloDraw colors render exactly)
+    bg: [u8; 3],
 }
 
 const BLANK: Cell = Cell {
     ch: b' ',
-    fg: 7,
-    bg: 0,
+    fg: PALETTE[7],
+    bg: PALETTE[0],
 };
 
 impl Decoder for AnsiDecoder {
@@ -248,8 +231,7 @@ fn render_grid(
             } else {
                 &CP437_8X16[cell.ch as usize]
             };
-            let fg = PALETTE[(cell.fg & 0x0f) as usize];
-            let bg = PALETTE[(cell.bg & 0x0f) as usize];
+            let (fg, bg) = (cell.fg, cell.bg); // already resolved to RGB
             for (ry, &bits) in glyph.iter().enumerate() {
                 for rx in 0..cell_w {
                     let on = dot_on(bits, rx, cell.ch);
@@ -316,6 +298,9 @@ fn parse(data: &[u8], wrap: usize, ice: bool) -> (Vec<Vec<Cell>>, usize) {
     let mut saved = (0usize, 0usize); // ESC[s/u and ESC 7/8 cursor save/restore
     let (mut fg, mut bg) = (7u8, 0u8);
     let (mut bold, mut blink, mut reverse) = (false, false, false);
+    // 24-bit overrides (PabloDraw `ESC[…t` / SGR 38;2/48;2): `Some` wins over the 16-color
+    // index, `None` falls back to the palette. Cleared whenever a 16-color SGR sets fg/bg.
+    let (mut fg_rgb, mut bg_rgb): (Option<[u8; 3]>, Option<[u8; 3]>) = (None, None);
     let mut i = 0;
     while i < data.len() {
         if y >= MAX_ROWS {
@@ -369,6 +354,8 @@ fn parse(data: &[u8], wrap: usize, ice: bool) -> (Vec<Vec<Cell>>, usize) {
                                     bold = false;
                                     blink = false;
                                     reverse = false;
+                                    fg_rgb = None;
+                                    bg_rgb = None;
                                 }
                                 1 => bold = true,
                                 5 | 6 => blink = true,
@@ -376,50 +363,76 @@ fn parse(data: &[u8], wrap: usize, ice: bool) -> (Vec<Vec<Cell>>, usize) {
                                 21 | 22 => bold = false,
                                 25 => blink = false,
                                 27 => reverse = false,
-                                30..=37 => fg = (nums[k] - 30) as u8,
-                                39 => fg = 7,
-                                40..=47 => bg = (nums[k] - 40) as u8,
-                                49 => bg = 0,
-                                90..=97 => fg = (nums[k] - 90 + 8) as u8,
-                                100..=107 => bg = (nums[k] - 100 + 8) as u8,
-                                // 38/48 extended color: consume the sub-params (5;n or
-                                // 2;r;g;b) so they can't corrupt state. Not yet applied.
+                                30..=37 => {
+                                    fg = (nums[k] - 30) as u8;
+                                    fg_rgb = None;
+                                }
+                                39 => {
+                                    fg = 7;
+                                    fg_rgb = None;
+                                }
+                                40..=47 => {
+                                    bg = (nums[k] - 40) as u8;
+                                    bg_rgb = None;
+                                }
+                                49 => {
+                                    bg = 0;
+                                    bg_rgb = None;
+                                }
+                                90..=97 => {
+                                    fg = (nums[k] - 90 + 8) as u8;
+                                    fg_rgb = None;
+                                }
+                                100..=107 => {
+                                    bg = (nums[k] - 100 + 8) as u8;
+                                    bg_rgb = None;
+                                }
                                 // Extended color: 38/48 ;5;n (256-color) or ;2;r;g;b
-                                // (truecolor) — mapped to the nearest of the 16 VGA
-                                // colors (we render a 16-color palette).
+                                // (truecolor) — stored as an exact RGB override.
                                 38 | 48 => {
                                     let to_fg = nums[k] == 38;
-                                    match nums.get(k + 1).copied() {
+                                    let rgb = match nums.get(k + 1).copied() {
                                         Some(5) => {
-                                            if let Some(&n) = nums.get(k + 2) {
-                                                let (r, g, b) = xterm256_rgb(n.min(255) as u8);
-                                                let idx = nearest_vga(r, g, b);
-                                                if to_fg {
-                                                    fg = idx;
-                                                } else {
-                                                    bg = idx;
-                                                }
-                                            }
+                                            let n = nums.get(k + 2).copied().unwrap_or(0);
                                             k += 2;
+                                            let (r, g, b) = xterm256_rgb(n.min(255) as u8);
+                                            Some([r, g, b])
                                         }
                                         Some(2) => {
                                             let ch = |o: usize| {
                                                 nums.get(k + o).copied().unwrap_or(0).min(255) as u8
                                             };
-                                            let idx = nearest_vga(ch(2), ch(3), ch(4));
-                                            if to_fg {
-                                                fg = idx;
-                                            } else {
-                                                bg = idx;
-                                            }
+                                            let rgb = [ch(2), ch(3), ch(4)];
                                             k += 4;
+                                            Some(rgb)
                                         }
-                                        _ => {}
+                                        _ => None,
+                                    };
+                                    if let Some(rgb) = rgb {
+                                        if to_fg {
+                                            fg_rgb = Some(rgb);
+                                        } else {
+                                            bg_rgb = Some(rgb);
+                                        }
                                     }
                                 }
                                 _ => {}
                             }
                             k += 1;
+                        }
+                    }
+                    // PabloDraw 24-bit RGB: `ESC[<sel>;r;g;b t` — sel 0 = background,
+                    // 1 = foreground. This is how Blocktronics/modern ANSI tweak palettes
+                    // (the file also emits a 16-color SGR fallback we'd otherwise show).
+                    b't' => {
+                        if nums.len() >= 4 {
+                            let rgb =
+                                [nums[1].min(255) as u8, nums[2].min(255) as u8, nums[3].min(255) as u8];
+                            match nums[0] {
+                                0 => bg_rgb = Some(rgb),
+                                1 => fg_rgb = Some(rgb),
+                                _ => {}
+                            }
                         }
                     }
                     // Cursor moves (the `1`-default, clamped). ANSI art leans on these
@@ -488,9 +501,12 @@ fn parse(data: &[u8], wrap: usize, ice: bool) -> (Vec<Vec<Cell>>, usize) {
             0x1A => break,
             ch => {
                 if x < MAX_COLS {
-                    // Bold brightens fg; in iCE mode blink brightens bg; reverse swaps.
-                    let efg = if bold { fg | 8 } else { fg };
-                    let ebg = if ice && blink { bg | 8 } else { bg };
+                    // Resolve to RGB. A 24-bit override (`*_rgb`) wins; otherwise the
+                    // 16-color index, with bold brightening fg and (iCE) blink brightening
+                    // bg. Reverse swaps the two resolved colors.
+                    let efg = fg_rgb.unwrap_or(PALETTE[(if bold { fg | 8 } else { fg } & 0x0f) as usize]);
+                    let ebg =
+                        bg_rgb.unwrap_or(PALETTE[(if ice && blink { bg | 8 } else { bg } & 0x0f) as usize]);
                     let (cfg, cbg) = if reverse { (ebg, efg) } else { (efg, ebg) };
                     ensure(&mut grid, y, x);
                     grid[y][x] = Cell {
@@ -747,13 +763,23 @@ mod tests {
     }
 
     #[test]
-    fn extended_color_maps_to_nearest_vga() {
-        // Truecolor pure red → nearest VGA is index 1 (170,0,0), not bright red.
+    fn extended_color_is_exact_rgb() {
+        // Truecolor is now stored exactly (24-bit), not folded to the nearest VGA color.
         let img = AnsiDecoder.decode(b"\x1b[38;2;255;0;0m\xDB").unwrap();
-        assert_eq!(img.pixels[0], [170, 0, 0, 255]);
+        assert_eq!(img.pixels[0], [255, 0, 0, 255]);
         // 256-color index 9 is bright red exactly.
         let img = AnsiDecoder.decode(b"\x1b[38;5;9m\xDB").unwrap();
         assert_eq!(img.pixels[0], [255, 85, 85, 255]);
+    }
+
+    #[test]
+    fn pablodraw_24bit_t_sequence() {
+        // ESC[1;r;g;b t sets a 24-bit foreground; ESC[0;r;g;b t the background.
+        // (Blocktronics "tweaked palette" art, e.g. B-SiDES iNFO.ans.)
+        let img = AnsiDecoder.decode(b"\x1b[1;0;23;1t\xDB").unwrap();
+        assert_eq!(img.pixels[0], [0, 23, 1, 255], "fg = exact 24-bit RGB");
+        let img = AnsiDecoder.decode(b"\x1b[0;187;249;255t ").unwrap();
+        assert_eq!(img.pixels[0], [187, 249, 255, 255], "bg = exact 24-bit RGB");
     }
 
     #[test]
@@ -854,3 +880,5 @@ mod tests {
         eprintln!("wrote /tmp/ansi_out.png {}x{}", img.width, img.height);
     }
 }
+
+
