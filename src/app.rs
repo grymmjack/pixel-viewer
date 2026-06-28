@@ -962,6 +962,10 @@ pub struct PixelView {
     colo_columns: u16,
     // Per-column width overrides (ColKind as u8 → points), for drag-to-resize. Persisted.
     col_widths: HashMap<u8, f32>,
+    // User column order (ColKind as u8) for the file / scene table layouts, from
+    // drag-to-reorder; empty = the natural build order. Unknown/new kinds append.
+    table_order: Vec<u8>,
+    colo_order: Vec<u8>,
     // 16colo.rs flat-piece listing state. `colo_flat` marks the current view as a
     // flattened artist/group/search listing (→ the table shows scene columns). The
     // map carries per-piece metadata keyed by virtual display path (see [`ColoPiece`]).
@@ -1058,6 +1062,8 @@ impl PixelView {
     const TABLE_COLUMNS_KEY: &'static str = "table_columns";
     const COLO_COLUMNS_KEY: &'static str = "colo_columns";
     const COL_WIDTHS_KEY: &'static str = "col_widths";
+    const TABLE_ORDER_KEY: &'static str = "table_order";
+    const COLO_ORDER_KEY: &'static str = "colo_order";
 
     pub fn new(cc: &eframe::CreationContext<'_>, cli: CliArgs) -> Self {
         let registry = Arc::new(Registry::with_builtins());
@@ -1128,6 +1134,14 @@ impl PixelView {
             .storage
             .and_then(|s| eframe::get_value::<Vec<(u8, f32)>>(s, Self::COL_WIDTHS_KEY))
             .map(|v| v.into_iter().collect())
+            .unwrap_or_default();
+        let table_order: Vec<u8> = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, Self::TABLE_ORDER_KEY))
+            .unwrap_or_default();
+        let colo_order: Vec<u8> = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, Self::COLO_ORDER_KEY))
             .unwrap_or_default();
         let dirs_first = get_bool(Self::DIRS_FIRST).unwrap_or(true);
         let min_rating = get_u8(Self::MIN_RATING).unwrap_or(0);
@@ -1466,6 +1480,8 @@ impl PixelView {
             table_columns,
             colo_columns,
             col_widths,
+            table_order,
+            colo_order,
             colo_flat: false,
             colo_pieces: HashMap::new(),
             colo_rx: None,
@@ -5575,6 +5591,23 @@ impl PixelView {
                 ));
             }
         }
+        // Apply the user's drag-to-reorder column order (data columns only — the
+        // thumbnail stays first, the scene Download menu stays last). Unknown / newly
+        // shown kinds keep their default relative position (sorted to the end).
+        let order = if scene { &self.colo_order } else { &self.table_order };
+        if !order.is_empty() {
+            let head = 1; // after the thumbnail
+            let tail = usize::from(cols.last().map(|c| c.kind) == Some(ColKind::Download));
+            let end = cols.len() - tail;
+            if head < end {
+                cols[head..end].sort_by_key(|c| {
+                    order
+                        .iter()
+                        .position(|&k| k == c.kind as u8)
+                        .unwrap_or(usize::MAX)
+                });
+            }
+        }
         // Apply persisted drag-to-resize width overrides to the fixed-width columns
         // (the flex columns — Filename/Artist — absorb whatever's left).
         for c in cols
@@ -5602,6 +5635,11 @@ impl PixelView {
         let mut toggle_col: Option<u16> = None; // right-click: show/hide a column bit
         let mut resize: Option<(u8, f32)> = None; // drag a column border: (ColKind, width)
         let (tc_cur, cs_cur) = (self.table_columns, self.colo_columns);
+        // Drag-to-reorder: collect the visible data columns' header rects, the column
+        // being dragged, and where it was dropped (pointer x).
+        let mut data_rects: Vec<(ColKind, egui::Rect)> = Vec::new();
+        let mut drag_kind: Option<ColKind> = None;
+        let mut drop_at: Option<(ColKind, f32)> = None;
         let mut ctx_action: Option<(usize, FileAction)> = None;
         let mut pin_dir: Option<usize> = None;
         let mut smart_on: Option<(usize, SmartCriterion)> = None;
@@ -5629,12 +5667,36 @@ impl PixelView {
             for c in &cols {
                 // A fixed (non-flex) data column ends in a thin drag-to-resize border.
                 let resizable = !c.flex && !matches!(c.kind, ColKind::Thumb | ColKind::Download);
+                // Data columns (not the thumbnail / download menu) can be dragged to
+                // reorder; that needs the cell to sense a drag as well as a click.
+                let movable = !matches!(c.kind, ColKind::Thumb | ColKind::Download);
                 let handle_w = if resizable { 5.0 } else { 0.0 };
                 let cell_w = (c.w - handle_w).max(1.0);
-                let (rect, resp) =
-                    ui.allocate_exact_size(egui::vec2(cell_w, 22.0), egui::Sense::click());
-                ui.painter()
-                    .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
+                let sense = if movable {
+                    egui::Sense::click_and_drag()
+                } else {
+                    egui::Sense::click()
+                };
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(cell_w, 22.0), sense);
+                if movable {
+                    data_rects.push((c.kind, rect));
+                    if resp.dragged() {
+                        drag_kind = Some(c.kind);
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                    }
+                    if resp.drag_stopped() {
+                        if let Some(p) = ui.ctx().pointer_interact_pos() {
+                            drop_at = Some((c.kind, p.x));
+                        }
+                    }
+                }
+                let dragging_this = drag_kind == Some(c.kind);
+                let bg = if dragging_this {
+                    ui.visuals().widgets.active.bg_fill
+                } else {
+                    ui.visuals().faint_bg_color
+                };
+                ui.painter().rect_filled(rect, 0.0, bg);
                 if !c.label.is_empty() {
                     let active = c.sort == Some(sort_key);
                     let arrow = if active {
@@ -5725,6 +5787,26 @@ impl PixelView {
                         let w = (c.w + hresp.drag_delta().x).clamp(40.0, 600.0);
                         resize = Some((c.kind as u8, w));
                     }
+                }
+            }
+            // While reordering, mark where the dragged column will drop — a vertical
+            // insertion line at the boundary nearest the pointer.
+            if drag_kind.is_some() {
+                if let (Some(p), Some((_, first))) =
+                    (ui.ctx().pointer_interact_pos(), data_rects.first())
+                {
+                    let yr = first.y_range();
+                    let line_x = data_rects
+                        .iter()
+                        .filter(|(k, r)| Some(*k) != drag_kind && r.center().x < p.x)
+                        .map(|(_, r)| r.right())
+                        .next_back()
+                        .unwrap_or_else(|| first.left());
+                    ui.painter().vline(
+                        line_x,
+                        yr,
+                        egui::Stroke::new(2.0, ui.visuals().strong_text_color()),
+                    );
                 }
             }
         });
@@ -6016,6 +6098,22 @@ impl PixelView {
         // Drag-to-resize: remember this column's new width (used next frame).
         if let Some((kind, w)) = resize {
             self.col_widths.insert(kind, w);
+        }
+        // Drag-to-reorder: drop the dragged column at the boundary under the pointer.
+        if let Some((dragged, ptr_x)) = drop_at {
+            let others: Vec<(ColKind, f32)> = data_rects
+                .iter()
+                .filter(|(k, _)| *k != dragged)
+                .map(|(k, r)| (*k, r.center().x))
+                .collect();
+            let idx = others.iter().filter(|(_, cx)| *cx < ptr_x).count();
+            let mut new: Vec<u8> = others.iter().map(|(k, _)| *k as u8).collect();
+            new.insert(idx.min(new.len()), dragged as u8);
+            if self.colo_flat {
+                self.colo_order = new;
+            } else {
+                self.table_order = new;
+            }
         }
         // A pack/year/group link click navigates the 16colo browser; it takes priority
         // over the row's open-the-art click (the link cell is part of the row response).
@@ -8258,6 +8356,8 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::COLO_COLUMNS_KEY, &self.colo_columns);
         let widths: Vec<(u8, f32)> = self.col_widths.iter().map(|(&k, &w)| (k, w)).collect();
         eframe::set_value(storage, Self::COL_WIDTHS_KEY, &widths);
+        eframe::set_value(storage, Self::TABLE_ORDER_KEY, &self.table_order);
+        eframe::set_value(storage, Self::COLO_ORDER_KEY, &self.colo_order);
         eframe::set_value(storage, Self::DIRS_FIRST, &self.dirs_first);
         eframe::set_value(storage, Self::MIN_RATING, &self.min_rating);
         eframe::set_value(storage, Self::EXPLORER_KEY, &self.show_explorer);
