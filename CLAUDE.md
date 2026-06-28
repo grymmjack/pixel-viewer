@@ -505,6 +505,13 @@ a piece whose 16colo/ansilove thumbnail is red renders blue in the viewer
   `DETAILS_KEY`, `GAP_KEY`/`GAP_Y_KEY` (h/v grid spacing), `CAPTION_KEY` (caption
   bitmask), `KEYMAP_KEY`).
   `persist_egui_memory()` returns `false` — we persist only our keys, in `save()`.
+- **Last folder** (`FOLDER_KEY`) is reopened on launch (CLI `--folder` wins). `save()`
+  stores the **display** path, not `self.folder` — inside an archive / downloaded 16colo
+  pack the latter is a temp dir that's gone next run, whereas the display path
+  (`pack.zip/…`, `<16colo.rs>/year/pack`) is stable. `new()` restores it when it's a real
+  dir, a 16colo path (re-fetched), or an archive file (re-extracted) — `open_folder`
+  routes each. (A subpath *inside* a local archive isn't restored — `is_archive` only
+  matches the archive file itself.)
 - **Two independent zoom axes:** Ctrl +/- = whole-GUI scale (egui `zoom_factor`);
   Ctrl+wheel = thumbnail tile size only. Ctrl+wheel arrives as `zoom_delta()`, NOT
   `smooth_scroll_delta` (see gotcha).

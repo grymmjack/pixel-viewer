@@ -1367,10 +1367,15 @@ impl PixelView {
             colo_sauce_done: HashSet::new(),
         };
 
-        // Reopen wherever we left off so the grid, breadcrumb, and favorites are
-        // all visible on launch instead of an empty window.
+        // Reopen wherever we left off so the grid, breadcrumb, and favorites are all
+        // visible on launch instead of an empty window. `open_folder` itself routes the
+        // virtual cases, so allow a real dir, a 16colo.rs path (re-fetched), or an
+        // archive file (re-extracted) — not only an on-disk directory.
         if let Some(dir) = open_target {
-            if dir.is_dir() {
+            if dir.is_dir()
+                || crate::sixteen::is_remote(&dir)
+                || (dir.is_file() && crate::archive::is_archive(&dir))
+            {
                 app.open_folder(dir);
             }
         }
@@ -7882,7 +7887,12 @@ impl eframe::App for PixelView {
             })
             .collect();
         eframe::set_value(storage, Self::SAVED_FILTERS_KEY, &filters);
-        eframe::set_value(storage, Self::FOLDER_KEY, &self.folder);
+        // Remember where we were. Save the *display* path, not `self.folder`: inside an
+        // archive / downloaded 16colo pack, `self.folder` is a temp dir that's gone next
+        // launch, whereas the display path (`pack.zip/…`, `<16colo.rs>/year/pack`) is
+        // stable and re-openable.
+        let last_folder = self.folder.clone().map(|f| self.to_display(&f));
+        eframe::set_value(storage, Self::FOLDER_KEY, &last_folder);
         eframe::set_value(storage, Self::SORT_KEY, &self.sort_key.to_u8());
         eframe::set_value(storage, Self::SORT_DESC, &self.sort_desc);
         eframe::set_value(storage, Self::TABLE_VIEW_KEY, &self.table_view);
