@@ -7222,8 +7222,16 @@ impl eframe::App for PixelView {
         // F11 — immersive mode: hide every bar/dock, drop the window decorations, and go
         // OS-fullscreen, showing only the art. Bars reveal when the mouse reaches the
         // matching screen edge; the cursor auto-hides after a moment of stillness.
-        let typing =
-            self.path_edit.is_some() || self.renaming.is_some() || self.rebinding.is_some();
+        // True while the user is typing into *any* text field — incl. the 16colo.rs
+        // search box, the '/' filter, and the advanced-search fields, which the explicit
+        // flags below don't cover. Without this, a Backspace to fix a typo in the search
+        // box fired ParentDir (jumping the artists list back to Years), and an 'r' in a
+        // query triggered the random-pack hotkey. `wants_keyboard_input` reflects focus
+        // (held across frames), so it's reliable even though this runs before the panels.
+        let typing = self.path_edit.is_some()
+            || self.renaming.is_some()
+            || self.rebinding.is_some()
+            || ctx.egui_wants_keyboard_input();
         if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
             self.immersive = !self.immersive;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.immersive));
@@ -7369,12 +7377,11 @@ impl eframe::App for PixelView {
         // Keyboard: ratings (1-5 / 0) + rebindable nav (defaults: Esc->grid,
         // Backspace->parent). Suppressed while typing into any text field (path /
         // search / rename) or capturing a rebind — else a typed digit rates an image.
-        if self.path_edit.is_none()
-            && self.rebinding.is_none()
+        if !typing
             && self.search.is_none()
-            && self.renaming.is_none()
             && !self.show_search
-        // typing dimensions/criteria shouldn't rate images
+        // typing into any field (path, rename, search box, criteria) must not rate
+        // images or trigger nav keys — `typing` now also covers focused text fields.
         {
             let back_key = self.key_for(Action::BackToGrid);
             let parent_key = self.key_for(Action::ParentDir);
@@ -7481,7 +7488,7 @@ impl eframe::App for PixelView {
             )
         });
         if self.mode == Mode::Grid
-            && self.path_edit.is_none()
+            && !typing
             && self.search.is_none()
             && !self.entries.is_empty()
         {

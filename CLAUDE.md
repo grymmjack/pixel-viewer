@@ -666,6 +666,10 @@ than assuming a logic bug. Already hit and migrated for 0.34.3:
   pre-classified as a zoom gesture** — it lands in `zoom_delta()` and
   `smooth_scroll_delta` stays `0` (egui's `zoom_modifier` defaults to Ctrl/Cmd).
 - `ComboBox::from_id_source` → `from_id_salt`; menu actions live in `egui::menu`.
+- `Context::wants_keyboard_input()` → **`egui_wants_keyboard_input()`**. Used in the
+  global key handler's `typing` guard so hotkeys (ratings, Backspace→ParentDir, R→random
+  pack) are suppressed while a text field is focused — the explicit `path_edit`/`search`
+  flags don't cover the 16colo search box / advanced-search fields, only this does.
 
 ## Testing
 
