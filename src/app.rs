@@ -1576,6 +1576,16 @@ impl PixelView {
             self.enter_archive(dir);
             return;
         }
+        // Opening a real local folder. If we were inside a mounted archive / 16colo.rs
+        // pack and this folder is *outside* that mount's extracted tree, we've left it —
+        // drop the stale mount so the 16colo.rs nav bar (and the archive breadcrumb)
+        // don't linger over a plain local folder. Navigating *within* the extracted tree
+        // (dir under temp_root) keeps the mount, so subfolders of an archive still work.
+        if let Some(m) = &self.archive_mount {
+            if !dir.starts_with(&m.temp_root) {
+                self.archive_mount = None;
+            }
+        }
         let mut all: Vec<Entry> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for e in rd.flatten() {
@@ -13020,6 +13030,42 @@ mod gui_tests {
             before,
             "wheel over the combo must change the selection"
         );
+    }
+
+    // Regression: the 16colo.rs nav bar (and the archive breadcrumb) keyed off a
+    // stale `archive_mount` that was never cleared, so it lingered over a plain local
+    // folder after you'd visited a pack. Leaving the mount's tree must drop the mount.
+    #[test]
+    fn leaving_an_archive_mount_clears_it() {
+        let mut harness =
+            Harness::builder().build_eframe(|cc| PixelView::new(cc, CliArgs::default()));
+        let pid = std::process::id();
+        let mount = std::env::temp_dir().join(format!("pv_mount_{pid}"));
+        let inside = mount.join("sub");
+        let outside = std::env::temp_dir().join(format!("pv_outside_{pid}"));
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let st = harness.state_mut();
+        st.archive_mount = Some(ArchiveMount {
+            archive: PathBuf::from("<16colo.rs>/2023/somepack"),
+            temp_root: mount.clone(),
+        });
+        // Browsing a subfolder *within* the extracted tree keeps the mount…
+        st.open_folder(inside);
+        assert!(
+            st.archive_mount.is_some(),
+            "navigating within the archive's tree must keep the mount"
+        );
+        // …navigating to a folder outside it drops the mount (nav bar then hides).
+        st.open_folder(outside.clone());
+        assert!(
+            st.archive_mount.is_none(),
+            "leaving the archive's tree must clear the stale mount"
+        );
+
+        std::fs::remove_dir_all(&mount).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 }
 
