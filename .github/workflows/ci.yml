@@ -40,34 +40,48 @@ jobs:
   screenshots:
     name: GUI screenshots (artifact)
     runs-on: ubuntu-latest
-    # Best-effort visual artifacts via software-rendered wgpu — a GPU/driver hiccup
-    # must never block the PR, so the job is allowed to fail.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
-      # Same build deps + a software Vulkan implementation (Mesa lavapipe) so
-      # egui_kittest's wgpu backend can render with no real GPU.
+      # Build deps + a software Vulkan stack: the loader (libvulkan1), Mesa
+      # lavapipe (the CPU ICD egui_kittest's wgpu backend renders with), and
+      # vulkan-tools for the diagnostic below. The loader auto-discovers the
+      # lavapipe ICD from /usr/share/vulkan/icd.d — so we must NOT pin
+      # VK_ICD_FILENAMES (a wrong path disables discovery) or WGPU_BACKEND
+      # (kittest already prefers any CPU adapter, Vulkan or GL).
       - name: Install system dependencies + software Vulkan (lavapipe)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev libssl-dev xvfb \
-            mesa-vulkan-drivers vulkan-tools
+            libvulkan1 mesa-vulkan-drivers vulkan-tools
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # Force the lavapipe (software) Vulkan ICD; render the chrome screenshots
-      # into target/gui-screenshots/. The wgpu deps the gui-screenshots feature
-      # pulls are pinned in the committed lockfile, so --locked is reproducible.
+      # Diagnostic: prove a software adapter (lavapipe) is visible. Non-fatal.
+      - name: Vulkan adapter info
+        run: xvfb-run -a vulkaninfo --summary || true
+
+      # Compile the screenshot test separately so a real build break still fails
+      # the job (the render step below is deliberately best-effort).
+      - name: Build screenshot renderer
+        run: cargo test --locked --features gui-screenshots --no-run
+
+      # Render the chrome screenshots into target/gui-screenshots/. Best-effort:
+      # a software-GPU hiccup emits a warning but does NOT fail the job, so this
+      # artifact job never red-Xes a PR. Artifacts appear when rendering works.
       - name: Render GUI screenshots
         env:
-          WGPU_BACKEND: vulkan
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          RUST_BACKTRACE: "1"
           LIBGL_ALWAYS_SOFTWARE: "1"
-        run: xvfb-run -a cargo test --locked --features gui-screenshots gui_screenshots -- --nocapture
+        run: |
+          xvfb-run -a cargo test --locked --features gui-screenshots gui_screenshots -- --nocapture \
+            || echo "::warning::GUI screenshot render failed (non-fatal) — see log above"
+
+      - name: List rendered screenshots
+        run: ls -la target/gui-screenshots/ 2>/dev/null || echo "no screenshots produced"
 
       - name: Upload screenshots
         if: always()
