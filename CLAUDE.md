@@ -450,7 +450,10 @@ rematch**, and the *order* of all of it is user-controlled.
   zoom gesture, or any key press) finishes the playback instantly (`pos=len`, `playing=
   false`) and clears `play_autoscroll` so the user can scroll/pan the full art; that
   input's own nav action is suppressed for the frame. The viewer also scrolls a long file
-  with **Up/Down arrows** (Left/Right stay prev/next image), alongside the wheel.
+  with **Up/Down arrows** (Left/Right stay prev/next image), alongside the wheel, plus
+  **Home/End** (top/bottom) and **PageUp/PageDown** — a page is **25 character rows** for
+  text-mode art (an old 80×25 DOS screen: `25 · textmode_cell.h · scale.y`), else ~90% of
+  the viewport for raster. All gated on `overflow_y` and re-clamped to the pan bounds.
 - **Slideshow** (`auto_next` + `auto_next_secs` 1/3/5/10s, status bar, persisted). In the
   single view, once the file has *settled* (any baud transmission finished — `Player.playing`
   is the "busy" gate) and the delay elapses, `ui_single` steps to the next file. Dwell

@@ -6893,10 +6893,15 @@ impl PixelView {
         // Up/Down arrows scroll a long file (Left/Right are prev/next). Auto-repeat while
         // held; one keypress nudges ~⅛ of the viewport. Only when there's overflow to pan.
         if overflow_y {
-            let (up, down) = ui.input(|i| {
+            let (up, down, home, end, pgup, pgdn) = ui.input(|i| {
+                use egui::Key::*;
                 (
-                    i.key_pressed(egui::Key::ArrowUp),
-                    i.key_pressed(egui::Key::ArrowDown),
+                    i.key_pressed(ArrowUp),
+                    i.key_pressed(ArrowDown),
+                    i.key_pressed(Home),
+                    i.key_pressed(End),
+                    i.key_pressed(PageUp),
+                    i.key_pressed(PageDown),
                 )
             });
             let step = resp.rect.height() * 0.125;
@@ -6905,6 +6910,31 @@ impl PixelView {
             }
             if up {
                 self.offset.y += step;
+            }
+            // Home/End jump to top/bottom; PageUp/PageDown move a "page" — 25 character
+            // rows for scene art (an old 80×25 DOS screen), else ~a screenful for raster.
+            // (+offset.y = toward the top; the clamp below keeps it in bounds.)
+            let page = if self.viewing_textmode {
+                let cell_h = self
+                    .full_tex
+                    .as_ref()
+                    .map(|(p, _)| textmode_cell(p).1)
+                    .unwrap_or(16);
+                25.0 * cell_h as f32 * scale.y
+            } else {
+                resp.rect.height() * 0.9
+            };
+            if home {
+                self.offset.y = oy_max;
+            }
+            if end {
+                self.offset.y = -oy_max;
+            }
+            if pgdn {
+                self.offset.y -= page;
+            }
+            if pgup {
+                self.offset.y += page;
             }
         }
         // Baud playback: keep the typing cursor at the bottom of the viewport so a long
@@ -11401,7 +11431,9 @@ const HOTKEYS: &[(&str, &str)] = &[
         "Mouse Back / Fwd",
         "Grid: folder history · Viewer: prev / next image",
     ),
-    ("Home / End", "Grid: select first / last"),
+    ("Home / End", "Grid: first / last · Viewer: scroll to top / bottom"),
+    ("PageUp / PageDown", "Viewer: scroll 25 lines (a screen of scene art)"),
+    ("Arrow Up / Down", "Viewer: scroll a long image"),
     ("/", "Grid: filter by filename"),
     ("Drag", "Pan the image"),
     ("F", "Fit to window + auto-fit new images (viewer)"),
