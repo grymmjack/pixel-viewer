@@ -406,9 +406,14 @@ rematch**, and the *order* of all of it is user-controlled.
   is transient). Both persist (`TEXTMODE_ZOOM_KEY`). `viewing_textmode` tracks the kind.
 - **CRT aspect** (`crt_aspect`, `CRT_ASPECT_KEY`, **off by default**) is a viewer-only
   toggle shown in the status bar **only for text-mode art**: it stretches the blit
-  ≈1.2× vertically (an 80×25 8×16 grid → 4:3) to match non-square VGA pixels — snapped
-  to an integer device-pixel scale (see below), so it lands near 1.2× while staying
-  crisp. It's a *display* scale, not a zoom change, and never touches the texture. The
+  ≈1.2× vertically (an 80×25 8×16 grid → 4:3) to match non-square VGA pixels. **X stays
+  pixel-perfect** (integer device-px, for dither crispness); **Y is the CRT stretch** —
+  `ny = round(nx·aspect_y)` *when that's still visibly taller than nx* (high zoom →
+  uniform & crisp), else the **exact fractional** `nx·aspect_y` (low zoom). The exact
+  fallback matters: a fit-to-screen tall ANSI sits at nx≈1–2, where `round(2·1.2)=2`
+  **erased** the stretch — the main view looked unchanged on toggle while the
+  linear-sampled previews (continuous 1.2×) did change. It's a *display* scale, not a zoom
+  change, and never touches the texture. The
   **navigator minimap, Recolor preview and Details thumbnail all apply the same
   `aspect_y`** so every rendering of the open image agrees (the minimap used to stay
   native → looked squished next to the stretched main view + previews). The previews also

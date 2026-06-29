@@ -6828,7 +6828,15 @@ impl PixelView {
         // warp the dither. `self.zoom` is re-aligned to the value we can show crisply.
         let scale = if pixel_perfect {
             let nx = (self.zoom * ppp).round().max(1.0); // device px per source px, X
-            let ny = (self.zoom * aspect_y * ppp).round().max(1.0); // …Y
+            // Keep X pixel-perfect for dither crispness. For Y, *rounding* the CRT's ≈1.2×
+            // to whole device pixels makes it vanish at low zoom (round(2·1.2)=2, no change
+            // — why the main view "didn't update" on a fit-to-screen tall ANSI while the
+            // linear-sampled previews did). So round Y when that still leaves a visible
+            // stretch (high zoom → uniform & crisp), but fall back to the exact fractional
+            // ratio when rounding would erase it (low zoom → the stretch always shows).
+            // aspect_y == 1.0 → ny == nx, so a non-CRT image stays perfectly crisp.
+            let ny_round = (nx * aspect_y).round().max(1.0);
+            let ny = if ny_round > nx { ny_round } else { nx * aspect_y }; // …Y
             self.zoom = nx / ppp; // idempotent: round((nx/ppp)·ppp) == nx
             egui::vec2(nx / ppp, ny / ppp)
         } else {
