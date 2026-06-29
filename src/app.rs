@@ -896,15 +896,18 @@ pub struct PixelView {
     black_bg: bool,         // fill the viewer background black instead of dark grey (persisted)
     // Metadata OSD: a fading info overlay shown on each newly opened image.
     osd_enabled: bool,  // show the OSD at all (persisted)
-    osd_position: u8,   // 0 = top, 1 = bottom (persisted)
+    osd_position: u8,   // anchor 0..=7: TL,T,TR,L,R,BL,B,BR (3×3 grid, no center) (persisted)
     osd_secs: f32,      // how long it holds at full opacity before fading (persisted)
     osd_t: f32,         // animation clock since the current image opened (runtime)
     osd_rect: Option<egui::Rect>,        // last-painted OSD bounds (for hover-to-pin)
     osd_links: Vec<(egui::Rect, PathBuf)>, // clickable field rects → open_folder target
+    osd_close: Option<egui::Rect>,       // the [×] dismiss button's last-painted rect
+    osd_dismissed: bool, // [×] clicked → hide the OSD for *this* image (reset on next load)
     scanline_tex: Option<egui::TextureHandle>, // lazily-built 1×3 scanline pattern
     auto_next: bool,        // slideshow: auto-advance to the next file after a delay (persisted)
     auto_next_secs: u8,     // slideshow delay in seconds: 1/3/5/10 (persisted)
     auto_next_dwell: f32,   // slideshow: seconds the current (settled) file has been shown
+    auto_paused: bool,      // slideshow paused by a user interaction (scroll/key/drag); not persisted
     immersive: bool,        // F11 fullscreen: hide all bars/UI, show only the art
     idle_t: f32,            // seconds of mouse stillness (immersive cursor auto-hide)
     shuffle: bool,          // screensaver: at a pack's end, load another random pack (persisted)
@@ -1229,7 +1232,7 @@ impl PixelView {
         let crt_scanline_scale = get_bool(Self::CRT_SCANLINE_SCALE_KEY).unwrap_or(true);
         let black_bg = get_bool(Self::BLACK_BG_KEY).unwrap_or(true);
         let osd_enabled = get_bool(Self::OSD_ENABLED_KEY).unwrap_or(true);
-        let osd_position = get_u8(Self::OSD_POSITION_KEY).unwrap_or(0).min(1);
+        let osd_position = get_u8(Self::OSD_POSITION_KEY).unwrap_or(1).min(7);
         let osd_secs = cc
             .storage
             .and_then(|s| eframe::get_value::<f32>(s, Self::OSD_SECS_KEY))
@@ -1464,12 +1467,15 @@ impl PixelView {
             osd_t: f32::INFINITY, // start hidden until the first image opens
             osd_rect: None,
             osd_links: Vec::new(),
+            osd_close: None,
+            osd_dismissed: false,
             glow,
             glow_amt,
             scanline_tex: None,
             auto_next,
             auto_next_secs,
             auto_next_dwell: 0.0,
+            auto_paused: false,
             immersive: false,
             idle_t: 0.0,
             shuffle,
@@ -2882,6 +2888,8 @@ impl PixelView {
         // Opening an image in the viewer counts as a view (bumps its count + last-viewed).
         self.mark_viewed(&path);
         self.osd_t = 0.0; // restart the metadata OSD fade-in for the new image
+        self.osd_dismissed = false; // a fresh image un-hides the OSD ([×] is per-view only)
+        let _ = self.cached_sauce(&path); // populate SAUCE (columns/lines/font/comment) for the OSD
         // `path` is the display identity (kept for stepping/ratings/full_tex keys); a
         // downloaded 16colo piece reads its bytes from the local cache file instead.
         let src = self.resolve_local(&path);
@@ -3846,7 +3854,11 @@ impl PixelView {
         // file so the Details panel works for an opened piece. (Un-opened pieces get
         // their SAUCE pre-seeded into this same cache from the 16colo API.)
         let real = self.colo_files.get(path).map_or(path, |p| p.as_path());
-        let parsed = read_file_tail(real, 128).and_then(|t| crate::sauce::parse(&t));
+        // Read enough tail to include the COMNT block, which sits *before* the 128-byte
+        // record (up to 255 lines × 64 + "COMNT"); else `sauce::parse` can't recover the
+        // comment/description. ~16 KB covers any valid block + the record + stray EOL.
+        const SAUCE_TAIL: u64 = 5 + 255 * 64 + 128 + 16;
+        let parsed = read_file_tail(real, SAUCE_TAIL).and_then(|t| crate::sauce::parse(&t));
         self.sauce_cache.insert(path.to_path_buf(), parsed.clone());
         parsed
     }
@@ -5167,6 +5179,7 @@ impl PixelView {
         let mut pin_dir: Option<usize> = None; // "Pin to Places" on a folder tile
         let mut smart_on: Option<(usize, SmartCriterion)> = None; // "Smart filter on…"
         let mut toggle_viewed: Option<(usize, bool)> = None; // "Mark as (not) viewed"
+        let mut rate_to: Option<(usize, u8)> = None; // "Rating ▸ N" context-menu choice
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // 16colo download (idx, want_pack)
         let can_paste = self.clipboard.is_some();
@@ -5459,6 +5472,7 @@ impl PixelView {
                                     TilePick::File(a) => ctx_action = Some((idx, a)),
                                     TilePick::ToggleViewed(b) => toggle_viewed = Some((idx, b)),
                                     TilePick::Download(pack) => dl = Some((idx, pack)),
+                                    TilePick::Rate(stars) => rate_to = Some((idx, stars)),
                                 }
                             }
                         });
@@ -5516,6 +5530,9 @@ impl PixelView {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
                 self.set_viewed(&p, b);
             }
+        }
+        if let Some((idx, stars)) = rate_to {
+            self.rate_entry(idx, stars);
         }
         if pin_current {
             self.pin_current_folder();
@@ -5744,6 +5761,7 @@ impl PixelView {
         let mut pin_dir: Option<usize> = None;
         let mut smart_on: Option<(usize, SmartCriterion)> = None;
         let mut toggle_viewed: Option<(usize, bool)> = None; // "Mark as (not) viewed"
+        let mut rate_to: Option<(usize, u8)> = None; // "Rating ▸ N" context-menu choice
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // (idx, want_pack)
         let mut colo_link: Option<(usize, ColKind)> = None; // pack/year/group link click
@@ -6159,6 +6177,7 @@ impl PixelView {
                                 TilePick::File(a) => ctx_action = Some((idx, a)),
                                 TilePick::ToggleViewed(b) => toggle_viewed = Some((idx, b)),
                                 TilePick::Download(pack) => dl = Some((idx, pack)),
+                                TilePick::Rate(stars) => rate_to = Some((idx, stars)),
                             }
                         }
                     });
@@ -6265,6 +6284,9 @@ impl PixelView {
                 self.set_viewed(&p, b);
             }
         }
+        if let Some((idx, stars)) = rate_to {
+            self.rate_entry(idx, stars);
+        }
         if pin_current {
             self.pin_current_folder();
         }
@@ -6346,6 +6368,24 @@ impl PixelView {
             }
             self.play_autoscroll = None; // release the cursor-follow so the user can scroll
         }
+
+        // Auto-pause: while the slideshow is running, any deliberate user interaction
+        // (scroll, zoom, key, or a drag-to-pan) hands control back — pause auto-advance
+        // and flag it (the status-bar "auto ▶" turns yellow). Passive mouse *movement*
+        // is intentionally excluded so a hands-off screensaver isn't paused by a nudge.
+        if self.auto_next && !self.auto_paused {
+            let touched = ctx.input(|i| {
+                i.smooth_scroll_delta != egui::Vec2::ZERO
+                    || (i.zoom_delta() - 1.0).abs() > 0.001
+                    || i.pointer.is_decidedly_dragging()
+                    || i.events
+                        .iter()
+                        .any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+            });
+            if touched {
+                self.auto_paused = true;
+            }
+        }
         if self.rebinding.is_none() && !interrupt {
             if prev {
                 self.step_image(ctx, false);
@@ -6370,7 +6410,7 @@ impl PixelView {
         // Slideshow: auto-advance to the next file after it has "settled" (a baud
         // transmission, if any, finished typing) plus the chosen delay — great for
         // flipping through a whole pack hands-free.
-        if self.auto_next && self.path_edit.is_none() && self.rebinding.is_none() {
+        if self.auto_next && !self.auto_paused && self.path_edit.is_none() && self.rebinding.is_none() {
             let busy = self.player.as_ref().is_some_and(|p| p.playing);
             if busy {
                 self.auto_next_dwell = 0.0; // wait for the art to finish drawing
@@ -6979,20 +7019,39 @@ impl PixelView {
         }
 
         // Metadata OSD: fade in on a freshly opened image, hold, fade out — but hovering
-        // it pins it open, and clicking a field (path / artist / pack / group / year)
-        // jumps there. Hover + clicks hit-test against last frame's rect/links.
+        // it (even mid-fade-out) pins it open at full opacity, and clicking a field
+        // (path / artist / pack / group / year) jumps there. Use `hover_pos` (not just
+        // `interact_pos`) so *passive* hovering — no button held — re-pins it too, which
+        // is what makes catching it during the fade-out reliable. Hit-tests against last
+        // frame's rect/links; the only ways out are the [×] or letting it fade un-hovered.
         const FADE_IN: f32 = 0.35;
         const FADE_OUT: f32 = 0.7;
-        if self.osd_enabled {
-            let pointer = ui.input(|i| i.pointer.interact_pos());
+        if self.osd_enabled && !self.osd_dismissed {
+            let pointer = ui.input(|i| i.pointer.hover_pos().or(i.pointer.interact_pos()));
             let over = self.osd_rect.zip(pointer).is_some_and(|(r, p)| r.contains(p));
             if over {
                 self.osd_t = FADE_IN; // pin at full opacity while hovered
                 self.want_repaint = true;
+                // Hovering the OSD counts as taking control: pause the slideshow.
+                if self.auto_next {
+                    self.auto_paused = true;
+                }
                 if let Some(p) = pointer {
-                    if let Some(target) =
-                        self.osd_links.iter().find(|(r, _)| r.contains(p)).map(|(_, t)| t.clone())
-                    {
+                    let on_close = self.osd_close.is_some_and(|r| r.contains(p));
+                    let link = (!on_close)
+                        .then(|| self.osd_links.iter().find(|(r, _)| r.contains(p)).map(|(_, t)| t.clone()))
+                        .flatten();
+                    if on_close {
+                        // [×] dismisses the OSD for this image only (load_full re-shows it).
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        if ui.input(|i| i.pointer.primary_clicked()) {
+                            self.osd_dismissed = true;
+                            self.osd_rect = None;
+                            self.osd_links.clear();
+                            self.osd_close = None;
+                            return advance;
+                        }
+                    } else if let Some(target) = link {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         if ui.input(|i| i.pointer.primary_clicked()) {
                             self.open_folder(target); // local dir or 16colo virtual path
@@ -7021,82 +7080,126 @@ impl PixelView {
                     .map(|(p, _)| p.clone())
                     .or_else(|| self.entries.get(self.selected).map(|e| e.path.clone()));
                 if let Some(p) = p {
-                    let (rect, links) =
+                    let (rect, links, close) =
                         self.paint_osd(&painter, resp.rect, alpha, &p, over.then_some(pointer).flatten());
                     self.osd_rect = Some(rect);
                     self.osd_links = links;
+                    self.osd_close = Some(close);
                 }
                 self.want_repaint = true;
             } else {
                 self.osd_rect = None;
                 self.osd_links.clear();
+                self.osd_close = None;
             }
+        } else {
+            self.osd_rect = None;
+            self.osd_links.clear();
+            self.osd_close = None;
         }
         advance
     }
 
-    /// The metadata OSD's fields for `path`: `(label, value, near-white hue, link)`. The
-    /// first field (empty label) is the headline name/title. 16colo.rs pieces show SAUCE
-    /// title / artist / group / pack / year; local files show name / path / type / size /
-    /// dimensions / colors / created. Both end with a ★ rating. `link` (when `Some`) is a
-    /// path the field jumps to on click: a local directory, or a 16colo artist / group /
-    /// pack / year virtual path.
+    /// The metadata OSD's content for `path`: the headline `title` + hue, then a list of
+    /// `(gap_before, fields)` **rows** (each field `(label, value, hue, link)`; a one-field
+    /// row reads as its own line, a multi-field row flows). 16colo.rs pieces: artist line,
+    /// SAUCE-comment line, then an attribute row (type/columns/lines/font/group/pack/year/
+    /// ★). Local files: path line, optional comment, then type/size/dimensions/colors/
+    /// created/★. `link` jumps to a local directory or a 16colo artist/group/pack/year path.
     #[allow(clippy::type_complexity)]
-    fn osd_lines(&self, path: &Path) -> Vec<(&'static str, String, [u8; 3], Option<PathBuf>)> {
+    fn osd_content(
+        &self,
+        path: &Path,
+    ) -> (String, [u8; 3], Vec<(f32, Vec<(&'static str, String, [u8; 3], Option<PathBuf>)>)>) {
         use crate::sixteen::{ARTISTS, GROUPS, ROOT};
-        let mut v: Vec<(&'static str, String, [u8; 3], Option<PathBuf>)> = Vec::new();
+        type Field = (&'static str, String, [u8; 3], Option<PathBuf>);
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("?")
             .to_string();
+        let sauce = self.sauce_cache.get(path).and_then(|s| s.clone());
+        let comment = sauce
+            .as_ref()
+            .map(|s| s.comment.trim().to_string())
+            .filter(|c| !c.is_empty());
+        let rating = self.read_rating(path);
+        let mut rows: Vec<(f32, Vec<Field>)> = Vec::new();
+
         if let Some(piece) = self.colo_pieces.get(path) {
             let root = Path::new(ROOT);
-            let title = self
-                .sauce_cache
-                .get(path)
-                .and_then(|s| s.as_ref())
+            let title = sauce
+                .as_ref()
                 .map(|s| s.title.trim().to_string())
-                .filter(|t| !t.is_empty());
-            v.push(("", title.clone().unwrap_or_else(|| name.clone()), [255, 246, 232], None));
-            if title.is_some() {
-                v.push(("File", name.clone(), [228, 228, 234], None));
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| name.clone());
+            // A collab piece lists several artists (`", "`-joined); give each its own
+            // link so any one can be opened. One field per artist flows `a · b · c`.
+            let artists: Vec<Field> = piece
+                .artist
+                .split(',')
+                .map(|a| a.trim())
+                .filter(|a| !a.is_empty())
+                .map(|a| ("", a.to_string(), [150, 222, 255], Some(root.join(ARTISTS).join(a))))
+                .collect();
+            if !artists.is_empty() {
+                rows.push((7.0, artists));
             }
-            if !piece.artist.is_empty() {
-                let link = root.join(ARTISTS).join(&piece.artist);
-                v.push(("Artist", piece.artist.clone(), [206, 238, 255], Some(link)));
+            if let Some(c) = &comment {
+                rows.push((9.0, vec![("", c.clone(), [205, 205, 214], None)]));
+            }
+            let mut attrs: Vec<Field> = Vec::new();
+            // Keep the filename visible when the headline is a distinct SAUCE title.
+            if title != name {
+                attrs.push(("File", name.clone(), [228, 228, 234], None));
+            }
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_uppercase();
+            if !ext.is_empty() {
+                attrs.push(("Type", ext, [210, 236, 255], None));
+            }
+            if let Some(s) = &sauce {
+                if s.tinfo1 > 0 {
+                    attrs.push(("Columns", s.tinfo1.to_string(), [255, 236, 210], None));
+                }
+                if s.tinfo2 > 0 {
+                    attrs.push(("Lines", s.tinfo2.to_string(), [236, 255, 210], None));
+                }
+                if !s.font.trim().is_empty() {
+                    attrs.push(("Font", s.font.trim().to_string(), [236, 222, 255], None));
+                }
             }
             if !piece.group.is_empty() {
-                let link = root.join(GROUPS).join(&piece.group);
-                v.push(("Group", piece.group.clone(), [240, 222, 255], Some(link)));
+                attrs.push(("Group", piece.group.clone(), [240, 222, 255], Some(root.join(GROUPS).join(&piece.group))));
             }
             if !piece.pack.is_empty() {
-                let link = root.join(piece.year.to_string()).join(&piece.pack);
-                v.push(("Pack", piece.pack.clone(), [218, 255, 224], Some(link)));
+                attrs.push(("Pack", piece.pack.clone(), [218, 255, 224], Some(root.join(piece.year.to_string()).join(&piece.pack))));
             }
-            let year_link = root.join(piece.year.to_string());
-            v.push(("Year", piece.year.to_string(), [255, 250, 210], Some(year_link)));
+            attrs.push(("Year", piece.year.to_string(), [255, 250, 210], Some(root.join(piece.year.to_string()))));
+            if rating > 0 {
+                attrs.push(("Rating", "★".repeat(rating as usize), [255, 210, 96], None));
+            }
+            rows.push((11.0, attrs));
+            (title, [255, 246, 232], rows)
         } else {
-            v.push(("", name.clone(), [255, 246, 232], None));
             if let Some(parent) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-                v.push((
-                    "Path",
+                rows.push((7.0, vec![(
+                    "",
                     elide(&parent.display().to_string(), 64),
-                    [226, 226, 234],
+                    [205, 205, 214],
                     Some(parent.to_path_buf()),
-                ));
+                )]));
             }
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_ascii_uppercase();
+            if let Some(c) = &comment {
+                rows.push((9.0, vec![("", c.clone(), [205, 205, 214], None)]));
+            }
+            let mut attrs: Vec<Field> = Vec::new();
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_uppercase();
             if !ext.is_empty() {
-                v.push(("Type", ext, [210, 236, 255], None));
+                attrs.push(("Type", ext, [210, 236, 255], None));
             }
             let entry = self.entries.iter().find(|e| e.path == path);
             if let Some(sz) = entry.map(|e| e.size).filter(|&s| s > 0) {
-                v.push(("Size", human_size(sz), [255, 234, 222], None));
+                attrs.push(("Size", human_size(sz), [255, 234, 222], None));
             }
             if let Some((w, h)) = self
                 .full_tex
@@ -7104,27 +7207,28 @@ impl PixelView {
                 .filter(|(fp, _)| fp == path)
                 .map(|(_, tt)| (tt.size[0], tt.size[1]))
             {
-                v.push(("Dimensions", format!("{w} × {h}"), [222, 255, 236], None));
+                attrs.push(("Dimensions", format!("{w} × {h}"), [222, 255, 236], None));
             }
             if let Some(c) = self.img_meta.get(path).and_then(|m| m.colors) {
-                v.push(("Colors", c.to_string(), [244, 226, 255], None));
+                attrs.push(("Colors", c.to_string(), [244, 226, 255], None));
             }
             if let Some(t) = entry.and_then(|e| e.ctime) {
-                v.push(("Created", fmt_time(t), [255, 248, 214], None));
+                attrs.push(("Created", fmt_time(t), [255, 248, 214], None));
             }
+            if rating > 0 {
+                attrs.push(("Rating", "★".repeat(rating as usize), [255, 210, 96], None));
+            }
+            rows.push((9.0, attrs));
+            (name, [255, 246, 232], rows)
         }
-        let r = self.read_rating(path);
-        if r > 0 {
-            v.push(("Rating", "★".repeat(r as usize), [255, 210, 96], None));
-        }
-        v
     }
 
-    /// Paint the fading metadata OSD and return its bounds + the clickable field rects
-    /// (value → `open_folder` target). Line 1 is the name/title, larger + faux-bold; the
-    /// rest flow left-to-right as a wide bar (label dim, value in its hue, ` · ` separators,
-    /// wrapping only on overflow). `pointer` (when the OSD is hovered) underlines the link
-    /// the cursor is over. Colors fade by scaling each one's alpha.
+    /// Paint the fading metadata OSD and return `(bounds, link rects, close-button rect)`.
+    /// Line 1 is the name/title (larger + faux-bold); below it the artist, comment, and a
+    /// flowing attribute row, each section gapped. Links open their `open_folder` target; the
+    /// top-right `×` dismisses the OSD for this view. `pointer` (when hovered) underlines the
+    /// link / highlights the `×` under the cursor. `osd_position` anchors the bar top / bottom
+    /// (h-centered) or left / right (v-centered). Colors fade by scaling each one's alpha.
     fn paint_osd(
         &self,
         painter: &egui::Painter,
@@ -7132,10 +7236,10 @@ impl PixelView {
         alpha: f32,
         path: &Path,
         pointer: Option<egui::Pos2>,
-    ) -> (egui::Rect, Vec<(egui::Rect, PathBuf)>) {
-        let fields = self.osd_lines(path);
-        if fields.is_empty() {
-            return (egui::Rect::NOTHING, Vec::new());
+    ) -> (egui::Rect, Vec<(egui::Rect, PathBuf)>, egui::Rect) {
+        let (title, title_c, rows) = self.osd_content(path);
+        if title.is_empty() && rows.is_empty() {
+            return (egui::Rect::NOTHING, Vec::new(), egui::Rect::NOTHING);
         }
         let av = |base: f32| (base * alpha).clamp(0.0, 255.0) as u8;
         let hue = |c: [u8; 3]| egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], av(255.0));
@@ -7144,58 +7248,90 @@ impl PixelView {
         let sep_col = egui::Color32::from_rgba_unmultiplied(120, 120, 132, av(170.0));
         let header_font = egui::FontId::proportional(18.0);
         let body_font = egui::FontId::proportional(14.0);
-        let (pad, lv_gap, line_h, margin, head_gap) = (12.0_f32, 4.0_f32, 20.0_f32, 16.0_f32, 3.0_f32);
+        let (pad, lv_gap, line_h, margin) = (12.0_f32, 4.0_f32, 20.0_f32, 16.0_f32);
         let max_w = (viewport.width() - 2.0 * (margin + pad)).max(160.0);
 
         // Line 1: the name/title (larger; faux-bold via a 0.7px double-draw).
-        let (_, name, name_c, _) = &fields[0];
-        let header = painter.layout_no_wrap(name.clone(), header_font, hue(*name_c));
+        let header = painter.layout_no_wrap(title.clone(), header_font, hue(title_c));
         let header_h = header.size().y;
         let mut content_w = header.size().x + 0.7;
 
-        // The rest flow horizontally, starting on the row below the header.
+        // Each row sits below the header, separated by its own `gap`. A one-field row
+        // (artist / comment / path) reads as its own line; a multi-field row flows
+        // `label value · label value …`, wrapping when it would overrun `max_w`.
         let sep = painter.layout_no_wrap("   ·   ".to_string(), body_font.clone(), sep_col);
         let sep_w = sep.size().x;
-        let flow_y0 = header_h + head_gap;
         let mut placed: Vec<(egui::Pos2, std::sync::Arc<egui::Galley>)> = Vec::new();
         let mut links_rel: Vec<(egui::Rect, PathBuf)> = Vec::new();
-        let (mut x, mut y) = (0.0_f32, flow_y0);
-        for (label, value, c, link) in &fields[1..] {
-            let lg = (!label.is_empty())
-                .then(|| painter.layout_no_wrap(label.to_string(), body_font.clone(), label_col));
-            let vg = painter.layout_no_wrap(value.clone(), body_font.clone(), hue(*c));
-            let group_w = lg.as_ref().map_or(0.0, |g| g.size().x + lv_gap) + vg.size().x;
-            if x > 0.0 {
-                if x + sep_w + group_w > max_w {
-                    y += line_h;
-                    x = 0.0;
-                } else {
-                    placed.push((egui::pos2(x, y), sep.clone()));
-                    x += sep_w;
+        let mut y = header_h;
+        for (gap, fields) in &rows {
+            if fields.is_empty() {
+                continue;
+            }
+            y += gap;
+            let mut x = 0.0_f32;
+            for (label, value, c, link) in fields {
+                let lg = (!label.is_empty())
+                    .then(|| painter.layout_no_wrap(label.to_string(), body_font.clone(), label_col));
+                let vg = painter.layout_no_wrap(value.clone(), body_font.clone(), hue(*c));
+                let group_w = lg.as_ref().map_or(0.0, |g| g.size().x + lv_gap) + vg.size().x;
+                if x > 0.0 {
+                    if x + sep_w + group_w > max_w {
+                        y += line_h;
+                        x = 0.0;
+                    } else {
+                        placed.push((egui::pos2(x, y), sep.clone()));
+                        x += sep_w;
+                    }
                 }
+                if let Some(lg) = lg {
+                    placed.push((egui::pos2(x, y), lg.clone()));
+                    x += lg.size().x + lv_gap;
+                }
+                if let Some(t) = link {
+                    let r = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(vg.size().x, line_h));
+                    links_rel.push((r, t.clone()));
+                }
+                placed.push((egui::pos2(x, y), vg.clone()));
+                x += vg.size().x;
+                content_w = content_w.max(x);
             }
-            if let Some(lg) = lg {
-                placed.push((egui::pos2(x, y), lg.clone()));
-                x += lg.size().x + lv_gap;
-            }
-            if let Some(t) = link {
-                let r = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(vg.size().x, line_h));
-                links_rel.push((r, t.clone()));
-            }
-            placed.push((egui::pos2(x, y), vg.clone()));
-            x += vg.size().x;
-            content_w = content_w.max(x);
+            y += line_h;
         }
-        let content_h = if fields.len() > 1 { y + line_h } else { header_h };
+        let content_h = y;
+        // Reserve room at the top-right for the [×] dismiss button so it never sits over
+        // the title (rows below are clear of the corner regardless).
+        let close_sz = 16.0_f32;
+        content_w = content_w.max(header.size().x + 0.7 + close_sz + 8.0);
         // Cap to the viewport (long values are clipped rather than overflowing).
         let box_w = (content_w + 2.0 * pad).min(viewport.width() - 2.0 * margin);
         let box_h = content_h + 2.0 * pad;
-        let top = if self.osd_position == 0 {
-            viewport.top() + margin
-        } else {
-            viewport.bottom() - margin - box_h
+        // Anchor at one of the 8 perimeter spots (3×3 grid, center unused). The flat index
+        // decodes to a horizontal third (left / center / right) and vertical third (top /
+        // middle / bottom); each axis resolves independently so e.g. top-left and bottom-right
+        // are both reachable as a single choice.
+        let (hcol, vrow) = match self.osd_position {
+            0 => (0u8, 0u8), // top-left
+            1 => (1, 0),     // top-center
+            2 => (2, 0),     // top-right
+            3 => (0, 1),     // middle-left
+            4 => (2, 1),     // middle-right
+            5 => (0, 2),     // bottom-left
+            6 => (1, 2),     // bottom-center
+            _ => (2, 2),     // bottom-right
         };
-        let left = (viewport.center().x - box_w / 2.0).max(viewport.left() + margin);
+        let left = match hcol {
+            0 => viewport.left() + margin,
+            1 => viewport.center().x - box_w / 2.0,
+            _ => viewport.right() - margin - box_w,
+        };
+        let top = match vrow {
+            0 => viewport.top() + margin,
+            1 => viewport.center().y - box_h / 2.0,
+            _ => viewport.bottom() - margin - box_h,
+        };
+        let left = left.max(viewport.left() + margin);
+        let top = top.max(viewport.top() + margin);
         let rect = egui::Rect::from_min_size(egui::pos2(left, top), egui::vec2(box_w, box_h));
         painter.rect_filled(rect, 8.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, av(190.0)));
         painter.rect_stroke(
@@ -7226,7 +7362,24 @@ impl PixelView {
             }
             links.push((abs, t));
         }
-        (rect, links)
+
+        // Top-right [×] dismiss button (drawn last, unclipped, so it's always crisp on top).
+        let close_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - pad - close_sz, rect.top() + pad * 0.5),
+            egui::vec2(close_sz, close_sz),
+        );
+        let close_hover = pointer.is_some_and(|p| close_rect.contains(p));
+        if close_hover {
+            painter.rect_filled(close_rect, 3.0, white(45.0));
+        }
+        painter.text(
+            close_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "×",
+            egui::FontId::proportional(16.0),
+            white(if close_hover { 255.0 } else { 165.0 }),
+        );
+        (rect, links, close_rect)
     }
 
     /// Apply a click with modifiers: Ctrl toggles, Shift range-selects, plain
@@ -7284,14 +7437,18 @@ impl PixelView {
                 .map(|e| vec![e.path.clone()])
                 .unwrap_or_default(),
             Mode::Grid => {
-                if self.selection.is_empty() {
-                    self.hovered
-                        .and_then(|i| self.entries.get(i))
-                        .filter(|e| !e.is_dir)
-                        .map(|e| vec![e.path.clone()])
-                        .unwrap_or_default()
-                } else {
-                    self.selection.iter().cloned().collect()
+                // The tile under the cursor wins when it isn't part of the selection —
+                // so "point at a piece and press 3" rates *that* piece, even if an
+                // earlier-opened one is still selected (the 16colo flat-listing case).
+                // Hovering one of the selected tiles still rates the whole selection.
+                let hovered_path = self
+                    .hovered
+                    .and_then(|i| self.entries.get(i))
+                    .filter(|e| !e.is_dir)
+                    .map(|e| e.path.clone());
+                match hovered_path {
+                    Some(p) if !self.selection.contains(&p) => vec![p],
+                    _ => self.selection.iter().cloned().collect(),
                 }
             }
         };
@@ -7309,6 +7466,25 @@ impl PixelView {
             self.rebuild_view();
             self.status = format!("Rated {n}: {}", stars_label(stars));
         }
+    }
+
+    /// Set one entry's rating from the context-menu "Rating ▸" submenu (files only),
+    /// mirroring the hotkey path: write through to xattr/sidecar, update the model, refresh.
+    fn rate_entry(&mut self, idx: usize, stars: u8) {
+        let Some(path) = self
+            .entries
+            .get(idx)
+            .filter(|e| !e.is_dir)
+            .map(|e| e.path.clone())
+        else {
+            return;
+        };
+        self.set_rating(&path, stars);
+        if let Some(e) = self.all_entries.iter_mut().find(|e| e.path == path) {
+            e.rating = stars;
+        }
+        self.rebuild_view();
+        self.status = format!("Rated: {}", stars_label(stars));
     }
 
     /// Bottom status bar: counts + total size, and the current selection.
@@ -7517,15 +7693,26 @@ impl PixelView {
                         ui.checkbox(&mut self.black_bg, "black bg")
                             .on_hover_text("Fill the viewer background black (off = dark grey)");
                         // Slideshow: auto-advance through the folder, with a delay picker.
+                        // When a user interaction has paused it, the label goes yellow and a
+                        // click *resumes* (rather than toggling the slideshow off).
                         ui.separator();
-                        if ui
-                            .checkbox(&mut self.auto_next, "auto ▶")
-                            .on_hover_text(
-                                "Auto-advance to the next file after it finishes drawing \
-                                 plus the chosen delay — flip through a whole pack hands-free",
-                            )
-                            .changed()
-                        {
+                        let resumed = self.auto_paused;
+                        let label = if self.auto_paused {
+                            egui::RichText::new("auto ▶").color(egui::Color32::from_rgb(255, 210, 70))
+                        } else {
+                            egui::RichText::new("auto ▶")
+                        };
+                        let hover = if self.auto_paused {
+                            "Slideshow paused — you took control. Click to resume."
+                        } else {
+                            "Auto-advance to the next file after it finishes drawing \
+                             plus the chosen delay — flip through a whole pack hands-free"
+                        };
+                        if ui.checkbox(&mut self.auto_next, label).on_hover_text(hover).changed() {
+                            if resumed {
+                                self.auto_next = true; // clicking while paused resumes, not off
+                            }
+                            self.auto_paused = false;
                             self.auto_next_dwell = 0.0;
                         }
                         egui::ComboBox::from_id_salt("auto_next_secs")
@@ -8632,11 +8819,25 @@ impl eframe::App for PixelView {
                     ui.checkbox(&mut self.osd_enabled, "Show metadata overlay on open")
                         .on_hover_text("A fading panel with the piece's details");
                     ui.add_enabled_ui(self.osd_enabled, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("Position");
-                            ui.selectable_value(&mut self.osd_position, 0, "Top");
-                            ui.selectable_value(&mut self.osd_position, 1, "Bottom");
-                        });
+                        ui.label("Position");
+                        // A spatial 3×3 picker (center unused) — the button's place in the
+                        // grid is where the OSD lands, so a corner is one click.
+                        egui::Grid::new("osd_pos_grid")
+                            .spacing([4.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.selectable_value(&mut self.osd_position, 0, "Top L");
+                                ui.selectable_value(&mut self.osd_position, 1, "Top");
+                                ui.selectable_value(&mut self.osd_position, 2, "Top R");
+                                ui.end_row();
+                                ui.selectable_value(&mut self.osd_position, 3, "Left");
+                                ui.label(""); // center: unused
+                                ui.selectable_value(&mut self.osd_position, 4, "Right");
+                                ui.end_row();
+                                ui.selectable_value(&mut self.osd_position, 5, "Bot L");
+                                ui.selectable_value(&mut self.osd_position, 6, "Bot");
+                                ui.selectable_value(&mut self.osd_position, 7, "Bot R");
+                                ui.end_row();
+                            });
                         ui.add(
                             egui::Slider::new(&mut self.osd_secs, 0.5..=15.0)
                                 .suffix(" s")
@@ -10345,6 +10546,7 @@ enum TilePick {
     File(FileAction),
     ToggleViewed(bool),     // mark this entry viewed (true) / not viewed (false)
     Download(bool),         // save a 16colo piece (false) or its whole pack .zip (true)
+    Rate(u8),               // set this entry's star rating (0 = clear), via the context menu
 }
 
 /// The shared right-click context menu for a browse entry (used by both the grid tile
@@ -10427,6 +10629,29 @@ fn entry_context_menu(
                 on(ui, "SAUCE group", SmartCriterion::Group);
                 on(ui, "SAUCE artist", SmartCriterion::Artist);
             }
+        });
+        ui.separator();
+    }
+    // Star rating (files only) — same effect as the 0-5 hotkeys, shown alongside each
+    // entry, so 16colo pieces (where the keys can be fiddly) are always ratable here.
+    if !entry.is_dir {
+        ui.menu_button("★ Rating", |ui| {
+            let cur = entry.rating;
+            let mut row = |ui: &mut egui::Ui, stars: u8, label: &str, key: &str| {
+                if ui
+                    .add(egui::Button::selectable(cur == stars, label).shortcut_text(key))
+                    .clicked()
+                {
+                    pick = Some(TilePick::Rate(stars));
+                    ui.close();
+                }
+            };
+            row(ui, 0, "Unrated", "0");
+            row(ui, 1, "★", "1");
+            row(ui, 2, "★★", "2");
+            row(ui, 3, "★★★", "3");
+            row(ui, 4, "★★★★", "4");
+            row(ui, 5, "★★★★★", "5");
         });
         ui.separator();
     }

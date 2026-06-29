@@ -295,6 +295,12 @@ map; `load_full` decodes via `resolve_local`, keeping the virtual path as identi
 Per-row ⬇ menu saves the file or its pack `.zip` to disk (`download_piece` → rfd +
 `sixteen::download_to`, reported via `colo_save_rx`). Entering a flat listing auto-switches
 to table view; navigating away (`show_folder`) cancels the stream + clears `colo_pieces`.
+**URL encoding:** the API returns *literal* paths, so a filename with a `#` (e.g.
+`#44_FIRE.ANS`) would truncate every URL at the fragment — leaving the piece
+un-downloadable and its thumbnail spinning forever. `sixteen::enc_path` percent-encodes a
+site path **preserving `/`** (and `abs_url` runs every relative path through it; the
+pack-view `raw_url` `enc()`s the built filename) so `#`→`%23` etc. survive
+(`hash_in_filename_is_percent_encoded_in_urls`).
 
 ## Core invariants (read these before touching the data model)
 
@@ -451,20 +457,43 @@ rematch**, and the *order* of all of it is user-controlled.
   resets on load and while busy. While slideshow is on, RIP + raster (non-text-mode) art
   opens **fit-to-screen** (`load_full` sets `fit_requested`) so it's fully visible; text-mode
   keeps its readable zoom + fit-to-width. Great for flipping through a whole pack hands-free.
-- **Metadata OSD** (`osd_enabled`/`osd_position` top|bottom/`osd_secs`, Preferences →
-  "Viewer info OSD", persisted). `load_full` resets `osd_t=0` so a fading rounded panel
-  appears on each opened image: fade-in (0.35s) → hold (`osd_secs`) → fade-out (0.7s),
-  painted at the end of `draw_image_view` (covers static / player / GIF paths). `osd_lines`
-  builds `(label, value, near-white hue)` per field — 16colo: SAUCE title / artist / group /
-  pack / year; local: name / path / type / size / dimensions / colors / created — both
-  ending in a ★ rating. Line 1 is the **name/title** (larger + faux-bold via a 0.7px
-  double-draw); the rest flow **left-to-right as a wide bar** (label dim, value in its hue,
-  ` · ` separators), wrapping only on overflow. **Interactive:** `paint_osd` returns its
-  rect + clickable value rects (`osd_rect`/`osd_links`), each field carrying an
-  `open_folder` target — a local directory or a 16colo artist/group/pack/year virtual path.
-  `draw_image_view` hit-tests last frame's rect: hovering **pins** it open (`osd_t` reset to
-  the hold, full opacity) and underlines + pointing-hand the link under the cursor; a click
-  navigates there. The panel caps to the viewport width and clips overflow.
+  **Auto-pause** (`auto_paused`, not persisted): while running, any deliberate user
+  interaction in the viewer — scroll, zoom gesture, key press, or a drag-to-pan
+  (`pointer.is_decidedly_dragging()`; passive mouse *movement* is excluded so a hands-off
+  screensaver isn't paused) — sets `auto_paused`, which gates the advance. The status-bar
+  "auto ▶" then renders **yellow** (a `RichText` color) with a "you took control — click to
+  resume" hover; clicking it while paused **resumes** (the checkbox would set `auto_next`
+  false, so the handler forces it back true and clears `auto_paused`) instead of toggling
+  the slideshow off. Pause persists across manual navigation until you click to resume.
+- **Metadata OSD** (`osd_enabled`/`osd_position`/`osd_secs`, Preferences →
+  "Viewer info OSD", persisted). `load_full` resets `osd_t=0` + `osd_dismissed=false` (and
+  primes SAUCE via `cached_sauce`) so a fading rounded panel appears on each opened image:
+  fade-in (0.35s) → hold (`osd_secs`) → fade-out (0.7s), painted at the end of
+  `draw_image_view` (covers static / player / GIF paths). `osd_content` returns a **headline
+  title** + a list of `(gap_before, fields)` **rows** so sections get vertical breathing room:
+  the title (larger + faux-bold via a 0.7px double-draw), then the **artist(s)** on their own
+  line — a collab piece's `", "`-joined `piece.artist` is split so **each artist is its own
+  link** (flows `a · b · c`) — then the **SAUCE comment / description** (the COMNT block on
+  local scene files — `sauce::parse`,
+  which `cached_sauce` reads a ~16 KB tail for since COMNT precedes the 128-byte record; the API
+  `Comments` string on 16colo pieces), then an **attributes** row flowing `label value · …`
+  (type / columns / lines / font / group / pack / year, or local type / size / dimensions /
+  colors / created) — ending in a ★ rating. A one-field row reads as its own line; a
+  multi-field row wraps only on overflow. **Placement** (`osd_position` 0..=7, a spatial 3×3
+  Preferences picker with the center unused): each index decodes to a horizontal third
+  (left/center/right) and vertical third (top/middle/bottom) resolved independently, so any
+  corner or edge-center — top-left, top-right, bottom-left, bottom-right, etc. — is a single
+  choice. **Interactive:** `paint_osd` returns `(rect, link rects, close rect)` —
+  links (`osd_links`) each carry an `open_folder` target (a local directory or a 16colo
+  artist/group/pack/year virtual path), and the top-right **`×`** (`osd_close`) **dismisses the
+  OSD for this view** (`osd_dismissed`, reset on the next `load_full` so it returns on the next
+  image). `draw_image_view` hit-tests last frame's rects (using `hover_pos().or(interact_pos())`
+  so *passive* hovering — no button held — counts, which is what re-pins it reliably **even
+  mid-fade-out**): hovering **pins** it open (`osd_t` reset to the hold, full opacity) **and
+  pauses the slideshow** (`auto_paused`), underlines + pointing-hands the link under the cursor
+  (the `×` takes click priority); a link click navigates there. Once pinned, the only ways out
+  are the `×` or letting it fade un-hovered. The panel caps to the viewport width and clips
+  overflow.
 - **Random-pack screensaver** (`shuffle` + "🔀 Random pack" button, status bar). A worker
   (`start_random_pack` → `random_rx`, polled by `poll_random`) picks a random 16colo.rs year
   + pack (`pick_random`, wall-clock seeded — no `rand` dep), inserts its download URL into
@@ -569,8 +598,13 @@ a piece whose 16colo/ansilove thumbnail is red renders blue in the viewer
 - **Ratings** (`rating.rs`) read/write `user.baloo.rating` (ASCII `0..10`, 2 per
   star) — the KDE Baloo / Gwenview scheme, so they interoperate with Gwenview and
   the user's `~/git/qb64pe-lab/greywood/sort-by-rating.sh`. Keys 1–5 set, 0 clears
-  (removes the attr). Grid rates the selection (or hovered tile); single view rates
-  the current image.
+  (removes the attr); single view rates the current image. In the grid/table the **tile
+  under the cursor wins** when it isn't part of the selection (`apply_rating`) — so "point
+  at a piece and press 3" rates *that* one even with an earlier-opened piece still selected
+  (the 16colo flat-listing gotcha); hovering one of the selected tiles still rates the whole
+  selection. The shared `entry_context_menu` also has a **★ Rating** submenu (Unrated/1–5
+  with the 0–5 hotkeys shown via `Button::shortcut_text`, current marked selected →
+  `TilePick::Rate` → `rate_entry`), a reliable rating path for 16colo pieces.
 - **Cross-platform sidecar** (`ratings.rs`, `RatingStore`): xattrs only exist for a
   real on-disk file on Linux, but **virtual art has no such file** — archive contents
   are extracted to a *disposable* temp dir and 16colo.rs pieces are downloaded on

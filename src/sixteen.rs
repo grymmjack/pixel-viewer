@@ -371,17 +371,34 @@ fn sauce_from_json(s: &serde_json::Value) -> Option<crate::sauce::Sauce> {
         ice: s["f"]["ice"].as_u64().unwrap_or(0) != 0
             || (s["Tflags"].as_u64().unwrap_or(0) & 1) != 0,
         font: txt("Tinfos"),
+        comment: txt("Comments"),
         ..Default::default()
     })
 }
 
-/// Make a site-relative API path (`/pack/…`) absolute; pass through an already-absolute
-/// URL; empty stays empty.
+/// Percent-encode a site path, **preserving `/`** so the structure survives. The API
+/// returns *literal* paths (e.g. `/pack/fire/raw/#44_FIRE.ANS`), so a filename with `#`
+/// (or a space, `?`, `&`, …) would otherwise truncate the URL at the fragment/query and
+/// the fetch fails — the bug that left `#`-named pieces un-downloadable + their thumbnails
+/// spinning forever.
+fn enc_path(p: &str) -> String {
+    p.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// Make a site-relative API path (`/pack/…`) absolute (percent-encoding it via
+/// [`enc_path`]); pass through an already-absolute URL unchanged; empty stays empty.
 fn abs_url(p: &str) -> String {
     if p.is_empty() || p.starts_with("http") {
         p.to_string()
     } else {
-        format!("{SITE}{p}")
+        format!("{SITE}{}", enc_path(p))
     }
 }
 
@@ -470,7 +487,7 @@ fn pieces_from_pack_json(
                 group: group.to_string(),
                 year,
                 pack: pack.to_string(),
-                raw_url: format!("{SITE}/pack/{}/raw/{}", enc(pack), filename),
+                raw_url: format!("{SITE}/pack/{}/raw/{}", enc(pack), enc(filename)),
                 tn_url: abs_url(&x1_url(tn)),
                 sauce: sauce_from_json(&fobj["sauce"]),
                 filesize: fobj["sauce"]["Filesize"].as_u64().unwrap_or(0),
@@ -628,6 +645,39 @@ mod tests {
             p.tn_url,
             "https://16colo.rs/pack/acdu0892/x1/ACID-BR.ANS.png"
         );
+    }
+
+    #[test]
+    fn hash_in_filename_is_percent_encoded_in_urls() {
+        // A literal `#` in a filename would truncate the URL at the fragment, leaving the
+        // piece un-downloadable and its thumbnail spinning forever. Both the pack-view
+        // (built filename) and artist-view (API path via abs_url) must encode it as %23.
+        let pv: serde_json::Value = serde_json::from_str(
+            r##"{ "results": [ { "year": 2025, "files": {
+                "#44_FIRE.ANS": {
+                    "file": { "raw": "#44_FIRE.ANS",
+                              "tn": { "uri": "/pack/fire/tn/#44_FIRE.ANS.png" } },
+                    "artists": ["tainted"]
+                }
+            } } ] }"##,
+        )
+        .unwrap();
+        let p = &pieces_from_pack_json("fire", "fire", 0, &pv)[0];
+        assert_eq!(p.filename, "#44_FIRE.ANS"); // identity keeps the real name
+        assert_eq!(p.raw_url, "https://16colo.rs/pack/fire/raw/%2344_FIRE.ANS");
+        assert_eq!(p.tn_url, "https://16colo.rs/pack/fire/x1/%2344_FIRE.ANS.png");
+
+        let av: serde_json::Value = serde_json::from_str(
+            r##"{ "results": { "2025": { "fire": {
+                "group": "fire",
+                "files": [ { "file": "#44_FIRE.ANS", "raw": "/pack/fire/raw/#44_FIRE.ANS",
+                             "tn": "/pack/fire/tn/#44_FIRE.ANS.png" } ]
+            } } } }"##,
+        )
+        .unwrap();
+        let p = &pieces_from_artist_json("tainted", &av)[0];
+        assert_eq!(p.raw_url, "https://16colo.rs/pack/fire/raw/%2344_FIRE.ANS");
+        assert_eq!(p.tn_url, "https://16colo.rs/pack/fire/x1/%2344_FIRE.ANS.png");
     }
 
     #[test]

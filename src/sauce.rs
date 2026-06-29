@@ -18,6 +18,7 @@ pub struct Sauce {
     pub comments: u8,
     pub ice: bool,    // TFlags bit 0 — non-blink / iCE colors
     pub font: String, // TInfoS — font name
+    pub comment: String, // SAUCE comment text (the COMNT block / API `Comments`), if any
 }
 
 impl Sauce {
@@ -95,6 +96,26 @@ pub fn parse(data: &[u8]) -> Option<Sauce> {
             .unwrap_or(0);
         String::from_utf8_lossy(&raw[..end]).trim().to_string()
     };
+    // The COMNT block (`comments` × 64-char lines, preceded by "COMNT") sits just before
+    // the SAUCE record; join its lines into one description string.
+    let comments = s[104];
+    let comment = (comments > 0)
+        .then(|| {
+            let len = 5 + comments as usize * 64;
+            start
+                .checked_sub(len)
+                .filter(|&o| data[o..].starts_with(b"COMNT"))
+                .map(|o| {
+                    data[o + 5..o + len]
+                        .chunks(64)
+                        .map(|line| String::from_utf8_lossy(line).trim().to_string())
+                        .filter(|l| !l.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+        })
+        .flatten()
+        .unwrap_or_default();
     Some(Sauce {
         title: field(7, 35),
         author: field(42, 20),
@@ -104,9 +125,10 @@ pub fn parse(data: &[u8]) -> Option<Sauce> {
         file_type: s[95],
         tinfo1: u16::from_le_bytes([s[96], s[97]]),
         tinfo2: u16::from_le_bytes([s[98], s[99]]),
-        comments: s[104],
+        comments,
         ice: s[105] & 0x01 != 0,
         font: field(106, 22),
+        comment,
     })
 }
 
@@ -169,6 +191,30 @@ mod tests {
     #[test]
     fn none_without_record() {
         assert_eq!(parse(b"just some text"), None);
+    }
+
+    #[test]
+    fn parses_comnt_block_into_comment() {
+        // A 2-line COMNT block (each 64 chars, space-padded) sits immediately before the
+        // SAUCE record; byte 104 holds the line count. parse() should join the lines.
+        let mut comnt = b"COMNT".to_vec();
+        for line in ["a fine piece of work", "by yours truly"] {
+            let mut buf = [b' '; 64];
+            buf[..line.len()].copy_from_slice(line.as_bytes());
+            comnt.extend_from_slice(&buf);
+        }
+        let mut file = b"ART\x1a".to_vec();
+        file.extend(comnt);
+        file.extend(rec(|s| {
+            s[7..14].copy_from_slice(b"Titled ");
+            s[94] = 1; // Character
+            s[104] = 2; // two comment lines
+        }));
+        let p = parse(&file).expect("SAUCE with COMNT parses");
+        assert_eq!(p.comments, 2);
+        assert_eq!(p.comment, "a fine piece of work by yours truly");
+        // strip() drops the COMNT block + record + EOF, leaving just the art.
+        assert_eq!(strip(&file), b"ART");
     }
 
     #[test]
