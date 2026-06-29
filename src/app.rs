@@ -3863,6 +3863,20 @@ impl PixelView {
         parsed
     }
 
+    /// The `(w, h)` aspect to render `path`'s Details / Recolor preview at, so it agrees
+    /// with the main view + navigator minimap. Those use the **full** texture; if `path`'s
+    /// cached thumbnail was decoded at a different width (e.g. before a 9px-cell toggle,
+    /// which re-decodes the full view but not thumbnails), the thumbnail's own dims would
+    /// render the preview squished. So prefer the open image's full texture; else fall back
+    /// to the thumbnail's own size (`tsz`) — correct for a hovered, not-open entry.
+    fn preview_aspect(&self, path: &Path, tsz: egui::Vec2) -> (f32, f32) {
+        self.full_tex
+            .as_ref()
+            .filter(|(p, _)| p == path)
+            .map(|(_, tt)| (tt.size[0] as f32, tt.size[1] as f32))
+            .unwrap_or((tsz.x, tsz.y))
+    }
+
     fn ui_details(&mut self, ui: &mut egui::Ui) {
         ui.strong("Details");
         ui.separator();
@@ -3935,18 +3949,21 @@ impl PixelView {
                         // Fill the pane width so the thumbnail grows as the dock is
                         // widened; cap height so a very tall image stays usable. Match the
                         // full viewer's CRT stretch (≈1.2× taller) for text-mode art, so
-                        // the preview isn't squished next to the stretched full view.
+                        // the preview isn't squished next to the stretched full view. Take
+                        // the aspect from the open image's full texture (not the thumbnail's
+                        // own dims) so it agrees with the main view + minimap.
                         let ar_y = if self.crt_aspect && is_textmode_ext(&entry.path) {
                             1.2
                         } else {
                             1.0
                         };
+                        let (bw, bh) = self.preview_aspect(&entry.path, tsz);
                         let mut w = ui.available_width();
-                        let mut h = w * (tsz.y * ar_y) / tsz.x;
+                        let mut h = w * (bh * ar_y) / bw;
                         let max_h = 600.0;
                         if h > max_h {
                             h = max_h;
-                            w = h * tsz.x / (tsz.y * ar_y);
+                            w = h * bw / (bh * ar_y);
                         }
                         ui.vertical_centered(|ui| {
                             ui.image(egui::load::SizedTexture::new(tex.id(), egui::vec2(w, h)));
@@ -4241,18 +4258,21 @@ impl PixelView {
                     let tsz = tex.size_vec2();
                     // Fill the pane width so the preview grows as the dock is widened;
                     // only a very tall image is capped (by height) to keep it usable. Match
-                    // the full viewer's CRT stretch (≈1.2× taller) for text-mode art.
+                    // the full viewer's CRT stretch (≈1.2× taller) for text-mode art, and
+                    // take the aspect from the open image's full texture (not the preview
+                    // texture's own dims) so it agrees with the main view + minimap.
                     let ar_y = if self.crt_aspect && is_textmode_ext(&entry.path) {
                         1.2
                     } else {
                         1.0
                     };
+                    let (bw, bh) = self.preview_aspect(&entry.path, tsz);
                     let mut w = ui.available_width();
-                    let mut h = w * (tsz.y * ar_y) / tsz.x;
+                    let mut h = w * (bh * ar_y) / bw;
                     let max_h = 600.0;
                     if h > max_h {
                         h = max_h;
-                        w = h * tsz.x / (tsz.y * ar_y);
+                        w = h * bw / (bh * ar_y);
                     }
                     ui.vertical_centered(|ui| {
                         ui.image(egui::load::SizedTexture::new(tex.id(), egui::vec2(w, h)));

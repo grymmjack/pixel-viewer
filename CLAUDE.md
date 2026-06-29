@@ -411,7 +411,10 @@ rematch**, and the *order* of all of it is user-controlled.
   crisp. It's a *display* scale, not a zoom change, and never touches the texture. The
   **navigator minimap, Recolor preview and Details thumbnail all apply the same
   `aspect_y`** so every rendering of the open image agrees (the minimap used to stay
-  native → looked squished next to the stretched main view + previews).
+  native → looked squished next to the stretched main view + previews). The previews also
+  take their **base aspect from the open image's `full_tex`** (via `preview_aspect`), not
+  the downscaled thumbnail's own dims — otherwise a thumbnail decoded at a different width
+  (e.g. cached at 8px before a 9px-cell toggle re-decoded the full view) renders squished.
 - **9px VGA cell** (`font_9px`, `FONT_9PX_KEY`, **off by default**) is a separate
   status-bar toggle (next to CRT, text-mode art only) that renders the 8-pixel CP437
   glyph in a **9-dot-wide cell**, the way real VGA text mode did: the 9th column is
