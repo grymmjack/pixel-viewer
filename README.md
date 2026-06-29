@@ -221,7 +221,10 @@ order, CRT toggles, baud rates — is **remembered between runs**.
 - **Nearest-neighbor zoom** with drag-to-pan, and a minimap/navigator on huge
   images.
 - **Two zoom modes:** raster art keeps a logical `%` zoom remembered across images;
-  textmode/scene art uses **device-pixel scale** (`N×`) so it stays crisp on HiDPI.
+  textmode/scene art uses **device-pixel scale** (`N×`) so it stays crisp on HiDPI. The
+  scale ladder is integer both ways — `N×` zooming in, **`1/N×` zooming out** — so a big
+  or very tall scene can shrink right down to fit (downscaling is smoothly area-averaged,
+  not aliased).
 - **Fit to window** (`F`) is sticky — toggle it on and every newly opened image
   auto-fits. **Fit W** re-fits to viewport width. **Tile preview** (`T`) fills the
   window with the tiled image for seamless-texture testing.

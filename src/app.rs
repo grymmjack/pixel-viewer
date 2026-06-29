@@ -482,7 +482,7 @@ impl Player {
                 &format!("{}#baud", self.path.to_string_lossy()),
                 size,
                 &img.rgba_bytes(),
-                egui::TextureOptions::NEAREST_REPEAT,
+                view_tex_opts(),
             );
             self.tex = Some((self.pos, tex));
         }
@@ -2963,7 +2963,7 @@ impl PixelView {
                     &path.to_string_lossy(),
                     size,
                     &rgba,
-                    egui::TextureOptions::NEAREST_REPEAT,
+                    view_tex_opts(),
                 );
                 // Binary scene formats (XBin/BIN/Tundra/IDF/ADF/PETSCII) aren't byte
                 // streams, so `for_file` gave no player — drive a cell-reveal "typeout"
@@ -3015,7 +3015,7 @@ impl PixelView {
                     &path.to_string_lossy(),
                     size,
                     &rgba,
-                    egui::TextureOptions::NEAREST_REPEAT,
+                    view_tex_opts(),
                 );
                 self.full_src = Some((path.clone(), size, rgba));
                 self.full_tex = Some((path, tex));
@@ -3823,7 +3823,7 @@ impl PixelView {
             "pv_full_reduced",
             size,
             &rgba,
-            egui::TextureOptions::NEAREST_REPEAT,
+            view_tex_opts(),
         );
         self.full_reduced = Some((path.to_path_buf(), key.to_string(), tt.clone()));
         Some(tt)
@@ -6629,9 +6629,18 @@ impl PixelView {
     /// step in device units means a Snap/Z step is always exactly one crisp level,
     /// even on a fractionally-scaled display (where logical 100% steps would stick).
     fn step_device_zoom(&mut self, ppp: f32, up: bool) {
-        let n = (self.zoom * ppp).round().max(1.0);
-        let n = if up { n + 1.0 } else { (n - 1.0).max(1.0) };
-        self.zoom = (n / ppp).clamp(0.05, 64.0);
+        // Walk the pixel-art ladder as a single integer step index: 0 = 1×, +k = (k+1)×
+        // upscale, -k = 1/(k+1)× downscale. Stepping the index moves one crisp rung in
+        // either direction and passes smoothly through 1× into the zoom-out (1/N×) range.
+        let dev = (self.zoom * ppp).max(1e-3);
+        let s = if dev >= 1.0 {
+            dev.round() as i32 - 1 // 1×→0, 2×→1, …
+        } else {
+            1 - (1.0 / dev).round() as i32 // ½×→-1, ⅓×→-2, …
+        };
+        let s = (s + if up { 1 } else { -1 }).clamp(-15, 63); // 1/16× … 64×
+        let scale = if s >= 0 { (s + 1) as f32 } else { 1.0 / (1 - s) as f32 };
+        self.zoom = (scale / ppp).clamp(0.01, 64.0);
     }
 
     /// A crisp minimap texture for the navigator overview. The shared thumbnail is
@@ -6827,17 +6836,21 @@ impl PixelView {
         // scaling / zoom / the CRT stretch duplicate some pixels more than others and
         // warp the dither. `self.zoom` is re-aligned to the value we can show crisply.
         let scale = if pixel_perfect {
-            let nx = (self.zoom * ppp).round().max(1.0); // device px per source px, X
-            // Keep X pixel-perfect for dither crispness. For Y, *rounding* the CRT's ≈1.2×
-            // to whole device pixels makes it vanish at low zoom (round(2·1.2)=2, no change
-            // — why the main view "didn't update" on a fit-to-screen tall ANSI while the
-            // linear-sampled previews did). So round Y when that still leaves a visible
-            // stretch (high zoom → uniform & crisp), but fall back to the exact fractional
-            // ratio when rounding would erase it (low zoom → the stretch always shows).
+            // X snaps to the pixel-art ladder — integer N× up, 1/N× down — so a tall scene
+            // can shrink below 1:1 to fit (no longer floored at 1×).
+            let nx = pp_device_scale(self.zoom * ppp); // device px per source px, X (may be <1)
+            // Y is the CRT stretch off nx. When *upscaling*, rounding it to whole device
+            // pixels makes the ≈1.2× vanish at low zoom (round(2·1.2)=2, no change), so round
+            // only while that stays visibly taller than X, else use the exact ratio. When
+            // *downscaling* (nx<1) just keep the exact ratio — there's no integer to snap to.
             // aspect_y == 1.0 → ny == nx, so a non-CRT image stays perfectly crisp.
-            let ny_round = (nx * aspect_y).round().max(1.0);
-            let ny = if ny_round > nx { ny_round } else { nx * aspect_y }; // …Y
-            self.zoom = nx / ppp; // idempotent: round((nx/ppp)·ppp) == nx
+            let ny = if nx >= 1.0 {
+                let ny_round = (nx * aspect_y).round();
+                if ny_round > nx { ny_round } else { nx * aspect_y }
+            } else {
+                nx * aspect_y
+            };
+            self.zoom = nx / ppp; // idempotent: pp_device_scale((nx/ppp)·ppp) == nx
             egui::vec2(nx / ppp, ny / ppp)
         } else {
             egui::vec2(self.zoom, self.zoom * aspect_y)
@@ -7634,9 +7647,16 @@ impl PixelView {
                         // scaled display (e.g. 308%). Free zoom still reads as a %.
                         let ppp = ui.ctx().pixels_per_point();
                         if self.viewing_textmode || self.zoom_lock {
-                            let n = (self.zoom * ppp).round().max(1.0) as i32;
-                            ui.label(format!("{n}×")).on_hover_text(
-                                "Device pixels per source pixel — pixel-perfect whole steps",
+                            // N× when upscaling, 1/N× when zoomed out below 1:1.
+                            let dev = pp_device_scale(self.zoom * ppp);
+                            let label = if dev >= 1.0 {
+                                format!("{}×", dev.round() as i32)
+                            } else {
+                                format!("1/{}×", (1.0 / dev).round() as i32)
+                            };
+                            ui.label(label).on_hover_text(
+                                "Device pixels per source pixel — pixel-perfect whole steps \
+                                 (1/N× when zoomed out below 1:1)",
                             );
                         } else {
                             ui.label(format!("{:.0}%", self.zoom * 100.0));
@@ -10010,6 +10030,31 @@ fn snap_zoom_nearest(z: f32) -> f32 {
     }
 }
 
+/// Snap a desired **device-pixels-per-source-pixel** to the pixel-art ladder: an integer
+/// `N` when upscaling (1,2,3,…) and `1/N` when zooming out (½,⅓,¼,…). Both are crisp under
+/// nearest-neighbor (a whole ratio either way), and the `1/N` rungs are what let a big or
+/// very tall scene shrink below 1:1 to fit — the old `.max(1.0)` floor locked it at 1×.
+/// Floored at 1/16× so it can't vanish. Returns the (possibly fractional) device scale.
+fn pp_device_scale(dev: f32) -> f32 {
+    if dev >= 1.0 {
+        dev.round().min(64.0)
+    } else {
+        1.0 / (1.0 / dev.max(1e-3)).round().clamp(1.0, 16.0)
+    }
+}
+
+/// Texture options for the viewer's displayed images: **NEAREST magnification** (crisp
+/// pixel-art *upscale*) but **LINEAR minification** (smooth *downscale*). That's the
+/// GPU-sampler form of the project's "nearest up, area-average down" rule — so now that a
+/// scene can zoom out below 1:1, a 50% dither shrinks to a faithful grey instead of the
+/// aliased noise a nearest-sampled downscale produces. Repeat wrap for the Tile view.
+fn view_tex_opts() -> egui::TextureOptions {
+    egui::TextureOptions {
+        minification: egui::TextureFilter::Linear,
+        ..egui::TextureOptions::NEAREST_REPEAT
+    }
+}
+
 /// One labeled slider row body: `[label][== wide slider ==][right-justified value]`.
 /// The value is a right-anchored `DragValue` (editable, and its right edge lines up
 /// across rows). Handles middle-click-reset and wheel-step on the slider. Does NOT
@@ -10422,7 +10467,7 @@ fn build_anim(ctx: &egui::Context, path: &std::path::Path, max_pixels: usize) ->
                 format!("{}#{i}", path.to_string_lossy()),
                 size,
                 &raw,
-                egui::TextureOptions::NEAREST_REPEAT,
+                view_tex_opts(),
             )
         })
         .collect();

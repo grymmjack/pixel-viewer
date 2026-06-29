@@ -400,7 +400,13 @@ rematch**, and the *order* of all of it is user-controlled.
   is actually crisp on a fractionally-scaled display (300% logical = a warped 3.9 dev-
   px; `3×` = a clean 3). `load_full` opens at `textmode_zoom / pixels_per_point`
   (logical), Z+N sets `N/ppp`, and Z+/Ctrl-wheel step the device ladder via
-  `step_device_zoom`. Raster art instead keeps a logical `%` zoom remembered across
+  `step_device_zoom`. **The ladder is integer in *both* directions** — `pp_device_scale`
+  snaps the device scale to `N×` when upscaling (1,2,3,…) and **`1/N×` when zooming out
+  below 1:1** (½,⅓,…,⅟₁₆), so a big or very tall scene can shrink to fit (the old
+  `.max(1.0)` floor locked it at 1×; reads out `1/N×`). The viewer textures use
+  `view_tex_opts` — **NEAREST magnification, LINEAR minification** — so a zoomed-out
+  dither area-averages to grey instead of nearest-aliasing into noise. Raster art instead
+  keeps a logical `%` zoom remembered across
   images (`raster_zoom`, persisted as the old `IMG_ZOOM_KEY`; `draw_image_view` writes
   it back each frame), whereas text-mode always reopens at its preference (manual zoom
   is transient). Both persist (`TEXTMODE_ZOOM_KEY`). `viewing_textmode` tracks the kind.
