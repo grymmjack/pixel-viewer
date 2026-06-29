@@ -408,7 +408,10 @@ rematch**, and the *order* of all of it is user-controlled.
   toggle shown in the status bar **only for text-mode art**: it stretches the blit
   ≈1.2× vertically (an 80×25 8×16 grid → 4:3) to match non-square VGA pixels — snapped
   to an integer device-pixel scale (see below), so it lands near 1.2× while staying
-  crisp. It's a *display* scale, not a zoom change, and never touches the texture.
+  crisp. It's a *display* scale, not a zoom change, and never touches the texture. The
+  **navigator minimap, Recolor preview and Details thumbnail all apply the same
+  `aspect_y`** so every rendering of the open image agrees (the minimap used to stay
+  native → looked squished next to the stretched main view + previews).
 - **9px VGA cell** (`font_9px`, `FONT_9PX_KEY`, **off by default**) is a separate
   status-bar toggle (next to CRT, text-mode art only) that renders the 8-pixel CP437
   glyph in a **9-dot-wide cell**, the way real VGA text mode did: the 9th column is

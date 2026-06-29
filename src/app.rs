@@ -6847,12 +6847,16 @@ impl PixelView {
         }
 
         // Navigator (GIMP/VSCode-style minimap), flush right, only when overflowing.
+        // Use the *stretched* height (`sh * aspect_y`) so the minimap matches the main
+        // view's CRT aspect — otherwise text-mode art looks squished in the strip
+        // relative to what it's previewing.
         let nav = (!self.immersive && (overflow_x || overflow_y)).then(|| {
             const M: f32 = 8.0;
             const MAX_W: f32 = 120.0;
             let max_h = (resp.rect.height() - 2.0 * M).max(16.0);
-            let s = (MAX_W / sw).min(max_h / sh);
-            let nsz = egui::vec2(sw * s, sh * s);
+            let sh_a = sh * aspect_y;
+            let s = (MAX_W / sw).min(max_h / sh_a);
+            let nsz = egui::vec2(sw * s, sh_a * s);
             let ntl = egui::pos2(resp.rect.max.x - M - nsz.x, resp.rect.min.y + M);
             egui::Rect::from_min_size(ntl, nsz)
         });
