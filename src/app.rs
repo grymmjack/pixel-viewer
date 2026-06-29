@@ -6559,10 +6559,14 @@ impl PixelView {
         // Baud-rate playback (ANSImation / "watch RIP draw"): a controls row + the
         // progressively-rendered frame. When fully played out (or paused at the end) it
         // falls through to the static path below, so recolor / minimap keep working on
-        // the complete image. The baud picker itself lives in the status bar.
+        // the complete image. The baud picker sits in this row next to Play/Replay/seek.
         if self.player.is_some() {
             let dt = ctx.input(|i| i.stable_dt);
             let baud = self.current_baud();
+            let is_rip = self.player.as_ref().is_some_and(|p| p.stream.is_rip());
+            // The combo mutates only this local (so it doesn't need `&mut self` while the
+            // player is borrowed below); the change is applied after the borrow ends.
+            let mut baud_choice = baud;
             let (active, just_finished) = {
                 let p = self.player.as_mut().unwrap();
                 let was_playing = p.playing;
@@ -6585,6 +6589,21 @@ impl PixelView {
                             p.acc = 0.0;
                             p.playing = true;
                         }
+                        // Baud picker, right by the transport controls: simulate a modem
+                        // typing the art out. RIP and ANSI keep separate remembered speeds.
+                        egui::ComboBox::from_id_salt("baud_pick")
+                            .selected_text(format!("⚡ {}", baud_choice.label()))
+                            .show_ui(ui, |ui| {
+                                for b in Baud::ALL {
+                                    ui.selectable_value(&mut baud_choice, b, b.label());
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Simulated modem baud rate — replay the art as it would have \
+                                 typed out over a dial-up connection (None = instant). RIP and \
+                                 ANSI keep separate speeds.",
+                            );
                         let mut pos = p.pos;
                         if ui
                             .add(egui::Slider::new(&mut pos, 0..=len).text("byte"))
@@ -6595,14 +6614,9 @@ impl PixelView {
                             p.playing = false;
                         }
                         // The slider already shows the byte position, so don't repeat it:
-                        // just the percent, total size, and baud. (Was "{pos} / {len} bytes"
-                        // with {pos} printed three times — slider value + here, twice.)
+                        // just the percent and total size (baud is the picker to the left).
                         let pct = if len > 0 { p.pos * 100 / len } else { 100 };
-                        ui.label(format!(
-                            "{pct}%  ·  {}  ·  {} baud",
-                            human_size(len as u64),
-                            baud.label()
-                        ));
+                        ui.label(format!("{pct}%  ·  {}", human_size(len as u64)));
                     });
                 }
                 // Render one extra frame the moment it finishes, so the auto-scroll lands
@@ -6610,6 +6624,27 @@ impl PixelView {
                 let just_finished = was_playing && !p.playing;
                 (p.playing || p.pos < p.len || just_finished, just_finished)
             };
+            // Apply a baud change now that the player borrow above has ended: remember the
+            // per-kind speed and restart the transmission (or jump to the end for None).
+            if baud_choice != baud {
+                if is_rip {
+                    self.baud_rip = baud_choice;
+                } else {
+                    self.baud_ansi = baud_choice;
+                }
+                if let Some(p) = &mut self.player {
+                    if baud_choice == Baud::None {
+                        p.pos = p.len;
+                        p.playing = false;
+                    } else {
+                        p.pos = 0;
+                        p.acc = 0.0;
+                        p.playing = true;
+                    }
+                    p.tex = None;
+                }
+                self.want_repaint = true;
+            }
             if active {
                 let tex = self.player.as_mut().unwrap().frame(ctx);
                 let (playing, cursor_px) = {
@@ -7790,49 +7825,8 @@ impl PixelView {
                             "Retro monitor effects — scanlines, phosphor glow, CRT aspect, \
                              9-dot cell, background",
                         );
-                        // Baud picker — simulate a modem typing out the art. Shown only
-                        // while a stream player exists (during playback), so it never adds
-                        // to the at-rest width. RIP and ANSI remember their own speed.
-                        if self.player.is_some() {
-                            let is_rip = self.player.as_ref().is_some_and(|p| p.stream.is_rip());
-                            let mut baud = if is_rip {
-                                self.baud_rip
-                            } else {
-                                self.baud_ansi
-                            };
-                            let old = baud;
-                            egui::ComboBox::from_id_salt("baud_pick")
-                                .selected_text(format!("⚡ {}", baud.label()))
-                                .show_ui(ui, |ui| {
-                                    for b in Baud::ALL {
-                                        ui.selectable_value(&mut baud, b, b.label());
-                                    }
-                                })
-                                .response
-                                .on_hover_text(
-                                    "Simulated modem baud rate — replay the art as it would \
-                                     have typed out over a dial-up connection (None = instant). \
-                                     RIP and ANSI keep separate speeds.",
-                                );
-                            if baud != old {
-                                if is_rip {
-                                    self.baud_rip = baud;
-                                } else {
-                                    self.baud_ansi = baud;
-                                }
-                                if let Some(p) = &mut self.player {
-                                    if baud == Baud::None {
-                                        p.pos = p.len;
-                                        p.playing = false;
-                                    } else {
-                                        p.pos = 0;
-                                        p.acc = 0.0;
-                                        p.playing = true;
-                                    }
-                                    p.tex = None;
-                                }
-                            }
-                        }
+                        // (The baud picker moved up next to Play/Replay/seek in the
+                        // playback controls row — see ui_single.)
                         // Slideshow + random-pack screensaver, collapsed into one popover.
                         // The "auto ▶" toggle goes yellow when a user interaction paused it,
                         // and clicking it then *resumes* rather than toggling the slideshow
@@ -13157,8 +13151,9 @@ mod gui_screenshots {
             action: "Open a piece of art in the single/viewer view. No click.",
             shows: "Changes A/B/C — the viewer status bar is collapsed: a 📺 CRT popover \
                     and a ▶ Auto popover replace ~18 inline widgets, the long zoom hint is \
-                    now a compact ? tooltip, and the playback readout no longer repeats the \
-                    byte position.",
+                    now a compact ? tooltip, the playback readout no longer repeats the byte \
+                    position, and the baud picker moved up into the transport row \
+                    (▶ Play · ⏮ Replay · ⚡baud · seek).",
             drive: |h, sample| {
                 enter_viewer(h, sample);
                 None
