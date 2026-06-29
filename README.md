@@ -60,8 +60,9 @@ and the rest of the demoscene / textmode art world — right down to baud-rate
   RIPscript, and more).
 - **Pixel-perfect zoom** — nearest-neighbor textures, snapped to whole device
   pixels so dithering never warps, even on fractionally-scaled (HiDPI) displays.
-- **Virtualized thumbnail grid** that scrolls smoothly through folders of thousands
-  of images, with independent Ctrl+wheel tile sizing and configurable captions.
+- **Virtualized thumbnail grid** — *or a sortable table view* — that scrolls smoothly
+  through folders of thousands of images, with independent Ctrl+wheel tile sizing and
+  configurable captions.
 - **Recolor pane** — a reorderable 15-stage adjustment + palette-rematch + dither
   pipeline (brightness/contrast/gamma/hue/vibrance/posterize/invert/… → palette snap
   → dithering), with live preview and export.
@@ -69,13 +70,19 @@ and the rest of the demoscene / textmode art world — right down to baud-rate
   DawnBringer, Endesga, …) plus `.GPL` import/export.
 - **Star ratings** stored as KDE Baloo xattrs (interoperate with Gwenview), with a
   cross-platform sidecar so even art inside a zip or on 16colo.rs is ratable.
+- **A fading metadata OSD** in the viewer — title, artist(s), SAUCE comment and
+  attributes — with clickable links that jump to the artist / group / pack on 16colo.rs.
+- **View-history tracking** — visited pieces get a browser-style "you've seen this"
+  link colour / check badge, plus view count and last-viewed in the Details pane.
 - **Recursive advanced search** (name / type / dimensions / size / date / rating /
   SAUCE text) on a background thread, plus saveable "smart filters."
-- **Browse archives and the online ANSI scene** as if they were folders.
-- **The BBS aesthetic, faithfully**: SAUCE-aware textmode rendering, authentic IBM
-  VGA & C64 fonts, baud-rate ANSImation/RIP playback, CRT scanlines, phosphor glow,
-  9-dot VGA cells, slideshow, an immersive fullscreen mode, and a random-pack
-  screensaver.
+- **Browse archives and the online ANSI scene** as if they were folders — including
+  flattening a 16colo.rs **artist / group / search** into a sortable table of individual
+  pieces, backed by a persistent on-disk cache.
+- **The BBS aesthetic, faithfully**: SAUCE-aware textmode rendering with true 24-bit
+  color, authentic IBM VGA & C64 fonts, baud-rate ANSImation/RIP playback, CRT scanlines,
+  phosphor glow, 9-dot VGA cells, slideshow, an immersive fullscreen mode, and a
+  random-pack screensaver.
 
 ---
 
@@ -173,7 +180,11 @@ order, CRT toggles, baud rates — is **remembered between runs**.
 - **Breadcrumb path** with clickable segments, plus a current-path bar.
 - **Drag-reorderable favorites** in the top toolbar — drag to rearrange,
   right-click to remove, or pin any folder via its grid context menu / the **Go**
-  menu. `🏠 Home` and `⬆ Up` are always available.
+  menu. `🏠 Home` and `⬆ Up` are always available. **Color-tag** any favorite from its
+  right-click menu (an ANSI32 swatch grid) to fill the button with a color.
+- **Places dock** with **Local** / **16colo.rs** sub-tabs — local holds Home, your
+  on-disk favorites and saved smart filters; 16colo.rs holds the 🌐 browse entry and your
+  remote pins (e.g. a pinned artist that re-runs its search on click).
 - **Left activity rail** (VSCode-style) of icon toggles for the docks.
 - **Explorer dock** — an expandable, lazy-loading folder tree with a filter box
   (collapsed nodes do no disk I/O).
@@ -196,6 +207,14 @@ order, CRT toggles, baud rates — is **remembered between runs**.
   badge — recursively.
 - **Multi-select** with Ctrl+click (toggle) and Shift+click (range); `Home`/`End`
   jump to the first/last item.
+- **Grid or Table view** — toggle with **`T`**, the **View** menu, or the button in the
+  sort bar (persisted). The table is a hand-rolled, virtualized, sortable list: click a
+  header to sort (click again to reverse), **right-click** a header to sort or show/hide
+  columns, **drag a column border** to resize, and **drag a header** to reorder. The same
+  selection, ratings, keyboard nav and context menu work in both views.
+- **View history** — once you've opened a piece it's marked visited: a **painted check
+  badge** on its tile (and a browser-style "visited link" colour in the table). View count
+  and last-viewed show in the Details pane; right-click → *Mark as (not) viewed* to override.
 
 ### The single-image viewer
 
@@ -208,6 +227,16 @@ order, CRT toggles, baud rates — is **remembered between runs**.
   window with the tiled image for seamless-texture testing.
 - **Huge images** beyond the GPU texture limit are uploaded as a tile grid and shown
   at full resolution.
+- **Scroll a long image** with the wheel, the **`↑`/`↓`** arrows, **`Home`/`End`** (top /
+  bottom), or **`PageUp`/`PageDown`** — a page is **25 lines** for scene art, just like an
+  old 80×25 DOS screen.
+- **Metadata OSD** — a fading info panel appears on each newly opened image (configurable
+  position — any corner or edge — and hold time in Preferences). It shows a headline
+  **title**, the **artist(s)**, the **SAUCE comment**, and an attributes row (type /
+  columns / lines / font / group / pack / year / ★). **Hover it** to pin it open (it won't
+  fade while you're on it); each artist / group / pack / year is a **clickable link** that
+  jumps there on 16colo.rs (local paths jump to the folder); the **`×`** dismisses it for
+  the current image.
 
 ### Pixel-perfect rendering
 
@@ -251,7 +280,9 @@ user-controlled** — drag the grip handle or use ⬆/⬇ to reorder:
 
 ### Star ratings
 
-- **1–5** sets a rating, **0** clears it.
+- **1–5** sets a rating, **0** clears it. In the grid/table the tile **under the cursor**
+  is rated (so you can hover-and-rate quickly); in the viewer it rates the current image.
+  Or right-click → **★ Rating** to pick from a menu (with the 0–5 hotkeys shown).
 - Stored as the **KDE Baloo `user.baloo.rating` extended attribute** — the same
   scheme Gwenview uses, so ratings made here show up there (and vice-versa).
 - A **cross-platform `ratings.json` sidecar** mirrors them, which is what makes art
@@ -288,9 +319,17 @@ Full file management, with **undo**:
   `.zoo` / `.7z` / `.rar` / … and browse inside it; contents are extracted on demand
   to a temp dir.
 - **[16colo.rs](https://16colo.rs) as a virtual disk** — a Places entry with a nav
-  bar (Years / Latest / Groups / Artists, plus a server-side Search across artists +
-  groups). Drill in to **Packs**, and pack art is auto-downloaded and shown like any
-  local folder.
+  bar (Years / Latest / Groups / Artists, plus a facet-scoped Search). A **Year** lists
+  **Packs**, and pack art is auto-downloaded and shown like any local folder.
+- **Artist / Group / Search → a table of pieces** — instead of listing pack folders,
+  these flatten to a **sortable table of individual artworks** (thumbnail · filename ·
+  artist · type · year · group · pack), streamed from the JSON API with no pack download.
+  Opening a piece grabs just its single file; the **Pack / Year / Group** cells are links
+  into the browser; and a per-row **⬇ menu** saves the file or its whole pack `.zip` to
+  disk. Pin an artist/group/search to Places to bookmark it.
+- **Persistent on-disk cache** — JSON, thumbnails, downloaded files and pack zips are
+  cached (SQLite-indexed, LRU-evicted, 2 GiB cap) so re-browsing doesn't re-fetch.
+  *Preferences* shows the cache size and a **Clear cache** button.
 
 ### Scene art, ANSImation & retro effects
 
@@ -300,22 +339,26 @@ The textmode/BBS side is the heart of pixelview:
   and a C64 character ROM, so block/shade/line-draw glyphs are exact.
 - **SAUCE-driven layout** — cell size (8×8 VGA50 / EGA43 vs 8×16), iCE colors, and
   canvas width come from the file's SAUCE record.
+- **True 24-bit color** — full RGB ANSI (PabloDraw's `ESC[…t` sequences and SGR
+  `38;2`/`48;2`) renders pixel-identical to ansilove, not snapped to the 16-color palette.
 - **9-dot VGA cell** (toggle) — renders the 8-pixel glyph in a 9-wide cell the way
   real VGA text mode did (the 9th column repeats for line-draw chars so box rules
   join). This is why output matches ansilove / 16colo widths.
 - **Baud-rate playback** — watch ANSI art and RIPscript *draw themselves* at an
   authentic modem speed (300 baud crawl → 115.2k). Pick a rate in the status bar; the
   view auto-scrolls BBS-style to follow the cursor. ANSI and RIP remember independent
-  speeds.
+  speeds. The binary formats (XBin/BIN/PETSCII/…) "type out" cell-by-cell. **Any input**
+  (scroll, zoom, key) finishes the transmission instantly and hands you back the scroll.
 - **CRT aspect** (toggle) — stretches textmode art ~1.2× vertically to match
-  non-square VGA pixels (80×25 → 4:3), snapped to integer device pixels so it stays
-  crisp.
+  non-square VGA pixels (80×25 → 4:3). The horizontal axis stays pixel-perfect for crisp
+  dithering; the stretch shows at every zoom (including fit-to-screen).
 - **Phosphor glow** + **retro scanlines** (with adjustable darkness and a "scale with
   zoom" option) + optional **black background** — composable CRT-monitor effects.
 - **Immersive mode** (`F11`) — OS fullscreen with every panel hidden; bars reveal
   when the mouse reaches a screen edge, and the cursor auto-hides after ~1.5s.
 - **Slideshow** — auto-advance through a folder (1/3/5/10s), waiting for any baud
-  transmission to finish first.
+  transmission to finish first. Touch the keyboard or mouse and it **auto-pauses** (the
+  `auto ▶` control turns yellow); click it to resume.
 - **Random-pack screensaver** — `🔀 Random pack` (or **R**) jumps to a random
   16colo.rs pack; with Shuffle on it chains endlessly. Pair with `F11` for a
   screensaver of real scene art.
@@ -345,14 +388,16 @@ The rest are fixed (this is the same list shown in **Help → Keyboard shortcuts
 |---|---|
 | `Ctrl +` / `Ctrl -` | Zoom the whole UI |
 | `Ctrl + Wheel` / pinch | Resize thumbnails (grid) · zoom image (viewer) |
-| `Wheel` | Viewer: previous / next image · Grid: scroll |
+| `Wheel` | Viewer: previous / next image (or scroll a long one) · Grid: scroll |
+| `↑` / `↓` | Viewer: scroll a long image |
 | Mouse Back / Fwd | Grid: folder history · Viewer: prev / next image |
-| `Home` / `End` | Grid: select first / last |
+| `Home` / `End` | Grid: first / last · Viewer: scroll to top / bottom |
+| `PageUp` / `PageDown` | Viewer: scroll 25 lines (a screen of scene art) |
 | `/` | Grid: filter by filename |
 | `Ctrl + F` | Open advanced recursive search |
 | `Drag` | Pan the image (viewer) |
 | `F` | Fit to window + auto-fit new images (viewer) |
-| `T` | Tile preview — fill window (viewer) |
+| `T` | Grid/Table toggle (browse) · Tile preview — fill window (viewer) |
 | `F11` | Immersive / fullscreen |
 | `1` – `5` | Set star rating |
 | `0` | Clear rating |
@@ -401,13 +446,14 @@ the command line override the persisted ones and are remembered afterward.**
 |---|---|
 | **File** | Open folder… · Quit |
 | **Edit** | ↩ Undo · Copy · Cut · Paste · New folder · Rename… · Move to trash · Find images… (Ctrl+F) |
-| **View** | Explorer pane · Details pane · Recolor pane · Reset thumbnail size · Preferences… |
+| **View** | Table view · Explorer pane · Details pane · Recolor pane · Reset thumbnail size · Preferences… |
 | **Sort** | Name · Type · Modified · Created · Size · Rating · Colors · Descending · Directories first |
 | **Go** | ⬆ Up · 🏠 Home · *(your pinned favorites)* |
 | **Help** | Keyboard shortcuts |
 
-**Preferences** covers theme (Dark/Light), grid spacing, caption fields, the default
-textmode zoom, the palette directory, and the rebindable **Hotkeys**.
+**Preferences** covers theme (Dark/Light), grid spacing, caption fields, table columns,
+the default textmode zoom, the metadata-OSD position/hold, the palette directory, the
+16colo.rs cache (size + Clear), and the rebindable **Hotkeys**.
 
 ---
 
@@ -420,6 +466,10 @@ textmode zoom, the palette directory, and the rebindable **Hotkeys**.
 - **Ratings** live in two places: the `user.baloo.rating` xattr on real files (for
   Gwenview interop) and a portable `ratings.json` sidecar in the data dir (for
   virtual art and non-Linux platforms).
+- **View history** is a small SQLite database (`views.db`) in the data dir — visited
+  state, view count, and first/last-viewed, keyed by the same stable display path.
+- **The 16colo.rs cache** lives under `<data>/cache/` (blob files + a `cache.db` index);
+  clear it from Preferences.
 - **Palettes** are embedded in the binary; an optional user palette directory adds
   more `.GPL` files on top.
 
@@ -479,7 +529,12 @@ src/
   thumb.rs           worker pool: thumbnails + metadata
   rating.rs          star ratings via the user.baloo.rating xattr
   ratings.rs         cross-platform ratings.json sidecar
+  viewdb.rs          SQLite view-history store (visited / count / last-viewed)
   anim.rs            animated-GIF frame decode
+  sixteen.rs         16colo.rs JSON API client (years/packs/artists/groups/search)
+  cache.rs           persistent SQLite-indexed HTTP cache for 16colo
+  colo_thumb.rs      worker pool fetching 16colo's pre-rendered thumbnails
+  sauce.rs           SAUCE record + COMNT-comment parsing
   decode/            Decoder trait + every format decoder
   palettes_builtin.rs  the embedded .GPL library
 ```
@@ -497,7 +552,7 @@ cargo run --release      # build + launch
 cargo check              # fast type-check
 cargo clippy             # lint
 cargo fmt                # format
-cargo test               # 79 tests (unit + 3 headless egui_kittest GUI tests)
+cargo test               # 161 tests (unit + headless egui_kittest GUI tests)
 cargo test gui_tests     # just the GUI tests
 ```
 
