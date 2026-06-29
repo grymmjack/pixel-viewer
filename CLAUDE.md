@@ -451,6 +451,14 @@ rematch**, and the *order* of all of it is user-controlled.
   resets on load and while busy. While slideshow is on, RIP + raster (non-text-mode) art
   opens **fit-to-screen** (`load_full` sets `fit_requested`) so it's fully visible; text-mode
   keeps its readable zoom + fit-to-width. Great for flipping through a whole pack hands-free.
+- **Metadata OSD** (`osd_enabled`/`osd_position` top|bottom/`osd_secs`, Preferences →
+  "Viewer info OSD", persisted). `load_full` resets `osd_t=0` so a fading rounded panel
+  appears on each opened image: fade-in (0.35s) → hold (`osd_secs`) → fade-out (0.7s),
+  painted at the end of `draw_image_view` (covers static / player / GIF paths). `osd_lines`
+  builds `(label, value, near-white hue)` per field — 16colo: SAUCE title / artist / group /
+  pack / year; local: name / path / type / size / dimensions / colors / created — both
+  ending in a ★ rating. `paint_osd` lays out the galleys (long values wrap to `max_val_w`),
+  sizes the panel to the text, and fades everything by scaling each colour's alpha.
 - **Random-pack screensaver** (`shuffle` + "🔀 Random pack" button, status bar). A worker
   (`start_random_pack` → `random_rx`, polled by `poll_random`) picks a random 16colo.rs year
   + pack (`pick_random`, wall-clock seeded — no `rand` dep), inserts its download URL into

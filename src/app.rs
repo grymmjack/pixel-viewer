@@ -894,6 +894,11 @@ pub struct PixelView {
     glow: bool,             // phosphor-glow bloom around bright pixels (persisted)
     glow_amt: f32,          // phosphor-glow intensity (persisted)
     black_bg: bool,         // fill the viewer background black instead of dark grey (persisted)
+    // Metadata OSD: a fading info overlay shown on each newly opened image.
+    osd_enabled: bool,  // show the OSD at all (persisted)
+    osd_position: u8,   // 0 = top, 1 = bottom (persisted)
+    osd_secs: f32,      // how long it holds at full opacity before fading (persisted)
+    osd_t: f32,         // animation clock since the current image opened (runtime)
     scanline_tex: Option<egui::TextureHandle>, // lazily-built 1×3 scanline pattern
     auto_next: bool,        // slideshow: auto-advance to the next file after a delay (persisted)
     auto_next_secs: u8,     // slideshow delay in seconds: 1/3/5/10 (persisted)
@@ -1037,6 +1042,9 @@ impl PixelView {
     const CRT_SCANLINE_DARK_KEY: &'static str = "crt_scanline_dark";
     const CRT_SCANLINE_SCALE_KEY: &'static str = "crt_scanline_scale";
     const BLACK_BG_KEY: &'static str = "black_bg";
+    const OSD_ENABLED_KEY: &'static str = "osd_enabled";
+    const OSD_POSITION_KEY: &'static str = "osd_position";
+    const OSD_SECS_KEY: &'static str = "osd_secs";
     const AUTO_NEXT_KEY: &'static str = "auto_next";
     const AUTO_NEXT_SECS_KEY: &'static str = "auto_next_secs";
     const GLOW_KEY: &'static str = "glow";
@@ -1218,6 +1226,13 @@ impl PixelView {
             .clamp(0.0, 1.0);
         let crt_scanline_scale = get_bool(Self::CRT_SCANLINE_SCALE_KEY).unwrap_or(true);
         let black_bg = get_bool(Self::BLACK_BG_KEY).unwrap_or(true);
+        let osd_enabled = get_bool(Self::OSD_ENABLED_KEY).unwrap_or(true);
+        let osd_position = get_u8(Self::OSD_POSITION_KEY).unwrap_or(0).min(1);
+        let osd_secs = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::OSD_SECS_KEY))
+            .unwrap_or(3.0)
+            .clamp(0.5, 30.0);
         let auto_next = get_bool(Self::AUTO_NEXT_KEY).unwrap_or(true);
         let auto_next_secs = get_u8(Self::AUTO_NEXT_SECS_KEY).unwrap_or(5).clamp(1, 60);
         let glow = get_bool(Self::GLOW_KEY).unwrap_or(true);
@@ -1441,6 +1456,10 @@ impl PixelView {
             crt_scanline_dark,
             crt_scanline_scale,
             black_bg,
+            osd_enabled,
+            osd_position,
+            osd_secs,
+            osd_t: f32::INFINITY, // start hidden until the first image opens
             glow,
             glow_amt,
             scanline_tex: None,
@@ -2858,6 +2877,7 @@ impl PixelView {
         }
         // Opening an image in the viewer counts as a view (bumps its count + last-viewed).
         self.mark_viewed(&path);
+        self.osd_t = 0.0; // restart the metadata OSD fade-in for the new image
         // `path` is the display identity (kept for stepping/ratings/full_tex keys); a
         // downloaded 16colo piece reads its bytes from the local cache file instead.
         let src = self.resolve_local(&path);
@@ -6953,7 +6973,182 @@ impl PixelView {
         if !self.fit_mode && !self.viewing_textmode {
             self.raster_zoom = self.zoom;
         }
+
+        // Metadata OSD: fade in on a freshly opened image, hold for `osd_secs`, fade out.
+        if self.osd_enabled {
+            self.osd_t += ui.input(|i| i.stable_dt);
+            const FADE_IN: f32 = 0.35;
+            const FADE_OUT: f32 = 0.7;
+            let total = FADE_IN + self.osd_secs + FADE_OUT;
+            if self.osd_t < total {
+                let t = self.osd_t;
+                let alpha = if t < FADE_IN {
+                    t / FADE_IN
+                } else if t < FADE_IN + self.osd_secs {
+                    1.0
+                } else {
+                    (1.0 - (t - FADE_IN - self.osd_secs) / FADE_OUT).max(0.0)
+                };
+                if alpha > 0.004 {
+                    let p = self
+                        .full_tex
+                        .as_ref()
+                        .map(|(p, _)| p.clone())
+                        .or_else(|| self.entries.get(self.selected).map(|e| e.path.clone()));
+                    if let Some(p) = p {
+                        self.paint_osd(&painter, resp.rect, alpha, &p);
+                    }
+                    self.want_repaint = true; // keep the fade animating
+                }
+            }
+        }
         advance
+    }
+
+    /// The metadata OSD's lines for `path`: `(label, value, near-white hue)`. 16colo.rs
+    /// pieces show SAUCE title / artist / group / pack / year; local files show name /
+    /// path / type / size / dimensions / colors / created. Both end with a star rating.
+    fn osd_lines(&self, path: &Path) -> Vec<(&'static str, String, [u8; 3])> {
+        let mut v: Vec<(&'static str, String, [u8; 3])> = Vec::new();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+            .to_string();
+        if let Some(piece) = self.colo_pieces.get(path) {
+            let title = self
+                .sauce_cache
+                .get(path)
+                .and_then(|s| s.as_ref())
+                .map(|s| s.title.trim().to_string())
+                .filter(|t| !t.is_empty());
+            v.push(("", title.clone().unwrap_or_else(|| name.clone()), [255, 246, 232]));
+            if title.is_some() {
+                v.push(("File", name.clone(), [228, 228, 234]));
+            }
+            if !piece.artist.is_empty() {
+                v.push(("Artist", piece.artist.clone(), [206, 238, 255]));
+            }
+            if !piece.group.is_empty() {
+                v.push(("Group", piece.group.clone(), [240, 222, 255]));
+            }
+            if !piece.pack.is_empty() {
+                v.push(("Pack", piece.pack.clone(), [218, 255, 224]));
+            }
+            v.push(("Year", piece.year.to_string(), [255, 250, 210]));
+        } else {
+            v.push(("", name.clone(), [255, 246, 232]));
+            if let Some(parent) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                v.push(("Path", parent.display().to_string(), [226, 226, 234]));
+            }
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_uppercase();
+            if !ext.is_empty() {
+                v.push(("Type", ext, [210, 236, 255]));
+            }
+            let entry = self.entries.iter().find(|e| e.path == path);
+            if let Some(sz) = entry.map(|e| e.size).filter(|&s| s > 0) {
+                v.push(("Size", human_size(sz), [255, 234, 222]));
+            }
+            if let Some((w, h)) = self
+                .full_tex
+                .as_ref()
+                .filter(|(fp, _)| fp == path)
+                .map(|(_, tt)| (tt.size[0], tt.size[1]))
+            {
+                v.push(("Dimensions", format!("{w} × {h}"), [222, 255, 236]));
+            }
+            if let Some(c) = self.img_meta.get(path).and_then(|m| m.colors) {
+                v.push(("Colors", c.to_string(), [244, 226, 255]));
+            }
+            if let Some(t) = entry.and_then(|e| e.ctime) {
+                v.push(("Created", fmt_time(t), [255, 248, 214]));
+            }
+        }
+        let r = self.read_rating(path);
+        if r > 0 {
+            v.push(("Rating", "★".repeat(r as usize), [255, 210, 96]));
+        }
+        v
+    }
+
+    /// Paint the fading metadata OSD: a rounded dark panel (sized to the text) at the top
+    /// or bottom of `viewport`, each field a labelled line in its own near-white hue.
+    fn paint_osd(&self, painter: &egui::Painter, viewport: egui::Rect, alpha: f32, path: &Path) {
+        let lines = self.osd_lines(path);
+        if lines.is_empty() {
+            return;
+        }
+        let av = |base: f32| (base * alpha).clamp(0.0, 255.0) as u8;
+        let hue = |c: [u8; 3]| egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], av(255.0));
+        let label_col = egui::Color32::from_rgba_unmultiplied(150, 150, 162, av(225.0));
+        let title_font = egui::FontId::proportional(18.0);
+        let body_font = egui::FontId::proportional(13.5);
+        let (pad, label_w, gap, line_h) = (12.0, 88.0_f32, 8.0_f32, 20.0_f32);
+        let max_val_w = (viewport.width() - 2.0 * (pad + 8.0) - label_w - gap).max(120.0);
+
+        struct Laid {
+            label: Option<std::sync::Arc<egui::Galley>>,
+            value: std::sync::Arc<egui::Galley>,
+        }
+        let mut laid = Vec::with_capacity(lines.len());
+        let mut content_w = 0.0_f32;
+        for (label, value, c) in &lines {
+            let title = label.is_empty();
+            let font = if title { &title_font } else { &body_font };
+            // Wrap an over-long value (e.g. a path) so the panel can't overflow.
+            let vg = painter.layout(value.clone(), font.clone(), hue(*c), max_val_w);
+            let lg = (!title).then(|| {
+                painter.layout_no_wrap(label.to_string(), body_font.clone(), label_col)
+            });
+            let w = if title {
+                vg.size().x
+            } else {
+                label_w + gap + vg.size().x
+            };
+            content_w = content_w.max(w);
+            laid.push((Laid { label: lg, value: vg }, title));
+        }
+        let content_h: f32 = laid
+            .iter()
+            .map(|(l, _)| l.value.size().y.max(line_h))
+            .sum();
+        let (box_w, box_h) = (content_w + 2.0 * pad, content_h + 2.0 * pad);
+        let margin = 16.0;
+        let top = if self.osd_position == 0 {
+            viewport.top() + margin
+        } else {
+            viewport.bottom() - margin - box_h
+        };
+        let left = (viewport.center().x - box_w / 2.0).max(viewport.left() + margin);
+        let rect = egui::Rect::from_min_size(egui::pos2(left, top), egui::vec2(box_w, box_h));
+        painter.rect_filled(
+            rect,
+            8.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, av(180.0)),
+        );
+        painter.rect_stroke(
+            rect,
+            8.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, av(36.0))),
+            egui::StrokeKind::Inside,
+        );
+        let x = rect.left() + pad;
+        let mut y = rect.top() + pad;
+        for (l, _) in &laid {
+            let h = l.value.size().y.max(line_h);
+            if let Some(lg) = &l.label {
+                let ly = y + (h - lg.size().y) / 2.0;
+                painter.galley(egui::pos2(x, ly), lg.clone(), label_col);
+                painter.galley(egui::pos2(x + label_w + gap, ly), l.value.clone(), egui::Color32::WHITE);
+            } else {
+                painter.galley(egui::pos2(x, y + (h - l.value.size().y) / 2.0), l.value.clone(), egui::Color32::WHITE);
+            }
+            y += h;
+        }
     }
 
     /// Apply a click with modifiers: Ctrl toggles, Shift range-selects, plain
@@ -8355,6 +8550,24 @@ impl eframe::App for PixelView {
                     }
 
                     ui.add_space(10.0);
+                    ui.label("Viewer info OSD");
+                    ui.checkbox(&mut self.osd_enabled, "Show metadata overlay on open")
+                        .on_hover_text("A fading panel with the piece's details");
+                    ui.add_enabled_ui(self.osd_enabled, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Position");
+                            ui.selectable_value(&mut self.osd_position, 0, "Top");
+                            ui.selectable_value(&mut self.osd_position, 1, "Bottom");
+                        });
+                        ui.add(
+                            egui::Slider::new(&mut self.osd_secs, 0.5..=15.0)
+                                .suffix(" s")
+                                .text("Hold"),
+                        )
+                        .on_hover_text("How long it stays before fading out");
+                    });
+
+                    ui.add_space(10.0);
                     ui.label("16colo.rs cache");
                     let (bytes, count) = crate::cache::stats();
                     ui.horizontal(|ui| {
@@ -8485,6 +8698,9 @@ impl eframe::App for PixelView {
             &self.crt_scanline_scale,
         );
         eframe::set_value(storage, Self::BLACK_BG_KEY, &self.black_bg);
+        eframe::set_value(storage, Self::OSD_ENABLED_KEY, &self.osd_enabled);
+        eframe::set_value(storage, Self::OSD_POSITION_KEY, &self.osd_position);
+        eframe::set_value(storage, Self::OSD_SECS_KEY, &self.osd_secs);
         eframe::set_value(storage, Self::AUTO_NEXT_KEY, &self.auto_next);
         eframe::set_value(storage, Self::AUTO_NEXT_SECS_KEY, &self.auto_next_secs);
         eframe::set_value(storage, Self::GLOW_KEY, &self.glow);
