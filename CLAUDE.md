@@ -117,7 +117,7 @@ cargo build --release
 cargo check              # fast type-check during edits
 cargo clippy             # lint
 cargo fmt                # format
-cargo test               # 79 tests (76 unit + 3 headless egui_kittest GUI tests; +1 ignored real-trash)
+cargo test               # 161 tests (151 unit + 10 headless egui_kittest GUI tests; +11 ignored network/real-trash)
 cargo test gui_tests     # just the egui_kittest UI tests; cargo test <name> for one
 ```
 
@@ -776,17 +776,20 @@ than assuming a logic bug. Already hit and migrated for 0.34.3:
 
 ## Testing
 
-`cargo test` runs 79 tests, all headless (plus 1 `#[ignore]` real-trash round-trip):
+`cargo test` runs 161 tests, all headless (151 unit + 10 GUI; plus 11 `#[ignore]`
+network / real-trash tests that hit the live 16colo.rs API or the system trash):
 - **Unit tests** (`#[cfg(test)] mod tests` per module): PCX decode + sniff,
   `Registry` dispatch (incl. a real PNG via the `image` crate), `make_thumb` /
   `count_colors`, `PixImage` palette expansion, `rating.rs` parse/encode + a
-  guarded xattr round-trip, and `sorted_filtered_view` (the sort/filter logic,
-  extracted from `rebuild_view` so it's testable without a `PixelView`).
+  guarded xattr round-trip, `sorted_filtered_view` (the sort/filter logic,
+  extracted from `rebuild_view` so it's testable without a `PixelView`), `sauce`
+  (record + COMNT parsing), `sixteen` (JSON → pieces + URL `#`-encoding), the RIP
+  rasterizer (golden-scene guards), and `viewdb` round-trips.
 - **GUI tests** (`gui_tests` in `app.rs`, via the `egui_kittest` dev-dep with its
   `eframe` feature): `Harness::builder().build_eframe(|cc| PixelView::new(cc,
   CliArgs::default()))` boots the real app with no window and drives menus through
   AccessKit. Custom-*painted* grid tiles have no a11y label, so kittest covers the
-  chrome (menus/dialogs), not the tiles.
+  chrome (menus/dialogs/Preferences), not the tiles.
 
 For a **visual** check on KDE Wayland (KWin has no wlroots screencopy, so `grim`
 fails): run under XWayland so `xdotool` can target the window, capture with KDE's
