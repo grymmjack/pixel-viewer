@@ -3073,66 +3073,97 @@ impl PixelView {
     /// Dolphin-style breadcrumb bar: clickable path segments, with a "✎" toggle
     /// that swaps in an editable text field (Enter navigates).
     fn ui_breadcrumbs(&mut self, ui: &mut egui::Ui) {
-        let Some(folder) = self.folder.clone() else {
-            return;
-        };
-        // Inside a mounted archive, show the archive's path (…/pack.zip/sub), not the
-        // temp dir; clicks/edits map back to real paths via `real_path`.
-        let disp = self.to_display(&folder);
+        // While the full-width path editor is open it owns the whole row, so the
+        // favorites are suppressed until it closes.
+        let editing = self.path_edit.is_some();
         ui.horizontal(|ui| {
-            if let Some(mut text) = self.path_edit.take() {
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut text)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("Type a folder path — Enter to go, Esc to cancel"),
-                );
-                if self.focus_path {
-                    resp.request_focus();
-                    self.focus_path = false;
-                }
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if enter {
-                    let p = self.real_path(&PathBuf::from(text.trim()));
-                    if p.is_dir() {
-                        self.open_folder(p);
-                    } else {
-                        self.status = format!("Not a folder: {text}");
+            if let Some(folder) = self.folder.clone() {
+                // Inside a mounted archive, show the archive's path (…/pack.zip/sub),
+                // not the temp dir; clicks/edits map back to real paths via `real_path`.
+                let disp = self.to_display(&folder);
+                if let Some(mut text) = self.path_edit.take() {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut text)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("Type a folder path — Enter to go, Esc to cancel"),
+                    );
+                    if self.focus_path {
+                        resp.request_focus();
+                        self.focus_path = false;
                     }
-                    // leave edit mode (path_edit already taken -> stays None)
-                } else if resp.lost_focus() {
-                    // clicked away / Esc — cancel, stay in breadcrumb mode
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if enter {
+                        let p = self.real_path(&PathBuf::from(text.trim()));
+                        if p.is_dir() {
+                            self.open_folder(p);
+                        } else {
+                            self.status = format!("Not a folder: {text}");
+                        }
+                        // leave edit mode (path_edit already taken -> stays None)
+                    } else if resp.lost_focus() {
+                        // clicked away / Esc — cancel, stay in breadcrumb mode
+                    } else {
+                        self.path_edit = Some(text); // still editing
+                    }
                 } else {
-                    self.path_edit = Some(text); // still editing
-                }
-            } else {
-                if ui.button("✎").on_hover_text("Edit path").clicked() {
-                    self.path_edit = Some(disp.to_string_lossy().into_owned());
-                    self.focus_path = true;
-                }
-                ui.separator();
-                let crumbs: Vec<PathBuf> = disp
-                    .ancestors()
-                    .filter(|p| !p.as_os_str().is_empty()) // virtual paths end in ""
-                    .map(|p| p.to_path_buf())
-                    .collect();
-                for (i, a) in crumbs.iter().rev().enumerate() {
-                    if i > 0 {
-                        ui.label("›");
+                    if ui.button("✎").on_hover_text("Edit path").clicked() {
+                        self.path_edit = Some(disp.to_string_lossy().into_owned());
+                        self.focus_path = true;
                     }
-                    let label = a
-                        .file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| a.to_string_lossy().into_owned());
-                    // Show the virtual 16colo.rs root by its friendly name.
-                    let label = if label == crate::sixteen::ROOT {
-                        "16colo.rs".to_string()
-                    } else {
-                        label
-                    };
-                    if ui.button(label).clicked() {
-                        let real = self.real_path(a);
-                        self.open_folder(real);
+                    ui.separator();
+                    let crumbs: Vec<PathBuf> = disp
+                        .ancestors()
+                        .filter(|p| !p.as_os_str().is_empty()) // virtual paths end in ""
+                        .map(|p| p.to_path_buf())
+                        .collect();
+                    for (i, a) in crumbs.iter().rev().enumerate() {
+                        if i > 0 {
+                            ui.label("›");
+                        }
+                        let label = a
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| a.to_string_lossy().into_owned());
+                        // Show the virtual 16colo.rs root by its friendly name.
+                        let label = if label == crate::sixteen::ROOT {
+                            "16colo.rs".to_string()
+                        } else {
+                            label
+                        };
+                        if ui.button(label).clicked() {
+                            let real = self.real_path(a);
+                            self.open_folder(real);
+                        }
                     }
+                }
+            }
+            // Favorites now live at the right end of the path row — their own
+            // near-empty "Favorites: ★ Pin" strip was removed to reclaim a whole row
+            // of vertical space. ★ Pin adds the current folder (disabled when none is
+            // open); the 📁 chips jump to a pinned folder (drag to reorder, right-click
+            // to remove — also mirrored in the Places dock). A plain horizontal can
+            // only clip at the panel edge, never overlap, so a long path stays safe.
+            if !editing {
+                if self.folder.is_some() {
+                    ui.separator();
+                }
+                let can_pin = self
+                    .folder
+                    .as_ref()
+                    .is_some_and(|f| !self.favorites.contains(f));
+                if ui
+                    .add_enabled(can_pin, egui::Button::new("★ Pin"))
+                    .on_hover_text("Pin this folder to Favorites / Places")
+                    .clicked()
+                {
+                    if let Some(f) = self.folder.clone() {
+                        if !self.favorites.contains(&f) {
+                            self.favorites.push(f);
+                        }
+                    }
+                }
+                if let Some(p) = self.favorites_buttons(ui, "📁", |_| true) {
+                    self.open_folder(p);
                 }
             }
         });
@@ -3221,31 +3252,6 @@ impl PixelView {
         if let Some(p) = nav {
             self.open_folder(p);
         }
-    }
-
-    /// Pinned-folder buttons under the menu bar. Click to jump; drag to reorder;
-    /// right-click to remove.
-    fn ui_favorites(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Favorites:");
-            let can_pin = self
-                .folder
-                .as_ref()
-                .is_some_and(|f| !self.favorites.contains(f));
-            if ui
-                .add_enabled(can_pin, egui::Button::new("★ Pin"))
-                .clicked()
-            {
-                if let Some(f) = self.folder.clone() {
-                    if !self.favorites.contains(&f) {
-                        self.favorites.push(f);
-                    }
-                }
-            }
-            if let Some(p) = self.favorites_buttons(ui, "📁", |_| true) {
-                self.open_folder(p);
-            }
-        });
     }
 
     /// Render the favorites as draggable, reorderable, right-click-removable
@@ -7671,12 +7677,14 @@ impl PixelView {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 match self.mode {
                     Mode::Single => {
-                        ui.weak("Z+1-0 / Ctrl+wheel zoom · drag to pan")
-                            .on_hover_text(
-                                "Zoom: Ctrl+wheel, or hold Z and press 1-9/0 or Z + +/- to \
-                                 step. Text-mode art (and 'Snap') step in whole device \
-                                 pixels per source pixel — shown as N×.",
-                            );
+                        // The full zoom/pan hint used to sit here permanently, eating
+                        // ~200px of the right edge on every screen. Collapse it to a
+                        // compact "?" that carries the same text as a tooltip.
+                        ui.weak("?").on_hover_text(
+                            "Zoom: Ctrl+wheel, or hold Z and press 1-9/0 or Z + +/- to \
+                             step. Drag to pan. Text-mode art (and 'Snap') step in whole \
+                             device pixels per source pixel — shown as N×.",
+                        );
                         ui.separator();
                         // Pixel-perfect art reads in device-pixels-per-source-pixel
                         // ("N×", always a whole step) — clearer than a fractional % on a
@@ -8752,10 +8760,12 @@ impl eframe::App for PixelView {
                 .as_ref()
                 .is_some_and(|m| crate::sixteen::is_remote(&m.archive));
         if show_top {
-            egui::Panel::top("favorites").show_inside(ui, |ui| self.ui_favorites(ui));
-            if self.folder.is_some() {
-                egui::Panel::top("crumbs").show_inside(ui, |ui| self.ui_breadcrumbs(ui));
-            }
+            // Breadcrumb row hosts the path *and* the favorites (★ Pin + 📁 chips) at
+            // its right end — the old standalone "favorites" panel was merged in to
+            // reclaim a whole row of vertical space. Always shown (even before a folder
+            // is open, so favorites stay reachable for a quick jump); ui_breadcrumbs
+            // renders just the favorites when there's no folder.
+            egui::Panel::top("crumbs").show_inside(ui, |ui| self.ui_breadcrumbs(ui));
             // 16colo.rs quick-jump nav bar — shown while browsing the archive (also inside
             // a mounted pack, whose display path is the virtual one).
             if in_colo {
