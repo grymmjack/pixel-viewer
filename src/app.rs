@@ -3247,7 +3247,7 @@ impl PixelView {
                     set_color = Some((i, None));
                     ui.close();
                 }
-                // The ANSI32 swatches packed tight in an 8×4 grid.
+                // The ANSI32 swatches: sharp 18px squares, packed tight in an 8×4 grid.
                 egui::Grid::new(("fav_color_grid", i))
                     .spacing([1.0, 1.0])
                     .min_col_width(0.0)
@@ -3256,13 +3256,20 @@ impl PixelView {
                             if n > 0 && n % 8 == 0 {
                                 ui.end_row();
                             }
-                            let mut sw = egui::Button::new("")
-                                .fill(egui::Color32::from_rgb(c[0], c[1], c[2]))
-                                .min_size(egui::vec2(18.0, 18.0));
-                            if color == Some(c) {
-                                sw = sw.stroke(egui::Stroke::new(2.0, egui::Color32::WHITE));
-                            }
-                            if ui.add(sw).clicked() {
+                            let (rect, resp) = ui
+                                .allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                            let col = egui::Color32::from_rgb(c[0], c[1], c[2]);
+                            ui.painter().rect_filled(rect, 0.0, col); // 0 radius = square
+                            let outline = if color == Some(c) {
+                                egui::Stroke::new(2.0, egui::Color32::WHITE)
+                            } else if resp.hovered() {
+                                egui::Stroke::new(1.0, egui::Color32::WHITE)
+                            } else {
+                                egui::Stroke::new(1.0, egui::Color32::from_black_alpha(70))
+                            };
+                            ui.painter()
+                                .rect_stroke(rect, 0.0, outline, egui::StrokeKind::Inside);
+                            if resp.clicked() {
                                 set_color = Some((i, Some(c)));
                                 ui.close();
                             }
