@@ -6588,10 +6588,13 @@ impl PixelView {
                             p.acc = 0.0;
                             p.playing = false;
                         }
+                        // The slider already shows the byte position, so don't repeat it:
+                        // just the percent, total size, and baud. (Was "{pos} / {len} bytes"
+                        // with {pos} printed three times — slider value + here, twice.)
                         let pct = if len > 0 { p.pos * 100 / len } else { 100 };
                         ui.label(format!(
-                            "{pct}%  ·  {} / {len} bytes  ·  {} baud",
-                            p.pos,
+                            "{pct}%  ·  {}  ·  {} baud",
+                            human_size(len as u64),
                             baud.label()
                         ));
                     });
@@ -7715,36 +7718,74 @@ impl PixelView {
                         {
                             self.fit_width_on_open = true;
                         }
-                        // Only meaningful for text-mode art, so only shown for it.
-                        if self.viewing_textmode {
-                            ui.checkbox(&mut self.crt_aspect, "CRT").on_hover_text(
-                                "Stretch text-mode art ≈1.2× vertically to match the \
-                                 non-square pixels of a 4:3 VGA monitor (off = exact pixels)",
-                            );
-                            // 9-dot VGA cell width: the real DOS text cell was 9px
-                            // wide for the 8px font (independent of the CRT stretch).
-                            if ui
-                                .checkbox(&mut self.font_9px, "9px")
-                                .on_hover_text(
-                                    "Render the VGA font in a 9-dot-wide cell, like real \
-                                     DOS text mode — adds the inter-character gap and \
-                                     joins box-draw rules (off = exact 8-pixel cells)",
-                                )
-                                .changed()
-                            {
-                                crate::decode::set_font_9px(self.font_9px);
-                                let ctx = ui.ctx().clone();
-                                self.redecode_full(&ctx);
-                                if let Some(p) = &mut self.player {
-                                    p.tex = None; // re-render the frame at the new cell width
+                        ui.separator();
+                        // Retro-monitor effects, collapsed into one popover. These are
+                        // set-once "look" settings (scanlines / glow / CRT aspect / 9px /
+                        // background); inlining all ~9 widgets is what overflowed the bar
+                        // and let the left button group paint over them. CRT aspect + the
+                        // 9-dot cell only make sense for text-mode art, so they're gated.
+                        ui.menu_button("📺 CRT", |ui| {
+                            if self.viewing_textmode {
+                                ui.checkbox(&mut self.crt_aspect, "CRT aspect (1.2× V)")
+                                    .on_hover_text(
+                                        "Stretch text-mode art ≈1.2× vertically to match the \
+                                         non-square pixels of a 4:3 VGA monitor (off = exact pixels)",
+                                    );
+                                // 9-dot VGA cell width: the real DOS text cell was 9px
+                                // wide for the 8px font (independent of the CRT stretch).
+                                if ui
+                                    .checkbox(&mut self.font_9px, "9-dot VGA cell (9px)")
+                                    .on_hover_text(
+                                        "Render the VGA font in a 9-dot-wide cell, like real \
+                                         DOS text mode — adds the inter-character gap and \
+                                         joins box-draw rules (off = exact 8-pixel cells)",
+                                    )
+                                    .changed()
+                                {
+                                    crate::decode::set_font_9px(self.font_9px);
+                                    let ctx = ui.ctx().clone();
+                                    self.redecode_full(&ctx);
+                                    if let Some(p) = &mut self.player {
+                                        p.tex = None; // re-render the frame at the new cell width
+                                    }
                                 }
+                                ui.separator();
                             }
-                        }
-                        // Baud picker — simulate a modem typing out the art. Shown for
-                        // stream-playable art; RIP and ANSI remember their own speed.
-                        // Changing it restarts the open file.
+                            ui.add(
+                                egui::Slider::new(&mut self.crt_scanline_dark, 0.0..=1.0)
+                                    .show_value(false)
+                                    .text("scanlines"),
+                            )
+                            .on_hover_text("Scanline darkness (0 = off)");
+                            ui.checkbox(&mut self.crt_scanline_scale, "scale with zoom")
+                                .on_hover_text(
+                                    "Scale the scanline spacing with the zoom — one line per \
+                                     source-pixel row, so the lines grow as you zoom in \
+                                     (off = fixed fine lines)",
+                                );
+                            ui.checkbox(&mut self.glow, "glow").on_hover_text(
+                                "Phosphor glow — a soft bloom around bright pixels, like a \
+                                 late-night CRT",
+                            );
+                            ui.add_enabled(
+                                self.glow,
+                                egui::Slider::new(&mut self.glow_amt, 0.0..=1.0)
+                                    .show_value(false)
+                                    .text("amt"),
+                            )
+                            .on_hover_text("Phosphor glow intensity");
+                            ui.checkbox(&mut self.black_bg, "black background")
+                                .on_hover_text("Fill the viewer background black (off = dark grey)");
+                        })
+                        .response
+                        .on_hover_text(
+                            "Retro monitor effects — scanlines, phosphor glow, CRT aspect, \
+                             9-dot cell, background",
+                        );
+                        // Baud picker — simulate a modem typing out the art. Shown only
+                        // while a stream player exists (during playback), so it never adds
+                        // to the at-rest width. RIP and ANSI remember their own speed.
                         if self.player.is_some() {
-                            ui.separator();
                             let is_rip = self.player.as_ref().is_some_and(|p| p.stream.is_rip());
                             let mut baud = if is_rip {
                                 self.baud_rip
@@ -7784,72 +7825,67 @@ impl PixelView {
                                 }
                             }
                         }
-                        // Retro-monitor effects — apply to any image in the viewer.
-                        ui.separator();
-                        ui.label("📺").on_hover_text("Retro monitor effects");
-                        ui.add(
-                            egui::Slider::new(&mut self.crt_scanline_dark, 0.0..=1.0)
-                                .show_value(false)
-                                .text("scanlines"),
-                        )
-                        .on_hover_text("Scanline darkness (0 = off)");
-                        ui.checkbox(&mut self.crt_scanline_scale, "scale")
-                            .on_hover_text(
-                                "Scale the scanline spacing with the zoom — one line per \
-                                 source-pixel row, so the lines grow as you zoom in \
-                                 (off = fixed fine lines)",
-                            );
-                        ui.checkbox(&mut self.glow, "glow").on_hover_text(
-                            "Phosphor glow — a soft bloom around bright pixels, like a \
-                             late-night CRT",
-                        );
-                        ui.add_enabled(
-                            self.glow,
-                            egui::Slider::new(&mut self.glow_amt, 0.0..=1.0)
-                                .show_value(false)
-                                .text("amt"),
-                        )
-                        .on_hover_text("Phosphor glow intensity");
-                        ui.checkbox(&mut self.black_bg, "black bg")
-                            .on_hover_text("Fill the viewer background black (off = dark grey)");
-                        // Slideshow: auto-advance through the folder, with a delay picker.
-                        // When a user interaction has paused it, the label goes yellow and a
-                        // click *resumes* (rather than toggling the slideshow off).
-                        ui.separator();
-                        let resumed = self.auto_paused;
-                        let label = if self.auto_paused {
-                            egui::RichText::new("auto ▶").color(egui::Color32::from_rgb(255, 210, 70))
+                        // Slideshow + random-pack screensaver, collapsed into one popover.
+                        // The "auto ▶" toggle goes yellow when a user interaction paused it,
+                        // and clicking it then *resumes* rather than toggling the slideshow
+                        // off — so the toggle stays in the menu but keeps that behavior.
+                        let auto_running = self.auto_next;
+                        let auto_label = if self.auto_paused {
+                            egui::RichText::new("▶ Auto")
+                                .color(egui::Color32::from_rgb(255, 210, 70))
                         } else {
-                            egui::RichText::new("auto ▶")
+                            egui::RichText::new("▶ Auto")
                         };
-                        let hover = if self.auto_paused {
-                            "Slideshow paused — you took control. Click to resume."
-                        } else {
-                            "Auto-advance to the next file after it finishes drawing \
-                             plus the chosen delay — flip through a whole pack hands-free"
-                        };
-                        if ui.checkbox(&mut self.auto_next, label).on_hover_text(hover).changed() {
-                            if resumed {
-                                self.auto_next = true; // clicking while paused resumes, not off
-                            }
-                            self.auto_paused = false;
-                            self.auto_next_dwell = 0.0;
-                        }
-                        egui::ComboBox::from_id_salt("auto_next_secs")
-                            .selected_text(format!("{}s", self.auto_next_secs))
-                            .show_ui(ui, |ui| {
-                                for s in [1u8, 3, 5, 10] {
-                                    ui.selectable_value(
-                                        &mut self.auto_next_secs,
-                                        s,
-                                        format!("{s}s"),
-                                    );
+                        ui.menu_button(auto_label, |ui| {
+                            let resumed = self.auto_paused;
+                            let label = if self.auto_paused {
+                                egui::RichText::new("auto-advance (paused)")
+                                    .color(egui::Color32::from_rgb(255, 210, 70))
+                            } else {
+                                egui::RichText::new("auto-advance")
+                            };
+                            let hover = if self.auto_paused {
+                                "Slideshow paused — you took control. Click to resume."
+                            } else {
+                                "Auto-advance to the next file after it finishes drawing \
+                                 plus the chosen delay — flip through a whole pack hands-free"
+                            };
+                            if ui
+                                .checkbox(&mut self.auto_next, label)
+                                .on_hover_text(hover)
+                                .changed()
+                            {
+                                if resumed {
+                                    self.auto_next = true; // clicking while paused resumes, not off
                                 }
-                            })
-                            .response
-                            .on_hover_text("Seconds to wait before advancing");
-                        ui.separator();
-                        self.ui_shuffle_controls(ui);
+                                self.auto_paused = false;
+                                self.auto_next_dwell = 0.0;
+                            }
+                            ui.horizontal(|ui| {
+                                ui.label("delay");
+                                egui::ComboBox::from_id_salt("auto_next_secs")
+                                    .selected_text(format!("{}s", self.auto_next_secs))
+                                    .show_ui(ui, |ui| {
+                                        for s in [1u8, 3, 5, 10] {
+                                            ui.selectable_value(
+                                                &mut self.auto_next_secs,
+                                                s,
+                                                format!("{s}s"),
+                                            );
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text("Seconds to wait before advancing");
+                            });
+                            ui.separator();
+                            self.ui_shuffle_controls(ui);
+                        })
+                        .response
+                        .on_hover_text(if auto_running {
+                            "Slideshow + random-pack screensaver (running)"
+                        } else {
+                            "Slideshow + random-pack screensaver"
+                        });
                     }
                     Mode::Grid => {
                         if !self.entries.is_empty() {
