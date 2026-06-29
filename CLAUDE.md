@@ -423,8 +423,12 @@ rematch**, and the *order* of all of it is user-controlled.
   *decode-time* change (the texture width grows ~12.5%, 80 cols → 720px), so it's a
   process-global flag (`decode::set_font_9px`, read by `AnsiDecoder`) primed from
   storage on startup; toggling it calls `redecode_full` to rebuild the viewer texture
-  in place (keeping zoom/pan). This is why ansilove/16colo (9-dot) render wider than a
-  naive 8px blit. Thumbnails aren't re-rendered on toggle (sub-pixel at thumb scale).
+  in place (keeping zoom/pan). `redecode_full` decodes `resolve_local(path)` (the **real**
+  cache file) while keeping the virtual `path` as the stored identity — same split as
+  `load_full`; without it, re-decoding a 16colo piece read the *virtual* path off disk,
+  failed silently, and the toggle was a no-op. This is why ansilove/16colo (9-dot) render
+  wider than a naive 8px blit. Thumbnails aren't re-rendered on toggle (sub-pixel at thumb
+  scale).
 - **Baud-rate playback** (ANSImation / "watch RIP draw"). The whole engine is "render
   the first N bytes into a fixed-size canvas": `ansi::TextStream` and `rip::RipStream`
   parse a byte *prefix* (canvas sized from the whole file so frames don't resize). The

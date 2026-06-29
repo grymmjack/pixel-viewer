@@ -3001,7 +3001,12 @@ impl PixelView {
         else {
             return;
         };
-        match self.registry.decode_path(&path) {
+        // Decode the *real* file (a 16colo piece's bytes live at a cache path keyed by the
+        // virtual display path), keeping `path` as the stored identity — same split as
+        // `load_full`. Without this, re-decoding a 16colo/virtual piece tried to read the
+        // virtual path off disk, failed, and left the view unchanged (9px toggle no-op).
+        let src = self.resolve_local(&path);
+        match self.registry.decode_path(&src) {
             Ok(img) => {
                 let size = [img.width as usize, img.height as usize];
                 let rgba = img.rgba_bytes();
