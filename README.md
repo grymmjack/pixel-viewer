@@ -211,7 +211,9 @@ order, CRT toggles, baud rates — is **remembered between runs**.
   sort bar (persisted). The table is a hand-rolled, virtualized, sortable list: click a
   header to sort (click again to reverse), **right-click** a header to sort or show/hide
   columns, **drag a column border** to resize, and **drag a header** to reorder. The same
-  selection, ratings, keyboard nav and context menu work in both views.
+  selection, ratings, keyboard nav and context menu work in both views. Rows are
+  zebra-striped; optional **dividing lines** (Preferences → *Table dividing lines*) add a
+  subtle row/column grid.
 - **View history** — once you've opened a piece it's marked visited: a **painted check
   badge** on its tile (and a browser-style "visited link" colour in the table). View count
   and last-viewed show in the Details pane; right-click → *Mark as (not) viewed* to override.

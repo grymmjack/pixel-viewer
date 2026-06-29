@@ -970,6 +970,8 @@ pub struct PixelView {
     // Table view (an alternate renderer for the browse/grid mode — `Mode` stays
     // `Grid`, so selection/ratings/nav/keys all work unchanged). Persisted.
     table_view: bool,
+    // Draw subtle row/column dividing lines in the table (zebra is always on). Persisted.
+    table_grid: bool,
     // Which optional file columns show in the table (bitmask of TC_*). Persisted.
     table_columns: u16,
     // Which optional 16colo *scene* columns show (bitmask of CS_*). Persisted.
@@ -1076,6 +1078,8 @@ impl PixelView {
     const KEYMAP_KEY: &'static str = "keymap";
     /// Whether the browse view renders as a table (vs the thumbnail grid).
     const TABLE_VIEW_KEY: &'static str = "table_view";
+    /// Whether the table draws subtle row/column dividing lines.
+    const TABLE_GRID_KEY: &'static str = "table_grid";
     /// Bitmask of optional table columns shown (TC_*).
     const TABLE_COLUMNS_KEY: &'static str = "table_columns";
     const COLO_COLUMNS_KEY: &'static str = "colo_columns";
@@ -1145,6 +1149,7 @@ impl PixelView {
         let sort_key = SortKey::from_u8(get_u8(Self::SORT_KEY).unwrap_or(0));
         let sort_desc = get_bool(Self::SORT_DESC).unwrap_or(false);
         let table_view = get_bool(Self::TABLE_VIEW_KEY).unwrap_or(false);
+        let table_grid = get_bool(Self::TABLE_GRID_KEY).unwrap_or(false);
         let table_columns = cc
             .storage
             .and_then(|s| eframe::get_value::<u16>(s, Self::TABLE_COLUMNS_KEY))
@@ -1518,6 +1523,7 @@ impl PixelView {
             ui_zoom,
             thumb_size,
             table_view,
+            table_grid,
             table_columns,
             colo_columns,
             col_widths,
@@ -5591,6 +5597,10 @@ impl PixelView {
         let scene = self.colo_flat;
         let row_h = 46.0_f32;
         let cell_pad = 12.0_f32; // horizontal breathing room inside every cell
+        // Optional subtle row/column dividers (zebra striping is always on). A faint,
+        // theme-agnostic translucent grey so it reads on both light and dark.
+        let grid_lines = self.table_grid;
+        let divider = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(128, 128, 128, 46));
 
         // Column set + widths. The name/filename (and scene artist) columns flex to
         // absorb leftover width so the table always spans the panel; the rest are fixed.
@@ -6179,6 +6189,18 @@ impl PixelView {
                         });
                     }
                 });
+
+                // Optional dividing lines (over the cells, under nothing else): a bottom
+                // row separator + a vertical line at each interior column boundary.
+                if grid_lines {
+                    let p = ui.painter();
+                    p.hline(row_rect.x_range(), row_rect.max.y - 0.5, divider);
+                    let mut x = row_rect.min.x;
+                    for c in cols.iter().take(cols.len().saturating_sub(1)) {
+                        x += c.w;
+                        p.vline(x, row_rect.y_range(), divider);
+                    }
+                }
 
                 if let Some(resp) = row_resp {
                     let resp = resp.on_hover_ui(|ui| hover_details(ui, &entry, meta));
@@ -8854,6 +8876,11 @@ impl eframe::App for PixelView {
                     self.caption_fields = fields;
 
                     ui.add_space(10.0);
+                    ui.checkbox(&mut self.table_grid, "Table dividing lines")
+                        .on_hover_text(
+                            "Draw subtle row + column divider lines in the table view \
+                             (in addition to the zebra striping)",
+                        );
                     ui.label("Table columns (file view)");
                     let mut tcols = self.table_columns;
                     ui.horizontal_wrapped(|ui| {
@@ -9035,6 +9062,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::SORT_KEY, &self.sort_key.to_u8());
         eframe::set_value(storage, Self::SORT_DESC, &self.sort_desc);
         eframe::set_value(storage, Self::TABLE_VIEW_KEY, &self.table_view);
+        eframe::set_value(storage, Self::TABLE_GRID_KEY, &self.table_grid);
         eframe::set_value(storage, Self::TABLE_COLUMNS_KEY, &self.table_columns);
         eframe::set_value(storage, Self::COLO_COLUMNS_KEY, &self.colo_columns);
         let widths: Vec<(u8, f32)> = self.col_widths.iter().map(|(&k, &w)| (k, w)).collect();

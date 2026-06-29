@@ -252,6 +252,9 @@ sorts like `Colors` (unknown-last in both directions). The toggle is also the re
 `Action::ToggleView` (default **`T`**, browse-mode only so it never clashes with `T` =
 tile in the single view), shown in Preferences → Hotkeys + the Help window. Each cell
 has `cell_pad` breathing room and clips its text to the cell, so columns never touch.
+Rows always paint a **zebra stripe** (odd rows); the optional **`table_grid`** toggle
+(Preferences → "Table dividing lines", persisted) additionally draws a subtle translucent
+**bottom row separator + interior column dividers** per row (painted over the cells).
 Columns key off a `ColKind` (not a position), so the **file** layout's optional columns
 are user-toggled via a `TC_*` bitmask (`table_columns`, persisted; Preferences → "Table
 columns" *and* the header right-click menu) and the **scene** layout's via a parallel
