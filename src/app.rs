@@ -13029,6 +13029,46 @@ mod gui_tests {
     }
 }
 
+/// Renders real GUI screenshots of the app chrome to `target/gui-screenshots/`,
+/// for CI artifacts / visual review. Gated behind the `gui-screenshots` feature
+/// because it needs egui_kittest's wgpu backend (a Vulkan driver — lavapipe in
+/// CI); the normal `cargo test` neither compiles wgpu nor needs a GPU. Run with
+/// `cargo test --features gui-screenshots gui_screenshots`.
+#[cfg(all(test, feature = "gui-screenshots"))]
+mod gui_screenshots {
+    use super::*;
+    use egui_kittest::kittest::Queryable;
+    use egui_kittest::Harness;
+
+    fn shot(harness: &mut Harness<'_, PixelView>, name: &str) {
+        let dir = std::path::Path::new("target/gui-screenshots");
+        std::fs::create_dir_all(dir).expect("create screenshot dir");
+        let img = harness.render().expect("wgpu render failed");
+        img.save(dir.join(format!("{name}.png")))
+            .expect("save screenshot png");
+    }
+
+    #[test]
+    fn render_chrome_screenshots() {
+        let mut harness = Harness::builder()
+            .with_size([1280.0, 860.0])
+            .wgpu()
+            .build_eframe(|cc| PixelView::new(cc, CliArgs::default()));
+        harness.run();
+        shot(&mut harness, "01-startup");
+
+        // The View menu (Grid/Table toggle, panes, Preferences…).
+        harness.get_by_label("View").click();
+        harness.run();
+        shot(&mut harness, "02-view-menu");
+
+        // The Preferences dialog (theme, grid spacing, hotkeys, OSD…).
+        harness.get_by_label("Preferences…").click();
+        harness.run();
+        shot(&mut harness, "03-preferences");
+    }
+}
+
 #[cfg(test)]
 mod hold_test {
     use super::*;

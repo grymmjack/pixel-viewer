@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # eframe/winit + native decoders (openssl) build/link deps. See CLAUDE.md.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev xvfb
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The 161 tests are headless (egui_kittest drives the app via AccessKit with
+      # no window); xvfb is a cheap safety net in case winit probes a display.
+      - name: cargo test
+        run: xvfb-run -a cargo test --locked
+
+  screenshots:
+    name: GUI screenshots (artifact)
+    runs-on: ubuntu-latest
+    # Best-effort visual artifacts via software-rendered wgpu — a GPU/driver hiccup
+    # must never block the PR, so the job is allowed to fail.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same build deps + a software Vulkan implementation (Mesa lavapipe) so
+      # egui_kittest's wgpu backend can render with no real GPU.
+      - name: Install system dependencies + software Vulkan (lavapipe)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev xvfb \
+            mesa-vulkan-drivers vulkan-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Force the lavapipe (software) Vulkan ICD; render the chrome screenshots
+      # into target/gui-screenshots/. The wgpu deps the gui-screenshots feature
+      # pulls are pinned in the committed lockfile, so --locked is reproducible.
+      - name: Render GUI screenshots
+        env:
+          WGPU_BACKEND: vulkan
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: xvfb-run -a cargo test --locked --features gui-screenshots gui_screenshots -- --nocapture
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-screenshots
+          path: target/gui-screenshots/*.png
+          if-no-files-found: warn
