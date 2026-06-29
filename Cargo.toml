@@ -43,3 +43,10 @@ lto = "thin"
 
 [dev-dependencies]
 egui_kittest = { version = "0.34", features = ["eframe"] }
+
+[features]
+# Opt-in: render real GUI screenshots to target/gui-screenshots/ via
+# egui_kittest's wgpu backend (needs a Vulkan driver — lavapipe in CI). Off by
+# default so the normal `cargo test` stays GPU-free and doesn't compile wgpu.
+# Enabled only by the CI "screenshots" job: `cargo test --features gui-screenshots`.
+gui-screenshots = ["egui_kittest/wgpu", "egui_kittest/snapshot"]

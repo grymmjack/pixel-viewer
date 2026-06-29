@@ -1576,6 +1576,16 @@ impl PixelView {
             self.enter_archive(dir);
             return;
         }
+        // Opening a real local folder. If we were inside a mounted archive / 16colo.rs
+        // pack and this folder is *outside* that mount's extracted tree, we've left it —
+        // drop the stale mount so the 16colo.rs nav bar (and the archive breadcrumb)
+        // don't linger over a plain local folder. Navigating *within* the extracted tree
+        // (dir under temp_root) keeps the mount, so subfolders of an archive still work.
+        if let Some(m) = &self.archive_mount {
+            if !dir.starts_with(&m.temp_root) {
+                self.archive_mount = None;
+            }
+        }
         let mut all: Vec<Entry> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for e in rd.flatten() {
@@ -3073,66 +3083,97 @@ impl PixelView {
     /// Dolphin-style breadcrumb bar: clickable path segments, with a "✎" toggle
     /// that swaps in an editable text field (Enter navigates).
     fn ui_breadcrumbs(&mut self, ui: &mut egui::Ui) {
-        let Some(folder) = self.folder.clone() else {
-            return;
-        };
-        // Inside a mounted archive, show the archive's path (…/pack.zip/sub), not the
-        // temp dir; clicks/edits map back to real paths via `real_path`.
-        let disp = self.to_display(&folder);
+        // While the full-width path editor is open it owns the whole row, so the
+        // favorites are suppressed until it closes.
+        let editing = self.path_edit.is_some();
         ui.horizontal(|ui| {
-            if let Some(mut text) = self.path_edit.take() {
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut text)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("Type a folder path — Enter to go, Esc to cancel"),
-                );
-                if self.focus_path {
-                    resp.request_focus();
-                    self.focus_path = false;
-                }
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if enter {
-                    let p = self.real_path(&PathBuf::from(text.trim()));
-                    if p.is_dir() {
-                        self.open_folder(p);
-                    } else {
-                        self.status = format!("Not a folder: {text}");
+            if let Some(folder) = self.folder.clone() {
+                // Inside a mounted archive, show the archive's path (…/pack.zip/sub),
+                // not the temp dir; clicks/edits map back to real paths via `real_path`.
+                let disp = self.to_display(&folder);
+                if let Some(mut text) = self.path_edit.take() {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut text)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("Type a folder path — Enter to go, Esc to cancel"),
+                    );
+                    if self.focus_path {
+                        resp.request_focus();
+                        self.focus_path = false;
                     }
-                    // leave edit mode (path_edit already taken -> stays None)
-                } else if resp.lost_focus() {
-                    // clicked away / Esc — cancel, stay in breadcrumb mode
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if enter {
+                        let p = self.real_path(&PathBuf::from(text.trim()));
+                        if p.is_dir() {
+                            self.open_folder(p);
+                        } else {
+                            self.status = format!("Not a folder: {text}");
+                        }
+                        // leave edit mode (path_edit already taken -> stays None)
+                    } else if resp.lost_focus() {
+                        // clicked away / Esc — cancel, stay in breadcrumb mode
+                    } else {
+                        self.path_edit = Some(text); // still editing
+                    }
                 } else {
-                    self.path_edit = Some(text); // still editing
-                }
-            } else {
-                if ui.button("✎").on_hover_text("Edit path").clicked() {
-                    self.path_edit = Some(disp.to_string_lossy().into_owned());
-                    self.focus_path = true;
-                }
-                ui.separator();
-                let crumbs: Vec<PathBuf> = disp
-                    .ancestors()
-                    .filter(|p| !p.as_os_str().is_empty()) // virtual paths end in ""
-                    .map(|p| p.to_path_buf())
-                    .collect();
-                for (i, a) in crumbs.iter().rev().enumerate() {
-                    if i > 0 {
-                        ui.label("›");
+                    if ui.button("✎").on_hover_text("Edit path").clicked() {
+                        self.path_edit = Some(disp.to_string_lossy().into_owned());
+                        self.focus_path = true;
                     }
-                    let label = a
-                        .file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| a.to_string_lossy().into_owned());
-                    // Show the virtual 16colo.rs root by its friendly name.
-                    let label = if label == crate::sixteen::ROOT {
-                        "16colo.rs".to_string()
-                    } else {
-                        label
-                    };
-                    if ui.button(label).clicked() {
-                        let real = self.real_path(a);
-                        self.open_folder(real);
+                    ui.separator();
+                    let crumbs: Vec<PathBuf> = disp
+                        .ancestors()
+                        .filter(|p| !p.as_os_str().is_empty()) // virtual paths end in ""
+                        .map(|p| p.to_path_buf())
+                        .collect();
+                    for (i, a) in crumbs.iter().rev().enumerate() {
+                        if i > 0 {
+                            ui.label("›");
+                        }
+                        let label = a
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| a.to_string_lossy().into_owned());
+                        // Show the virtual 16colo.rs root by its friendly name.
+                        let label = if label == crate::sixteen::ROOT {
+                            "16colo.rs".to_string()
+                        } else {
+                            label
+                        };
+                        if ui.button(label).clicked() {
+                            let real = self.real_path(a);
+                            self.open_folder(real);
+                        }
                     }
+                }
+            }
+            // Favorites now live at the right end of the path row — their own
+            // near-empty "Favorites: ★ Pin" strip was removed to reclaim a whole row
+            // of vertical space. ★ Pin adds the current folder (disabled when none is
+            // open); the 📁 chips jump to a pinned folder (drag to reorder, right-click
+            // to remove — also mirrored in the Places dock). A plain horizontal can
+            // only clip at the panel edge, never overlap, so a long path stays safe.
+            if !editing {
+                if self.folder.is_some() {
+                    ui.separator();
+                }
+                let can_pin = self
+                    .folder
+                    .as_ref()
+                    .is_some_and(|f| !self.favorites.contains(f));
+                if ui
+                    .add_enabled(can_pin, egui::Button::new("★ Pin"))
+                    .on_hover_text("Pin this folder to Favorites / Places")
+                    .clicked()
+                {
+                    if let Some(f) = self.folder.clone() {
+                        if !self.favorites.contains(&f) {
+                            self.favorites.push(f);
+                        }
+                    }
+                }
+                if let Some(p) = self.favorites_buttons(ui, "📁", |_| true) {
+                    self.open_folder(p);
                 }
             }
         });
@@ -3221,31 +3262,6 @@ impl PixelView {
         if let Some(p) = nav {
             self.open_folder(p);
         }
-    }
-
-    /// Pinned-folder buttons under the menu bar. Click to jump; drag to reorder;
-    /// right-click to remove.
-    fn ui_favorites(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Favorites:");
-            let can_pin = self
-                .folder
-                .as_ref()
-                .is_some_and(|f| !self.favorites.contains(f));
-            if ui
-                .add_enabled(can_pin, egui::Button::new("★ Pin"))
-                .clicked()
-            {
-                if let Some(f) = self.folder.clone() {
-                    if !self.favorites.contains(&f) {
-                        self.favorites.push(f);
-                    }
-                }
-            }
-            if let Some(p) = self.favorites_buttons(ui, "📁", |_| true) {
-                self.open_folder(p);
-            }
-        });
     }
 
     /// Render the favorites as draggable, reorderable, right-click-removable
@@ -6553,10 +6569,14 @@ impl PixelView {
         // Baud-rate playback (ANSImation / "watch RIP draw"): a controls row + the
         // progressively-rendered frame. When fully played out (or paused at the end) it
         // falls through to the static path below, so recolor / minimap keep working on
-        // the complete image. The baud picker itself lives in the status bar.
+        // the complete image. The baud picker sits in this row next to Play/Replay/seek.
         if self.player.is_some() {
             let dt = ctx.input(|i| i.stable_dt);
             let baud = self.current_baud();
+            let is_rip = self.player.as_ref().is_some_and(|p| p.stream.is_rip());
+            // The combo mutates only this local (so it doesn't need `&mut self` while the
+            // player is borrowed below); the change is applied after the borrow ends.
+            let mut baud_choice = baud;
             let (active, just_finished) = {
                 let p = self.player.as_mut().unwrap();
                 let was_playing = p.playing;
@@ -6579,6 +6599,21 @@ impl PixelView {
                             p.acc = 0.0;
                             p.playing = true;
                         }
+                        // Baud picker, right by the transport controls: simulate a modem
+                        // typing the art out. RIP and ANSI keep separate remembered speeds.
+                        egui::ComboBox::from_id_salt("baud_pick")
+                            .selected_text(format!("⚡ {}", baud_choice.label()))
+                            .show_ui(ui, |ui| {
+                                for b in Baud::ALL {
+                                    ui.selectable_value(&mut baud_choice, b, b.label());
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Simulated modem baud rate — replay the art as it would have \
+                                 typed out over a dial-up connection (None = instant). RIP and \
+                                 ANSI keep separate speeds.",
+                            );
                         let mut pos = p.pos;
                         if ui
                             .add(egui::Slider::new(&mut pos, 0..=len).text("byte"))
@@ -6588,12 +6623,10 @@ impl PixelView {
                             p.acc = 0.0;
                             p.playing = false;
                         }
+                        // The slider already shows the byte position, so don't repeat it:
+                        // just the percent and total size (baud is the picker to the left).
                         let pct = if len > 0 { p.pos * 100 / len } else { 100 };
-                        ui.label(format!(
-                            "{pct}%  ·  {} / {len} bytes  ·  {} baud",
-                            p.pos,
-                            baud.label()
-                        ));
+                        ui.label(format!("{pct}%  ·  {}", human_size(len as u64)));
                     });
                 }
                 // Render one extra frame the moment it finishes, so the auto-scroll lands
@@ -6601,6 +6634,27 @@ impl PixelView {
                 let just_finished = was_playing && !p.playing;
                 (p.playing || p.pos < p.len || just_finished, just_finished)
             };
+            // Apply a baud change now that the player borrow above has ended: remember the
+            // per-kind speed and restart the transmission (or jump to the end for None).
+            if baud_choice != baud {
+                if is_rip {
+                    self.baud_rip = baud_choice;
+                } else {
+                    self.baud_ansi = baud_choice;
+                }
+                if let Some(p) = &mut self.player {
+                    if baud_choice == Baud::None {
+                        p.pos = p.len;
+                        p.playing = false;
+                    } else {
+                        p.pos = 0;
+                        p.acc = 0.0;
+                        p.playing = true;
+                    }
+                    p.tex = None;
+                }
+                self.want_repaint = true;
+            }
             if active {
                 let tex = self.player.as_mut().unwrap().frame(ctx);
                 let (playing, cursor_px) = {
@@ -7668,12 +7722,14 @@ impl PixelView {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 match self.mode {
                     Mode::Single => {
-                        ui.weak("Z+1-0 / Ctrl+wheel zoom · drag to pan")
-                            .on_hover_text(
-                                "Zoom: Ctrl+wheel, or hold Z and press 1-9/0 or Z + +/- to \
-                                 step. Text-mode art (and 'Snap') step in whole device \
-                                 pixels per source pixel — shown as N×.",
-                            );
+                        // The full zoom/pan hint used to sit here permanently, eating
+                        // ~200px of the right edge on every screen. Collapse it to a
+                        // compact "?" that carries the same text as a tooltip.
+                        ui.weak("?").on_hover_text(
+                            "Zoom: Ctrl+wheel, or hold Z and press 1-9/0 or Z + +/- to \
+                             step. Drag to pan. Text-mode art (and 'Snap') step in whole \
+                             device pixels per source pixel — shown as N×.",
+                        );
                         ui.separator();
                         // Pixel-perfect art reads in device-pixels-per-source-pixel
                         // ("N×", always a whole step) — clearer than a fractional % on a
@@ -7715,141 +7771,133 @@ impl PixelView {
                         {
                             self.fit_width_on_open = true;
                         }
-                        // Only meaningful for text-mode art, so only shown for it.
-                        if self.viewing_textmode {
-                            ui.checkbox(&mut self.crt_aspect, "CRT").on_hover_text(
-                                "Stretch text-mode art ≈1.2× vertically to match the \
-                                 non-square pixels of a 4:3 VGA monitor (off = exact pixels)",
-                            );
-                            // 9-dot VGA cell width: the real DOS text cell was 9px
-                            // wide for the 8px font (independent of the CRT stretch).
-                            if ui
-                                .checkbox(&mut self.font_9px, "9px")
+                        ui.separator();
+                        // Retro-monitor effects, collapsed into one popover. These are
+                        // set-once "look" settings (scanlines / glow / CRT aspect / 9px /
+                        // background); inlining all ~9 widgets is what overflowed the bar
+                        // and let the left button group paint over them. CRT aspect + the
+                        // 9-dot cell only make sense for text-mode art, so they're gated.
+                        ui.menu_button("📺 CRT", |ui| {
+                            if self.viewing_textmode {
+                                ui.checkbox(&mut self.crt_aspect, "CRT aspect (1.2× V)")
+                                    .on_hover_text(
+                                        "Stretch text-mode art ≈1.2× vertically to match the \
+                                         non-square pixels of a 4:3 VGA monitor (off = exact pixels)",
+                                    );
+                                // 9-dot VGA cell width: the real DOS text cell was 9px
+                                // wide for the 8px font (independent of the CRT stretch).
+                                if ui
+                                    .checkbox(&mut self.font_9px, "9-dot VGA cell (9px)")
+                                    .on_hover_text(
+                                        "Render the VGA font in a 9-dot-wide cell, like real \
+                                         DOS text mode — adds the inter-character gap and \
+                                         joins box-draw rules (off = exact 8-pixel cells)",
+                                    )
+                                    .changed()
+                                {
+                                    crate::decode::set_font_9px(self.font_9px);
+                                    let ctx = ui.ctx().clone();
+                                    self.redecode_full(&ctx);
+                                    if let Some(p) = &mut self.player {
+                                        p.tex = None; // re-render the frame at the new cell width
+                                    }
+                                }
+                                ui.separator();
+                            }
+                            ui.add(
+                                egui::Slider::new(&mut self.crt_scanline_dark, 0.0..=1.0)
+                                    .show_value(false)
+                                    .text("scanlines"),
+                            )
+                            .on_hover_text("Scanline darkness (0 = off)");
+                            ui.checkbox(&mut self.crt_scanline_scale, "scale with zoom")
                                 .on_hover_text(
-                                    "Render the VGA font in a 9-dot-wide cell, like real \
-                                     DOS text mode — adds the inter-character gap and \
-                                     joins box-draw rules (off = exact 8-pixel cells)",
-                                )
+                                    "Scale the scanline spacing with the zoom — one line per \
+                                     source-pixel row, so the lines grow as you zoom in \
+                                     (off = fixed fine lines)",
+                                );
+                            ui.checkbox(&mut self.glow, "glow").on_hover_text(
+                                "Phosphor glow — a soft bloom around bright pixels, like a \
+                                 late-night CRT",
+                            );
+                            ui.add_enabled(
+                                self.glow,
+                                egui::Slider::new(&mut self.glow_amt, 0.0..=1.0)
+                                    .show_value(false)
+                                    .text("amt"),
+                            )
+                            .on_hover_text("Phosphor glow intensity");
+                            ui.checkbox(&mut self.black_bg, "black background")
+                                .on_hover_text("Fill the viewer background black (off = dark grey)");
+                        })
+                        .response
+                        .on_hover_text(
+                            "Retro monitor effects — scanlines, phosphor glow, CRT aspect, \
+                             9-dot cell, background",
+                        );
+                        // (The baud picker moved up next to Play/Replay/seek in the
+                        // playback controls row — see ui_single.)
+                        // Slideshow + random-pack screensaver, collapsed into one popover.
+                        // The "auto ▶" toggle goes yellow when a user interaction paused it,
+                        // and clicking it then *resumes* rather than toggling the slideshow
+                        // off — so the toggle stays in the menu but keeps that behavior.
+                        let auto_running = self.auto_next;
+                        let auto_label = if self.auto_paused {
+                            egui::RichText::new("▶ Auto")
+                                .color(egui::Color32::from_rgb(255, 210, 70))
+                        } else {
+                            egui::RichText::new("▶ Auto")
+                        };
+                        ui.menu_button(auto_label, |ui| {
+                            let resumed = self.auto_paused;
+                            let label = if self.auto_paused {
+                                egui::RichText::new("auto-advance (paused)")
+                                    .color(egui::Color32::from_rgb(255, 210, 70))
+                            } else {
+                                egui::RichText::new("auto-advance")
+                            };
+                            let hover = if self.auto_paused {
+                                "Slideshow paused — you took control. Click to resume."
+                            } else {
+                                "Auto-advance to the next file after it finishes drawing \
+                                 plus the chosen delay — flip through a whole pack hands-free"
+                            };
+                            if ui
+                                .checkbox(&mut self.auto_next, label)
+                                .on_hover_text(hover)
                                 .changed()
                             {
-                                crate::decode::set_font_9px(self.font_9px);
-                                let ctx = ui.ctx().clone();
-                                self.redecode_full(&ctx);
-                                if let Some(p) = &mut self.player {
-                                    p.tex = None; // re-render the frame at the new cell width
+                                if resumed {
+                                    self.auto_next = true; // clicking while paused resumes, not off
                                 }
+                                self.auto_paused = false;
+                                self.auto_next_dwell = 0.0;
                             }
-                        }
-                        // Baud picker — simulate a modem typing out the art. Shown for
-                        // stream-playable art; RIP and ANSI remember their own speed.
-                        // Changing it restarts the open file.
-                        if self.player.is_some() {
+                            ui.horizontal(|ui| {
+                                ui.label("delay");
+                                egui::ComboBox::from_id_salt("auto_next_secs")
+                                    .selected_text(format!("{}s", self.auto_next_secs))
+                                    .show_ui(ui, |ui| {
+                                        for s in [1u8, 3, 5, 10] {
+                                            ui.selectable_value(
+                                                &mut self.auto_next_secs,
+                                                s,
+                                                format!("{s}s"),
+                                            );
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text("Seconds to wait before advancing");
+                            });
                             ui.separator();
-                            let is_rip = self.player.as_ref().is_some_and(|p| p.stream.is_rip());
-                            let mut baud = if is_rip {
-                                self.baud_rip
-                            } else {
-                                self.baud_ansi
-                            };
-                            let old = baud;
-                            egui::ComboBox::from_id_salt("baud_pick")
-                                .selected_text(format!("⚡ {}", baud.label()))
-                                .show_ui(ui, |ui| {
-                                    for b in Baud::ALL {
-                                        ui.selectable_value(&mut baud, b, b.label());
-                                    }
-                                })
-                                .response
-                                .on_hover_text(
-                                    "Simulated modem baud rate — replay the art as it would \
-                                     have typed out over a dial-up connection (None = instant). \
-                                     RIP and ANSI keep separate speeds.",
-                                );
-                            if baud != old {
-                                if is_rip {
-                                    self.baud_rip = baud;
-                                } else {
-                                    self.baud_ansi = baud;
-                                }
-                                if let Some(p) = &mut self.player {
-                                    if baud == Baud::None {
-                                        p.pos = p.len;
-                                        p.playing = false;
-                                    } else {
-                                        p.pos = 0;
-                                        p.acc = 0.0;
-                                        p.playing = true;
-                                    }
-                                    p.tex = None;
-                                }
-                            }
-                        }
-                        // Retro-monitor effects — apply to any image in the viewer.
-                        ui.separator();
-                        ui.label("📺").on_hover_text("Retro monitor effects");
-                        ui.add(
-                            egui::Slider::new(&mut self.crt_scanline_dark, 0.0..=1.0)
-                                .show_value(false)
-                                .text("scanlines"),
-                        )
-                        .on_hover_text("Scanline darkness (0 = off)");
-                        ui.checkbox(&mut self.crt_scanline_scale, "scale")
-                            .on_hover_text(
-                                "Scale the scanline spacing with the zoom — one line per \
-                                 source-pixel row, so the lines grow as you zoom in \
-                                 (off = fixed fine lines)",
-                            );
-                        ui.checkbox(&mut self.glow, "glow").on_hover_text(
-                            "Phosphor glow — a soft bloom around bright pixels, like a \
-                             late-night CRT",
-                        );
-                        ui.add_enabled(
-                            self.glow,
-                            egui::Slider::new(&mut self.glow_amt, 0.0..=1.0)
-                                .show_value(false)
-                                .text("amt"),
-                        )
-                        .on_hover_text("Phosphor glow intensity");
-                        ui.checkbox(&mut self.black_bg, "black bg")
-                            .on_hover_text("Fill the viewer background black (off = dark grey)");
-                        // Slideshow: auto-advance through the folder, with a delay picker.
-                        // When a user interaction has paused it, the label goes yellow and a
-                        // click *resumes* (rather than toggling the slideshow off).
-                        ui.separator();
-                        let resumed = self.auto_paused;
-                        let label = if self.auto_paused {
-                            egui::RichText::new("auto ▶").color(egui::Color32::from_rgb(255, 210, 70))
+                            self.ui_shuffle_controls(ui);
+                        })
+                        .response
+                        .on_hover_text(if auto_running {
+                            "Slideshow + random-pack screensaver (running)"
                         } else {
-                            egui::RichText::new("auto ▶")
-                        };
-                        let hover = if self.auto_paused {
-                            "Slideshow paused — you took control. Click to resume."
-                        } else {
-                            "Auto-advance to the next file after it finishes drawing \
-                             plus the chosen delay — flip through a whole pack hands-free"
-                        };
-                        if ui.checkbox(&mut self.auto_next, label).on_hover_text(hover).changed() {
-                            if resumed {
-                                self.auto_next = true; // clicking while paused resumes, not off
-                            }
-                            self.auto_paused = false;
-                            self.auto_next_dwell = 0.0;
-                        }
-                        egui::ComboBox::from_id_salt("auto_next_secs")
-                            .selected_text(format!("{}s", self.auto_next_secs))
-                            .show_ui(ui, |ui| {
-                                for s in [1u8, 3, 5, 10] {
-                                    ui.selectable_value(
-                                        &mut self.auto_next_secs,
-                                        s,
-                                        format!("{s}s"),
-                                    );
-                                }
-                            })
-                            .response
-                            .on_hover_text("Seconds to wait before advancing");
-                        ui.separator();
-                        self.ui_shuffle_controls(ui);
+                            "Slideshow + random-pack screensaver"
+                        });
                     }
                     Mode::Grid => {
                         if !self.entries.is_empty() {
@@ -8716,10 +8764,12 @@ impl eframe::App for PixelView {
                 .as_ref()
                 .is_some_and(|m| crate::sixteen::is_remote(&m.archive));
         if show_top {
-            egui::Panel::top("favorites").show_inside(ui, |ui| self.ui_favorites(ui));
-            if self.folder.is_some() {
-                egui::Panel::top("crumbs").show_inside(ui, |ui| self.ui_breadcrumbs(ui));
-            }
+            // Breadcrumb row hosts the path *and* the favorites (★ Pin + 📁 chips) at
+            // its right end — the old standalone "favorites" panel was merged in to
+            // reclaim a whole row of vertical space. Always shown (even before a folder
+            // is open, so favorites stay reachable for a quick jump); ui_breadcrumbs
+            // renders just the favorites when there's no folder.
+            egui::Panel::top("crumbs").show_inside(ui, |ui| self.ui_breadcrumbs(ui));
             // 16colo.rs quick-jump nav bar — shown while browsing the archive (also inside
             // a mounted pack, whose display path is the virtual one).
             if in_colo {
@@ -12980,6 +13030,282 @@ mod gui_tests {
             before,
             "wheel over the combo must change the selection"
         );
+    }
+
+    // Regression: the 16colo.rs nav bar (and the archive breadcrumb) keyed off a
+    // stale `archive_mount` that was never cleared, so it lingered over a plain local
+    // folder after you'd visited a pack. Leaving the mount's tree must drop the mount.
+    #[test]
+    fn leaving_an_archive_mount_clears_it() {
+        let mut harness =
+            Harness::builder().build_eframe(|cc| PixelView::new(cc, CliArgs::default()));
+        let pid = std::process::id();
+        let mount = std::env::temp_dir().join(format!("pv_mount_{pid}"));
+        let inside = mount.join("sub");
+        let outside = std::env::temp_dir().join(format!("pv_outside_{pid}"));
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let st = harness.state_mut();
+        st.archive_mount = Some(ArchiveMount {
+            archive: PathBuf::from("<16colo.rs>/2023/somepack"),
+            temp_root: mount.clone(),
+        });
+        // Browsing a subfolder *within* the extracted tree keeps the mount…
+        st.open_folder(inside);
+        assert!(
+            st.archive_mount.is_some(),
+            "navigating within the archive's tree must keep the mount"
+        );
+        // …navigating to a folder outside it drops the mount (nav bar then hides).
+        st.open_folder(outside.clone());
+        assert!(
+            st.archive_mount.is_none(),
+            "leaving the archive's tree must clear the stale mount"
+        );
+
+        std::fs::remove_dir_all(&mount).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+}
+
+/// Renders real GUI screenshots to `target/gui-screenshots/` for CI artifacts /
+/// visual review. Each *scenario* drives the actual app headlessly (egui_kittest
+/// boots `PixelView`, opens art, clicks controls) and captures the frame; the only
+/// thing painted onto the image is the spatial click marker (a ring) — kittest
+/// already paints the mouse cursor at the pointer. The *textual* annotations
+/// (action / keys / mouse / which change a shot demonstrates) are written as
+/// captions to `captions.md` beside the PNGs, not overlaid on the UI.
+///
+/// Reusable + parameterized: pick a subset with the `GUI_SHOTS` env var, matching
+/// a scenario `name` or `tag` — e.g. `GUI_SHOTS=ui-change` renders just the shots
+/// for this PR's changes. Default (unset) renders all.
+///
+/// Gated behind the `gui-screenshots` feature (egui_kittest's wgpu backend needs a
+/// Vulkan driver — lavapipe in CI); normal `cargo test` neither compiles wgpu nor
+/// needs a GPU. Run with `cargo test --features gui-screenshots gui_screenshots`.
+#[cfg(all(test, feature = "gui-screenshots"))]
+mod gui_screenshots {
+    use super::*;
+    use egui_kittest::kittest::Queryable;
+    use egui_kittest::Harness;
+    use std::path::Path;
+
+    // A small text-mode piece so the viewer shows the text-mode-only controls
+    // (CRT aspect, 9-dot cell) and a baud player: colored blocks, a title, dither.
+    const SAMPLE_ANS: &[u8] = b"\x1b[0;1;31m\xdb\xdb\x1b[33m\xdb\xdb\x1b[32m\xdb\xdb\x1b[36m\xdb\xdb\x1b[34m\xdb\xdb\x1b[35m\xdb\xdb\x1b[37m\xdb\xdb\x1b[0m\r\n\x1b[1;36m  pixelview \x1b[0;37mUI cleanup demo\x1b[0m\r\n\x1b[1;30m\xb0\xb1\xb2\x1b[0;36m\xb2\xb1\xb0 \x1b[1;33mtext-mode art\x1b[0m\r\n";
+
+    /// One screenshot scenario. `drive` puts the app in a state and returns the
+    /// click point (image px) to ring, if any. `action`/`shows` become captions.
+    struct Shot {
+        name: &'static str,
+        tags: &'static [&'static str],
+        action: &'static str,
+        shows: &'static str,
+        drive: fn(&mut Harness<'_, PixelView>, &Path) -> Option<(i32, i32)>,
+    }
+
+    fn build(folder: &Path) -> Harness<'static, PixelView> {
+        let args = CliArgs {
+            folder: Some(folder.to_path_buf()),
+            ..Default::default()
+        };
+        Harness::builder()
+            .with_size([1280.0, 860.0])
+            .wgpu()
+            .build_eframe(move |cc| PixelView::new(cc, args))
+    }
+
+    // Let async work (folder scan, thumbnail decode on the worker pool) catch up.
+    // Use `step` (one frame), not `run`: pixelview keeps requesting repaints
+    // (spinners / pending thumbnails / the player), so `run` never "settles" and
+    // would hit its max-steps assertion.
+    fn settle(h: &mut Harness<'_, PixelView>, frames: usize) {
+        for _ in 0..frames {
+            h.step();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    // Open `sample` in the single/viewer view, exactly as a grid click would
+    // (load_full decodes synchronously, then flip the mode).
+    fn enter_viewer(h: &mut Harness<'_, PixelView>, sample: &Path) {
+        let ctx = h.ctx.clone();
+        {
+            let st = h.state_mut();
+            st.load_full(&ctx, sample.to_path_buf());
+            st.mode = Mode::Single;
+        }
+        h.run_steps(2);
+    }
+
+    // Click a labelled widget; return its center in image pixels (for the ring).
+    fn click(h: &mut Harness<'_, PixelView>, label: &str) -> (i32, i32) {
+        let ppp = h.ctx.pixels_per_point();
+        let center = {
+            let n = h.get_by_label(label);
+            let c = n.rect().center();
+            n.click();
+            c
+        };
+        h.run_steps(2);
+        ((center.x * ppp) as i32, (center.y * ppp) as i32)
+    }
+
+    // A subtle 3px magenta ring at the click point — the one thing we paint on the
+    // image, because "where the click landed" is spatial and can't be a caption.
+    // Complements the mouse cursor kittest already draws at the pointer.
+    fn ring(buf: &mut [u8], w: u32, h: u32, cx: i32, cy: i32) {
+        for step in 0..1440 {
+            let a = step as f32 * std::f32::consts::PI / 720.0;
+            for r in [17.0f32, 18.0, 19.0] {
+                let x = cx + (a.cos() * r).round() as i32;
+                let y = cy + (a.sin() * r).round() as i32;
+                if x < 0 || y < 0 || x as u32 >= w || y as u32 >= h {
+                    continue;
+                }
+                let i = ((y as u32 * w + x as u32) * 4) as usize;
+                if i + 3 < buf.len() {
+                    buf[i] = 255;
+                    buf[i + 1] = 70;
+                    buf[i + 2] = 210;
+                    buf[i + 3] = 255;
+                }
+            }
+        }
+    }
+
+    const SHOTS: &[Shot] = &[
+        Shot {
+            name: "01-breadcrumb-favorites",
+            tags: &["ui-change", "browse"],
+            action: "Open a folder (here via --folder), with the folder pinned. No click.",
+            shows: "Change D — the ★ Pin button and the 📁 folder favorites now live at \
+                    the right end of the breadcrumb row; the old standalone \"Favorites:\" \
+                    strip (a whole row for one button) is gone.",
+            drive: |h, sample| {
+                if let Some(parent) = sample.parent() {
+                    h.state_mut().favorites.push(parent.to_path_buf());
+                }
+                h.run_steps(2);
+                None
+            },
+        },
+        Shot {
+            name: "02-viewer-status-bar",
+            tags: &["ui-change", "viewer"],
+            action: "Open a piece of art in the single/viewer view. No click.",
+            shows: "Changes A/B/C — the viewer status bar is collapsed: a 📺 CRT popover \
+                    and a ▶ Auto popover replace ~18 inline widgets, the long zoom hint is \
+                    now a compact ? tooltip, the playback readout no longer repeats the byte \
+                    position, and the baud picker moved up into the transport row \
+                    (▶ Play · ⏮ Replay · ⚡baud · seek).",
+            drive: |h, sample| {
+                enter_viewer(h, sample);
+                None
+            },
+        },
+        Shot {
+            name: "03-crt-popover",
+            tags: &["ui-change", "viewer"],
+            action: "Mouse: click the “📺 CRT” button in the status bar (ringed).",
+            shows: "Change A — all retro-monitor effects (scanlines, scale, glow + amount, \
+                    black background, plus CRT aspect & 9-dot cell for text-mode art) are \
+                    collapsed into this one popover.",
+            drive: |h, sample| {
+                enter_viewer(h, sample);
+                Some(click(h, "📺 CRT"))
+            },
+        },
+        Shot {
+            name: "04-auto-popover",
+            tags: &["ui-change", "viewer"],
+            action: "Mouse: click the “▶ Auto” button in the status bar (ringed).",
+            shows: "Change A — the slideshow (auto-advance + delay) and the random-pack \
+                    screensaver controls are collapsed into this one popover; the button \
+                    title turns yellow while a slideshow is paused.",
+            drive: |h, sample| {
+                enter_viewer(h, sample);
+                Some(click(h, "▶ Auto"))
+            },
+        },
+        Shot {
+            name: "05-view-menu",
+            tags: &["chrome"],
+            action: "Mouse: click the View menu (ringed).",
+            shows: "Top-level chrome (unchanged by this PR): Grid/Table toggle, panes, \
+                    Preferences….",
+            drive: |h, _| Some(click(h, "View")),
+        },
+        Shot {
+            name: "06-preferences",
+            tags: &["chrome"],
+            action: "Mouse: View → Preferences… (ring marks the final click).",
+            shows: "The Preferences dialog (unchanged by this PR): theme, grid spacing, \
+                    hotkeys, table columns, viewer OSD.",
+            drive: |h, _| {
+                let _ = click(h, "View");
+                Some(click(h, "Preferences…"))
+            },
+        },
+    ];
+
+    #[test]
+    fn render_app_screenshots() {
+        let dir = std::env::temp_dir().join(format!("pv_shots_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sample = dir.join("ACID-DEMO.ans");
+        std::fs::write(&sample, SAMPLE_ANS).unwrap();
+
+        let out = Path::new("target/gui-screenshots");
+        std::fs::create_dir_all(out).unwrap();
+
+        let want = std::env::var("GUI_SHOTS").ok();
+        let selected = |s: &Shot| {
+            want.as_deref().map_or(true, |w| {
+                w.split(',')
+                    .map(str::trim)
+                    .any(|n| n == s.name || s.tags.contains(&n))
+            })
+        };
+
+        let mut captions = String::from(
+            "# GUI screenshots\n\nGenerated by the `gui_screenshots` test: each shot drives \
+             the real app headlessly (egui_kittest + wgpu) and captures it. The mouse cursor \
+             and a magenta ring mark where a click landed; these captions describe the action \
+             rather than overlaying text on the UI.\n\n",
+        );
+
+        for shot in SHOTS {
+            if !selected(shot) {
+                continue;
+            }
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut h = build(&dir);
+                settle(&mut h, 4);
+                let marker = (shot.drive)(&mut h, &sample);
+                let mut img = h.render().expect("wgpu render failed");
+                let (w, ht) = (img.width(), img.height());
+                if let Some((mx, my)) = marker {
+                    ring(&mut img, w, ht, mx, my);
+                }
+                img.save(out.join(format!("{}.png", shot.name)))
+                    .expect("save png");
+            }));
+            let note = if res.is_ok() {
+                ""
+            } else {
+                eprintln!("[gui-screenshots] scenario {} failed to render", shot.name);
+                "  _(render failed — see log)_"
+            };
+            captions.push_str(&format!(
+                "## {}.png{}\n\n- **Action:** {}\n- **Shows:** {}\n\n",
+                shot.name, note, shot.action, shot.shows
+            ));
+        }
+
+        std::fs::write(out.join("captions.md"), captions).expect("write captions.md");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
