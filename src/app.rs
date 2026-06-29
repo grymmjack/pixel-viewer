@@ -822,6 +822,7 @@ pub struct PixelView {
     explorer_filter: String,                 // folder-tree search box (runtime only)
     colo_search: String,                     // 16colo.rs nav-bar search box (runtime only)
     explorer_tab: u8,                        // 0 = Places, 1 = Folders
+    places_tab: u8,                          // Places sub-tab: 0 = Local, 1 = 16colo.rs
     show_hotkeys: bool,
     show_prefs: bool,
 
@@ -1389,6 +1390,7 @@ impl PixelView {
             explorer_filter: String::new(),
             colo_search: String::new(),
             explorer_tab: 0,
+            places_tab: 0,
             show_hotkeys: false,
             show_prefs: false,
             theme,
@@ -3197,7 +3199,7 @@ impl PixelView {
                     }
                 }
             }
-            if let Some(p) = self.favorites_buttons(ui, "📁") {
+            if let Some(p) = self.favorites_buttons(ui, "📁", |_| true) {
                 self.open_folder(p);
             }
         });
@@ -3206,7 +3208,15 @@ impl PixelView {
     /// Render the favorites as draggable, reorderable, right-click-removable
     /// buttons in whatever layout the caller set up (horizontal in the toolbar,
     /// vertical in the Places dock). Returns a folder to navigate to, if clicked.
-    fn favorites_buttons(&mut self, ui: &mut egui::Ui, icon: &str) -> Option<PathBuf> {
+    /// Render the favorite buttons matching `filter` (so the Places dock can split them
+    /// into Local vs 16colo.rs sub-tabs). Reorder/remove use the *global* favorite index,
+    /// so filtering with `continue` keeps them correct.
+    fn favorites_buttons(
+        &mut self,
+        ui: &mut egui::Ui,
+        icon: &str,
+        filter: impl Fn(&Path) -> bool,
+    ) -> Option<PathBuf> {
         // Buttons must not wrap their text vertically near the right edge of
         // horizontal_wrapped (Extend = wrap whole buttons to the next row instead).
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
@@ -3215,6 +3225,9 @@ impl PixelView {
         let mut reorder: Option<(usize, usize)> = None;
         let mut set_color: Option<(usize, Option<[u8; 3]>)> = None;
         for (i, fav) in self.favorites.iter().enumerate() {
+            if !filter(fav) {
+                continue;
+            }
             let label = format!("{icon} {}", short_name(fav));
             let color = self.fav_colors.get(fav).copied();
             // ONE widget that senses click *and* drag, so egui can tell a click
@@ -7628,39 +7641,64 @@ impl PixelView {
             .auto_shrink([false; 2])
             .show(ui, |ui| {
                 if self.explorer_tab == 0 {
-                    if ui.button("🏠 Home").clicked() {
-                        nav = home_dir();
-                    }
-                    if ui
-                        .button("🌐 16colo.rs")
-                        .on_hover_text("Browse the 16colo.rs ANSI art archive online")
-                        .clicked()
-                    {
-                        nav = Some(PathBuf::from(crate::sixteen::ROOT));
-                    }
-                    // Drag-reorderable + right-click-removable (distinct Ui → no id clash
-                    // with the toolbar favorites).
-                    if let Some(p) = self.favorites_buttons(ui, "📁") {
-                        nav = Some(p);
-                    }
-                    // Smart filters: saved searches. Click recalls + runs; right-click
-                    // removes. (Deferred out of the closure — can't borrow self twice.)
-                    if !self.saved_filters.is_empty() {
-                        ui.separator();
-                        ui.weak("Smart filters");
-                        for (i, (name, _)) in self.saved_filters.iter().enumerate() {
-                            let r = ui
-                                .button(format!("🔍 {name}"))
-                                .on_hover_text("Run this saved search · right-click to remove");
-                            if r.clicked() {
-                                recall = Some(i);
-                            }
-                            r.context_menu(|ui| {
-                                if ui.button("Remove").clicked() {
-                                    remove_filter = Some(i);
-                                    ui.close();
+                    // Sub-tabs split favorites/pins by kind: Local folders vs 16colo.rs.
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(self.places_tab == 0, "Local")
+                            .clicked()
+                        {
+                            self.places_tab = 0;
+                        }
+                        if ui
+                            .selectable_label(self.places_tab == 1, "16colo.rs")
+                            .clicked()
+                        {
+                            self.places_tab = 1;
+                        }
+                    });
+                    if self.places_tab == 0 {
+                        // Local: Home + on-disk favorites + smart filters (local searches).
+                        if ui.button("🏠 Home").clicked() {
+                            nav = home_dir();
+                        }
+                        if let Some(p) =
+                            self.favorites_buttons(ui, "📁", |p| !crate::sixteen::is_remote(p))
+                        {
+                            nav = Some(p);
+                        }
+                        // Smart filters: saved searches. Click recalls + runs; right-click
+                        // removes. (Deferred out of the closure — can't borrow self twice.)
+                        if !self.saved_filters.is_empty() {
+                            ui.separator();
+                            ui.weak("Smart filters");
+                            for (i, (name, _)) in self.saved_filters.iter().enumerate() {
+                                let r = ui.button(format!("🔍 {name}")).on_hover_text(
+                                    "Run this saved search · right-click to remove",
+                                );
+                                if r.clicked() {
+                                    recall = Some(i);
                                 }
-                            });
+                                r.context_menu(|ui| {
+                                    if ui.button("Remove").clicked() {
+                                        remove_filter = Some(i);
+                                        ui.close();
+                                    }
+                                });
+                            }
+                        }
+                    } else {
+                        // 16colo.rs: the browse entry + pinned artists/groups/searches/packs.
+                        if ui
+                            .button("🌐 16colo.rs")
+                            .on_hover_text("Browse the 16colo.rs ANSI art archive online")
+                            .clicked()
+                        {
+                            nav = Some(PathBuf::from(crate::sixteen::ROOT));
+                        }
+                        if let Some(p) =
+                            self.favorites_buttons(ui, "🌐", crate::sixteen::is_remote)
+                        {
+                            nav = Some(p);
                         }
                     }
                 } else {

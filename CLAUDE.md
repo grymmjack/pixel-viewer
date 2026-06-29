@@ -173,7 +173,12 @@ right-click-removable in both the toolbar and the Places dock. Each favorite/pin
 be **color-tagged** from its right-click menu (a popup grid of the bundled **ANSI32**
 swatches via `ansi32_palette`, + ✕ to clear); the chosen color fills the button (text
 flipped to black/white by `contrast_text`). Stored in `fav_colors` (path → RGB,
-persisted as `FAV_COLORS_KEY`); cleared when the favorite is removed. The explorer's
+persisted as `FAV_COLORS_KEY`); cleared when the favorite is removed. In the Places
+dock the favorites split into **Local** vs **16colo.rs** sub-tabs (`places_tab`):
+`favorites_buttons` takes a `filter: Fn(&Path) -> bool` (`!is_remote` / `is_remote`) and
+filters with `continue` so the *global* favorite index — and thus reorder/remove —
+stays correct; the toolbar passes `|_| true` (all). Local also holds Home + smart
+filters; 16colo.rs holds the 🌐 browse entry + the remote pins. The explorer's
 folder tree uses `CollapsingState` (lazy: collapsed nodes do no I/O). The details
 dock shows a fit thumbnail + palette swatches + `.GPL` export (`to_gpl`), fed by
 the thumbnailer's `extract_palette` (authoritative palette for indexed art).
