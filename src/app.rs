@@ -7075,8 +7075,9 @@ impl PixelView {
         v
     }
 
-    /// Paint the fading metadata OSD: a rounded dark panel (sized to the text) at the top
-    /// or bottom of `viewport`, each field a labelled line in its own near-white hue.
+    /// Paint the fading metadata OSD: a wide rounded dark **bar** at the top or bottom of
+    /// `viewport`, the fields flowing left-to-right (label dim, value in its near-white
+    /// hue, ` · ` separators), wrapping to another line only if they'd overflow the width.
     fn paint_osd(&self, painter: &egui::Painter, viewport: egui::Rect, alpha: f32, path: &Path) {
         let lines = self.osd_lines(path);
         if lines.is_empty() {
@@ -7084,40 +7085,41 @@ impl PixelView {
         }
         let av = |base: f32| (base * alpha).clamp(0.0, 255.0) as u8;
         let hue = |c: [u8; 3]| egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], av(255.0));
-        let label_col = egui::Color32::from_rgba_unmultiplied(150, 150, 162, av(225.0));
-        let title_font = egui::FontId::proportional(18.0);
-        let body_font = egui::FontId::proportional(13.5);
-        let (pad, label_w, gap, line_h) = (12.0, 88.0_f32, 8.0_f32, 20.0_f32);
-        let max_val_w = (viewport.width() - 2.0 * (pad + 8.0) - label_w - gap).max(120.0);
+        let label_col = egui::Color32::from_rgba_unmultiplied(150, 150, 162, av(220.0));
+        let sep_col = egui::Color32::from_rgba_unmultiplied(120, 120, 132, av(170.0));
+        let font = egui::FontId::proportional(14.0);
+        let (pad, lv_gap, line_h, margin) = (12.0_f32, 4.0_f32, 20.0_f32, 16.0_f32);
+        let max_w = (viewport.width() - 2.0 * (margin + pad)).max(160.0);
+        let sep = painter.layout_no_wrap("   ·   ".to_string(), font.clone(), sep_col);
+        let sep_w = sep.size().x;
 
-        struct Laid {
-            label: Option<std::sync::Arc<egui::Galley>>,
-            value: std::sync::Arc<egui::Galley>,
-        }
-        let mut laid = Vec::with_capacity(lines.len());
-        let mut content_w = 0.0_f32;
+        // Pass 1: flow the fields into rows, recording each galley's position relative to
+        // the content's top-left, and the width/height the content actually used.
+        let mut placed: Vec<(egui::Pos2, std::sync::Arc<egui::Galley>)> = Vec::new();
+        let (mut x, mut y, mut used_w) = (0.0_f32, 0.0_f32, 0.0_f32);
         for (label, value, c) in &lines {
-            let title = label.is_empty();
-            let font = if title { &title_font } else { &body_font };
-            // Wrap an over-long value (e.g. a path) so the panel can't overflow.
-            let vg = painter.layout(value.clone(), font.clone(), hue(*c), max_val_w);
-            let lg = (!title).then(|| {
-                painter.layout_no_wrap(label.to_string(), body_font.clone(), label_col)
-            });
-            let w = if title {
-                vg.size().x
-            } else {
-                label_w + gap + vg.size().x
-            };
-            content_w = content_w.max(w);
-            laid.push((Laid { label: lg, value: vg }, title));
+            let lg = (!label.is_empty())
+                .then(|| painter.layout_no_wrap(label.to_string(), font.clone(), label_col));
+            let vg = painter.layout_no_wrap(value.clone(), font.clone(), hue(*c));
+            let group_w = lg.as_ref().map_or(0.0, |g| g.size().x + lv_gap) + vg.size().x;
+            if x > 0.0 {
+                if x + sep_w + group_w > max_w {
+                    y += line_h; // wrap to a new row (no leading separator)
+                    x = 0.0;
+                } else {
+                    placed.push((egui::pos2(x, y), sep.clone()));
+                    x += sep_w;
+                }
+            }
+            if let Some(lg) = lg {
+                placed.push((egui::pos2(x, y), lg.clone()));
+                x += lg.size().x + lv_gap;
+            }
+            placed.push((egui::pos2(x, y), vg.clone()));
+            x += vg.size().x;
+            used_w = used_w.max(x);
         }
-        let content_h: f32 = laid
-            .iter()
-            .map(|(l, _)| l.value.size().y.max(line_h))
-            .sum();
-        let (box_w, box_h) = (content_w + 2.0 * pad, content_h + 2.0 * pad);
-        let margin = 16.0;
+        let (box_w, box_h) = (used_w + 2.0 * pad, y + line_h + 2.0 * pad);
         let top = if self.osd_position == 0 {
             viewport.top() + margin
         } else {
@@ -7136,18 +7138,12 @@ impl PixelView {
             egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, av(36.0))),
             egui::StrokeKind::Inside,
         );
-        let x = rect.left() + pad;
-        let mut y = rect.top() + pad;
-        for (l, _) in &laid {
-            let h = l.value.size().y.max(line_h);
-            if let Some(lg) = &l.label {
-                let ly = y + (h - lg.size().y) / 2.0;
-                painter.galley(egui::pos2(x, ly), lg.clone(), label_col);
-                painter.galley(egui::pos2(x + label_w + gap, ly), l.value.clone(), egui::Color32::WHITE);
-            } else {
-                painter.galley(egui::pos2(x, y + (h - l.value.size().y) / 2.0), l.value.clone(), egui::Color32::WHITE);
-            }
-            y += h;
+
+        // Pass 2: paint each galley, vertically centred in its row.
+        let origin = rect.min + egui::vec2(pad, pad);
+        for (rel, g) in &placed {
+            let py = origin.y + rel.y + (line_h - g.size().y) / 2.0;
+            painter.galley(egui::pos2(origin.x + rel.x, py), g.clone(), egui::Color32::WHITE);
         }
     }
 

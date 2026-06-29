@@ -457,8 +457,10 @@ rematch**, and the *order* of all of it is user-controlled.
   painted at the end of `draw_image_view` (covers static / player / GIF paths). `osd_lines`
   builds `(label, value, near-white hue)` per field — 16colo: SAUCE title / artist / group /
   pack / year; local: name / path / type / size / dimensions / colors / created — both
-  ending in a ★ rating. `paint_osd` lays out the galleys (long values wrap to `max_val_w`),
-  sizes the panel to the text, and fades everything by scaling each colour's alpha.
+  ending in a ★ rating. `paint_osd` flows the fields **left-to-right as a wide bar** (label
+  dim, value in its hue, ` · ` separators), wrapping to a second row only if they'd exceed
+  the viewport width; the panel sizes to the used width/height and fades by scaling each
+  colour's alpha.
 - **Random-pack screensaver** (`shuffle` + "🔀 Random pack" button, status bar). A worker
   (`start_random_pack` → `random_rx`, polled by `poll_random`) picks a random 16colo.rs year
   + pack (`pick_random`, wall-clock seeded — no `rand` dep), inserts its download URL into
