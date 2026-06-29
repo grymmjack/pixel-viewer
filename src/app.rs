@@ -3784,7 +3784,11 @@ impl PixelView {
             .unwrap_or(true)
         {
             let reg = self.registry.clone();
-            let (w, h, rgba) = crate::thumb::decode_thumb(&reg, path, THUMB_PX)?;
+            // Decode the *real* file (a downloaded 16colo piece's bytes live at a cache
+            // path keyed by the virtual `path`); keep `path` as the cache key. Without this,
+            // recoloring an opened 16colo piece read the virtual path off disk and failed.
+            let real = self.resolve_local(path);
+            let (w, h, rgba) = crate::thumb::decode_thumb(&reg, &real, THUMB_PX)?;
             self.preview_src = Some((path.to_path_buf(), w, h, rgba));
         }
         let (w, h, mut rgba) = {
@@ -3880,7 +3884,14 @@ impl PixelView {
     /// which re-decodes the full view but not thumbnails), the thumbnail's own dims would
     /// render the preview squished. So prefer the open image's full texture; else fall back
     /// to the thumbnail's own size (`tsz`) — correct for a hovered, not-open entry.
+    ///
+    /// **Exception: a 16colo.rs flat-listing piece's thumbnail is *16colo's* pre-rendered
+    /// PNG**, a different renderer/aspect than our full decode — forcing it to our (often
+    /// very tall) decode aspect squashed the preview into a thin sliver. Use its own dims.
     fn preview_aspect(&self, path: &Path, tsz: egui::Vec2) -> (f32, f32) {
+        if self.colo_pieces.contains_key(path) {
+            return (tsz.x, tsz.y);
+        }
         self.full_tex
             .as_ref()
             .filter(|(p, _)| p == path)

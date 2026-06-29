@@ -429,6 +429,11 @@ rematch**, and the *order* of all of it is user-controlled.
   take their **base aspect from the open image's `full_tex`** (via `preview_aspect`), not
   the downscaled thumbnail's own dims — otherwise a thumbnail decoded at a different width
   (e.g. cached at 8px before a 9px-cell toggle re-decoded the full view) renders squished.
+  **But a 16colo flat-listing piece (`colo_pieces`) keeps its thumbnail's own dims** — its
+  thumb is 16colo's pre-rendered PNG, a different renderer than our (often very tall) full
+  decode, so forcing it to `full_tex`'s aspect squashed the preview into a thin sliver
+  (looked "gone"). `make_preview` likewise decodes `resolve_local(path)` so the colorizer
+  can recolor an opened 16colo piece (its bytes live at the cache file, not the virtual path).
 - **9px VGA cell** (`font_9px`, `FONT_9PX_KEY`, **off by default**) is a separate
   status-bar toggle (next to CRT, text-mode art only) that renders the 8-pixel CP437
   glyph in a **9-dot-wide cell**, the way real VGA text mode did: the 9th column is
