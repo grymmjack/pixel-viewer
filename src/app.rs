@@ -899,6 +899,8 @@ pub struct PixelView {
     osd_position: u8,   // 0 = top, 1 = bottom (persisted)
     osd_secs: f32,      // how long it holds at full opacity before fading (persisted)
     osd_t: f32,         // animation clock since the current image opened (runtime)
+    osd_rect: Option<egui::Rect>,        // last-painted OSD bounds (for hover-to-pin)
+    osd_links: Vec<(egui::Rect, PathBuf)>, // clickable field rects → open_folder target
     scanline_tex: Option<egui::TextureHandle>, // lazily-built 1×3 scanline pattern
     auto_next: bool,        // slideshow: auto-advance to the next file after a delay (persisted)
     auto_next_secs: u8,     // slideshow delay in seconds: 1/3/5/10 (persisted)
@@ -1460,6 +1462,8 @@ impl PixelView {
             osd_position,
             osd_secs,
             osd_t: f32::INFINITY, // start hidden until the first image opens
+            osd_rect: None,
+            osd_links: Vec::new(),
             glow,
             glow_amt,
             scanline_tex: None,
@@ -6974,72 +6978,113 @@ impl PixelView {
             self.raster_zoom = self.zoom;
         }
 
-        // Metadata OSD: fade in on a freshly opened image, hold for `osd_secs`, fade out.
+        // Metadata OSD: fade in on a freshly opened image, hold, fade out — but hovering
+        // it pins it open, and clicking a field (path / artist / pack / group / year)
+        // jumps there. Hover + clicks hit-test against last frame's rect/links.
+        const FADE_IN: f32 = 0.35;
+        const FADE_OUT: f32 = 0.7;
         if self.osd_enabled {
-            self.osd_t += ui.input(|i| i.stable_dt);
-            const FADE_IN: f32 = 0.35;
-            const FADE_OUT: f32 = 0.7;
-            let total = FADE_IN + self.osd_secs + FADE_OUT;
-            if self.osd_t < total {
-                let t = self.osd_t;
-                let alpha = if t < FADE_IN {
-                    t / FADE_IN
-                } else if t < FADE_IN + self.osd_secs {
-                    1.0
-                } else {
-                    (1.0 - (t - FADE_IN - self.osd_secs) / FADE_OUT).max(0.0)
-                };
-                if alpha > 0.004 {
-                    let p = self
-                        .full_tex
-                        .as_ref()
-                        .map(|(p, _)| p.clone())
-                        .or_else(|| self.entries.get(self.selected).map(|e| e.path.clone()));
-                    if let Some(p) = p {
-                        self.paint_osd(&painter, resp.rect, alpha, &p);
+            let pointer = ui.input(|i| i.pointer.interact_pos());
+            let over = self.osd_rect.zip(pointer).is_some_and(|(r, p)| r.contains(p));
+            if over {
+                self.osd_t = FADE_IN; // pin at full opacity while hovered
+                self.want_repaint = true;
+                if let Some(p) = pointer {
+                    if let Some(target) =
+                        self.osd_links.iter().find(|(r, _)| r.contains(p)).map(|(_, t)| t.clone())
+                    {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        if ui.input(|i| i.pointer.primary_clicked()) {
+                            self.open_folder(target); // local dir or 16colo virtual path
+                            return advance; // navigated away; nothing more to draw
+                        }
                     }
-                    self.want_repaint = true; // keep the fade animating
                 }
+            } else {
+                self.osd_t += ui.input(|i| i.stable_dt);
+            }
+            let total = FADE_IN + self.osd_secs + FADE_OUT;
+            let t = self.osd_t;
+            let alpha = if t >= total {
+                0.0
+            } else if t < FADE_IN {
+                t / FADE_IN
+            } else if t < FADE_IN + self.osd_secs {
+                1.0
+            } else {
+                (1.0 - (t - FADE_IN - self.osd_secs) / FADE_OUT).max(0.0)
+            };
+            if alpha > 0.004 {
+                let p = self
+                    .full_tex
+                    .as_ref()
+                    .map(|(p, _)| p.clone())
+                    .or_else(|| self.entries.get(self.selected).map(|e| e.path.clone()));
+                if let Some(p) = p {
+                    let (rect, links) =
+                        self.paint_osd(&painter, resp.rect, alpha, &p, over.then_some(pointer).flatten());
+                    self.osd_rect = Some(rect);
+                    self.osd_links = links;
+                }
+                self.want_repaint = true;
+            } else {
+                self.osd_rect = None;
+                self.osd_links.clear();
             }
         }
         advance
     }
 
-    /// The metadata OSD's lines for `path`: `(label, value, near-white hue)`. 16colo.rs
-    /// pieces show SAUCE title / artist / group / pack / year; local files show name /
-    /// path / type / size / dimensions / colors / created. Both end with a star rating.
-    fn osd_lines(&self, path: &Path) -> Vec<(&'static str, String, [u8; 3])> {
-        let mut v: Vec<(&'static str, String, [u8; 3])> = Vec::new();
+    /// The metadata OSD's fields for `path`: `(label, value, near-white hue, link)`. The
+    /// first field (empty label) is the headline name/title. 16colo.rs pieces show SAUCE
+    /// title / artist / group / pack / year; local files show name / path / type / size /
+    /// dimensions / colors / created. Both end with a ★ rating. `link` (when `Some`) is a
+    /// path the field jumps to on click: a local directory, or a 16colo artist / group /
+    /// pack / year virtual path.
+    #[allow(clippy::type_complexity)]
+    fn osd_lines(&self, path: &Path) -> Vec<(&'static str, String, [u8; 3], Option<PathBuf>)> {
+        use crate::sixteen::{ARTISTS, GROUPS, ROOT};
+        let mut v: Vec<(&'static str, String, [u8; 3], Option<PathBuf>)> = Vec::new();
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("?")
             .to_string();
         if let Some(piece) = self.colo_pieces.get(path) {
+            let root = Path::new(ROOT);
             let title = self
                 .sauce_cache
                 .get(path)
                 .and_then(|s| s.as_ref())
                 .map(|s| s.title.trim().to_string())
                 .filter(|t| !t.is_empty());
-            v.push(("", title.clone().unwrap_or_else(|| name.clone()), [255, 246, 232]));
+            v.push(("", title.clone().unwrap_or_else(|| name.clone()), [255, 246, 232], None));
             if title.is_some() {
-                v.push(("File", name.clone(), [228, 228, 234]));
+                v.push(("File", name.clone(), [228, 228, 234], None));
             }
             if !piece.artist.is_empty() {
-                v.push(("Artist", piece.artist.clone(), [206, 238, 255]));
+                let link = root.join(ARTISTS).join(&piece.artist);
+                v.push(("Artist", piece.artist.clone(), [206, 238, 255], Some(link)));
             }
             if !piece.group.is_empty() {
-                v.push(("Group", piece.group.clone(), [240, 222, 255]));
+                let link = root.join(GROUPS).join(&piece.group);
+                v.push(("Group", piece.group.clone(), [240, 222, 255], Some(link)));
             }
             if !piece.pack.is_empty() {
-                v.push(("Pack", piece.pack.clone(), [218, 255, 224]));
+                let link = root.join(piece.year.to_string()).join(&piece.pack);
+                v.push(("Pack", piece.pack.clone(), [218, 255, 224], Some(link)));
             }
-            v.push(("Year", piece.year.to_string(), [255, 250, 210]));
+            let year_link = root.join(piece.year.to_string());
+            v.push(("Year", piece.year.to_string(), [255, 250, 210], Some(year_link)));
         } else {
-            v.push(("", name.clone(), [255, 246, 232]));
+            v.push(("", name.clone(), [255, 246, 232], None));
             if let Some(parent) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-                v.push(("Path", parent.display().to_string(), [226, 226, 234]));
+                v.push((
+                    "Path",
+                    elide(&parent.display().to_string(), 64),
+                    [226, 226, 234],
+                    Some(parent.to_path_buf()),
+                ));
             }
             let ext = path
                 .extension()
@@ -7047,11 +7092,11 @@ impl PixelView {
                 .unwrap_or("")
                 .to_ascii_uppercase();
             if !ext.is_empty() {
-                v.push(("Type", ext, [210, 236, 255]));
+                v.push(("Type", ext, [210, 236, 255], None));
             }
             let entry = self.entries.iter().find(|e| e.path == path);
             if let Some(sz) = entry.map(|e| e.size).filter(|&s| s > 0) {
-                v.push(("Size", human_size(sz), [255, 234, 222]));
+                v.push(("Size", human_size(sz), [255, 234, 222], None));
             }
             if let Some((w, h)) = self
                 .full_tex
@@ -7059,52 +7104,70 @@ impl PixelView {
                 .filter(|(fp, _)| fp == path)
                 .map(|(_, tt)| (tt.size[0], tt.size[1]))
             {
-                v.push(("Dimensions", format!("{w} × {h}"), [222, 255, 236]));
+                v.push(("Dimensions", format!("{w} × {h}"), [222, 255, 236], None));
             }
             if let Some(c) = self.img_meta.get(path).and_then(|m| m.colors) {
-                v.push(("Colors", c.to_string(), [244, 226, 255]));
+                v.push(("Colors", c.to_string(), [244, 226, 255], None));
             }
             if let Some(t) = entry.and_then(|e| e.ctime) {
-                v.push(("Created", fmt_time(t), [255, 248, 214]));
+                v.push(("Created", fmt_time(t), [255, 248, 214], None));
             }
         }
         let r = self.read_rating(path);
         if r > 0 {
-            v.push(("Rating", "★".repeat(r as usize), [255, 210, 96]));
+            v.push(("Rating", "★".repeat(r as usize), [255, 210, 96], None));
         }
         v
     }
 
-    /// Paint the fading metadata OSD: a wide rounded dark **bar** at the top or bottom of
-    /// `viewport`, the fields flowing left-to-right (label dim, value in its near-white
-    /// hue, ` · ` separators), wrapping to another line only if they'd overflow the width.
-    fn paint_osd(&self, painter: &egui::Painter, viewport: egui::Rect, alpha: f32, path: &Path) {
-        let lines = self.osd_lines(path);
-        if lines.is_empty() {
-            return;
+    /// Paint the fading metadata OSD and return its bounds + the clickable field rects
+    /// (value → `open_folder` target). Line 1 is the name/title, larger + faux-bold; the
+    /// rest flow left-to-right as a wide bar (label dim, value in its hue, ` · ` separators,
+    /// wrapping only on overflow). `pointer` (when the OSD is hovered) underlines the link
+    /// the cursor is over. Colors fade by scaling each one's alpha.
+    fn paint_osd(
+        &self,
+        painter: &egui::Painter,
+        viewport: egui::Rect,
+        alpha: f32,
+        path: &Path,
+        pointer: Option<egui::Pos2>,
+    ) -> (egui::Rect, Vec<(egui::Rect, PathBuf)>) {
+        let fields = self.osd_lines(path);
+        if fields.is_empty() {
+            return (egui::Rect::NOTHING, Vec::new());
         }
         let av = |base: f32| (base * alpha).clamp(0.0, 255.0) as u8;
         let hue = |c: [u8; 3]| egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], av(255.0));
+        let white = |a: f32| egui::Color32::from_rgba_unmultiplied(255, 255, 255, av(a));
         let label_col = egui::Color32::from_rgba_unmultiplied(150, 150, 162, av(220.0));
         let sep_col = egui::Color32::from_rgba_unmultiplied(120, 120, 132, av(170.0));
-        let font = egui::FontId::proportional(14.0);
-        let (pad, lv_gap, line_h, margin) = (12.0_f32, 4.0_f32, 20.0_f32, 16.0_f32);
+        let header_font = egui::FontId::proportional(18.0);
+        let body_font = egui::FontId::proportional(14.0);
+        let (pad, lv_gap, line_h, margin, head_gap) = (12.0_f32, 4.0_f32, 20.0_f32, 16.0_f32, 3.0_f32);
         let max_w = (viewport.width() - 2.0 * (margin + pad)).max(160.0);
-        let sep = painter.layout_no_wrap("   ·   ".to_string(), font.clone(), sep_col);
-        let sep_w = sep.size().x;
 
-        // Pass 1: flow the fields into rows, recording each galley's position relative to
-        // the content's top-left, and the width/height the content actually used.
+        // Line 1: the name/title (larger; faux-bold via a 0.7px double-draw).
+        let (_, name, name_c, _) = &fields[0];
+        let header = painter.layout_no_wrap(name.clone(), header_font, hue(*name_c));
+        let header_h = header.size().y;
+        let mut content_w = header.size().x + 0.7;
+
+        // The rest flow horizontally, starting on the row below the header.
+        let sep = painter.layout_no_wrap("   ·   ".to_string(), body_font.clone(), sep_col);
+        let sep_w = sep.size().x;
+        let flow_y0 = header_h + head_gap;
         let mut placed: Vec<(egui::Pos2, std::sync::Arc<egui::Galley>)> = Vec::new();
-        let (mut x, mut y, mut used_w) = (0.0_f32, 0.0_f32, 0.0_f32);
-        for (label, value, c) in &lines {
+        let mut links_rel: Vec<(egui::Rect, PathBuf)> = Vec::new();
+        let (mut x, mut y) = (0.0_f32, flow_y0);
+        for (label, value, c, link) in &fields[1..] {
             let lg = (!label.is_empty())
-                .then(|| painter.layout_no_wrap(label.to_string(), font.clone(), label_col));
-            let vg = painter.layout_no_wrap(value.clone(), font.clone(), hue(*c));
+                .then(|| painter.layout_no_wrap(label.to_string(), body_font.clone(), label_col));
+            let vg = painter.layout_no_wrap(value.clone(), body_font.clone(), hue(*c));
             let group_w = lg.as_ref().map_or(0.0, |g| g.size().x + lv_gap) + vg.size().x;
             if x > 0.0 {
                 if x + sep_w + group_w > max_w {
-                    y += line_h; // wrap to a new row (no leading separator)
+                    y += line_h;
                     x = 0.0;
                 } else {
                     placed.push((egui::pos2(x, y), sep.clone()));
@@ -7115,11 +7178,18 @@ impl PixelView {
                 placed.push((egui::pos2(x, y), lg.clone()));
                 x += lg.size().x + lv_gap;
             }
+            if let Some(t) = link {
+                let r = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(vg.size().x, line_h));
+                links_rel.push((r, t.clone()));
+            }
             placed.push((egui::pos2(x, y), vg.clone()));
             x += vg.size().x;
-            used_w = used_w.max(x);
+            content_w = content_w.max(x);
         }
-        let (box_w, box_h) = (used_w + 2.0 * pad, y + line_h + 2.0 * pad);
+        let content_h = if fields.len() > 1 { y + line_h } else { header_h };
+        // Cap to the viewport (long values are clipped rather than overflowing).
+        let box_w = (content_w + 2.0 * pad).min(viewport.width() - 2.0 * margin);
+        let box_h = content_h + 2.0 * pad;
         let top = if self.osd_position == 0 {
             viewport.top() + margin
         } else {
@@ -7127,24 +7197,36 @@ impl PixelView {
         };
         let left = (viewport.center().x - box_w / 2.0).max(viewport.left() + margin);
         let rect = egui::Rect::from_min_size(egui::pos2(left, top), egui::vec2(box_w, box_h));
-        painter.rect_filled(
-            rect,
-            8.0,
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, av(180.0)),
-        );
+        painter.rect_filled(rect, 8.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, av(190.0)));
         painter.rect_stroke(
             rect,
             8.0,
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, av(36.0))),
+            egui::Stroke::new(1.0, white(40.0)),
             egui::StrokeKind::Inside,
         );
 
-        // Pass 2: paint each galley, vertically centred in its row.
+        // Clip the text to the panel so an over-long value can't bleed past the edge.
+        let tp = painter.with_clip_rect(rect.shrink(pad * 0.5));
         let origin = rect.min + egui::vec2(pad, pad);
+        tp.galley(origin, header.clone(), white(255.0));
+        tp.galley(origin + egui::vec2(0.7, 0.0), header, white(255.0)); // faux-bold
         for (rel, g) in &placed {
             let py = origin.y + rel.y + (line_h - g.size().y) / 2.0;
-            painter.galley(egui::pos2(origin.x + rel.x, py), g.clone(), egui::Color32::WHITE);
+            tp.galley(egui::pos2(origin.x + rel.x, py), g.clone(), white(255.0));
         }
+        // Absolute link rects (clipped to the panel) + underline the hovered one.
+        let mut links = Vec::with_capacity(links_rel.len());
+        for (r, t) in links_rel {
+            let abs = r.translate(origin.to_vec2()).intersect(rect);
+            if abs.width() < 1.0 {
+                continue;
+            }
+            if pointer.is_some_and(|p| abs.contains(p)) {
+                tp.hline(abs.x_range(), abs.bottom() - 2.0, egui::Stroke::new(1.0, white(220.0)));
+            }
+            links.push((abs, t));
+        }
+        (rect, links)
     }
 
     /// Apply a click with modifiers: Ctrl toggles, Shift range-selects, plain
