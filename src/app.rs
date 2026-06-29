@@ -573,6 +573,7 @@ enum MenuAction {
     ToggleDetails,
     ToggleRecolor,
     ToggleTable,
+    ToggleFavBarColored,
     Up,
     Home,
     Nav(PathBuf),
@@ -923,6 +924,9 @@ pub struct PixelView {
     // Optional color tag per favorite/pin (the favorite path → RGB), for organizing
     // Places. Assigned from the favorite's right-click ANSI32 palette. Persisted.
     fav_colors: HashMap<PathBuf, [u8; 3]>,
+    // Top Favorites bar shows only color-tagged favorites (declutter; the rest stay in the
+    // Places dock). Falls back to showing all when none are colored. Persisted.
+    fav_bar_colored_only: bool,
     path_edit: Option<String>, // Some(..) while the breadcrumb is in type-a-path mode
     focus_path: bool,          // request focus on the path field next frame
     dir_history: Vec<PathBuf>, // visited folders, for mouse back/forward
@@ -1025,6 +1029,8 @@ impl PixelView {
     /// Storage key for the persisted favorite folders.
     const FAV_KEY: &'static str = "favorites";
     const FAV_COLORS_KEY: &'static str = "fav_colors";
+    /// Whether the top Favorites bar shows only color-tagged favorites.
+    const FAV_BAR_COLORED_KEY: &'static str = "fav_bar_colored_only";
     /// Storage key for saved searches ("smart filters"): `Vec<Vec<String>>`, each
     /// row = `[display_name, name, ext, wmin, wmax, hmin, hmax, sauce]`.
     const SAVED_FILTERS_KEY: &'static str = "saved_filters";
@@ -1122,6 +1128,10 @@ impl PixelView {
             .and_then(|s| eframe::get_value::<Vec<(PathBuf, [u8; 3])>>(s, Self::FAV_COLORS_KEY))
             .map(|v| v.into_iter().collect())
             .unwrap_or_default();
+        let fav_bar_colored_only = cc
+            .storage
+            .and_then(|s| eframe::get_value::<bool>(s, Self::FAV_BAR_COLORED_KEY))
+            .unwrap_or(true);
 
         // Saved searches: each persisted row is [display_name, ...7 spec fields].
         let saved_filters: Vec<(String, SearchSpec)> = cc
@@ -1491,6 +1501,7 @@ impl PixelView {
             adjust_drag: None,
             favorites,
             fav_colors,
+            fav_bar_colored_only,
             path_edit: None,
             focus_path: false,
             dir_history: Vec::new(),
@@ -3172,8 +3183,31 @@ impl PixelView {
                         }
                     }
                 }
-                if let Some(p) = self.favorites_buttons(ui, "📁", |_| true) {
+                // Declutter: when enabled, the top bar surfaces only color-tagged
+                // favorites (the rest stay in the Places dock). Fall back to showing all
+                // when none are colored yet, so the bar is never confusingly empty.
+                let colored_only = self.fav_bar_colored_only
+                    && self.favorites.iter().any(|f| self.fav_colors.contains_key(f));
+                let colored: std::collections::HashSet<PathBuf> = if colored_only {
+                    self.fav_colors.keys().cloned().collect()
+                } else {
+                    std::collections::HashSet::new()
+                };
+                let hidden = if colored_only {
+                    self.favorites.len().saturating_sub(colored.len())
+                } else {
+                    0
+                };
+                if let Some(p) =
+                    self.favorites_buttons(ui, "📁", |path| !colored_only || colored.contains(path))
+                {
                     self.open_folder(p);
+                }
+                if hidden > 0 {
+                    ui.weak(format!("+{hidden}")).on_hover_text(format!(
+                        "{hidden} uncolored favorite(s) hidden — find them in the Places dock, \
+                         or color-tag one to surface it here (View → Favorites bar)"
+                    ));
                 }
             }
         });
@@ -8107,6 +8141,17 @@ impl PixelView {
                     action = Some(MenuAction::ToggleTable);
                     ui.close();
                 }
+                if ui
+                    .selectable_label(self.fav_bar_colored_only, "Favorites bar: colored only")
+                    .on_hover_text(
+                        "Show only color-tagged favorites in the top bar (the rest stay in \
+                         the Places dock) — color-tag a favorite from its right-click menu",
+                    )
+                    .clicked()
+                {
+                    action = Some(MenuAction::ToggleFavBarColored);
+                    ui.close();
+                }
                 ui.separator();
                 if ui
                     .selectable_label(self.show_explorer, "Explorer pane")
@@ -8201,6 +8246,9 @@ impl PixelView {
             MenuAction::ToggleExplorer => self.show_explorer = !self.show_explorer,
             MenuAction::ToggleDetails => self.show_details = !self.show_details,
             MenuAction::ToggleRecolor => self.show_recolor = !self.show_recolor,
+            MenuAction::ToggleFavBarColored => {
+                self.fav_bar_colored_only = !self.fav_bar_colored_only
+            }
             MenuAction::ToggleTable => self.table_view = !self.table_view,
             MenuAction::Up => {
                 // Compute the parent in *display* space so "up" from an archive root
@@ -9104,6 +9152,7 @@ impl eframe::App for PixelView {
         let fav_colors: Vec<(PathBuf, [u8; 3])> =
             self.fav_colors.iter().map(|(p, &c)| (p.clone(), c)).collect();
         eframe::set_value(storage, Self::FAV_COLORS_KEY, &fav_colors);
+        eframe::set_value(storage, Self::FAV_BAR_COLORED_KEY, &self.fav_bar_colored_only);
         let filters: Vec<Vec<String>> = self
             .saved_filters
             .iter()

@@ -177,7 +177,11 @@ persisted as `FAV_COLORS_KEY`); cleared when the favorite is removed. In the Pla
 dock the favorites split into **Local** vs **16colo.rs** sub-tabs (`places_tab`):
 `favorites_buttons` takes a `filter: Fn(&Path) -> bool` (`!is_remote` / `is_remote`) and
 filters with `continue` so the *global* favorite index — and thus reorder/remove —
-stays correct; the toolbar passes `|_| true` (all). Local also holds Home + smart
+stays correct. The **top toolbar** passes a filter that, when `fav_bar_colored_only`
+(persisted, default on; View → "Favorites bar: colored only") is set, surfaces **only
+color-tagged favorites** to declutter the bar — with a fallback to all when *none* are
+colored (never an empty bar), and a faint `+N` marking how many uncolored ones are hidden
+in the dock. Local also holds Home + smart
 filters; 16colo.rs holds the 🌐 browse entry + the remote pins. The explorer's
 folder tree uses `CollapsingState` (lazy: collapsed nodes do no I/O). The details
 dock shows a fit thumbnail + palette swatches + `.GPL` export (`to_gpl`), fed by

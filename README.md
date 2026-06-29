@@ -181,7 +181,10 @@ order, CRT toggles, baud rates — is **remembered between runs**.
 - **Drag-reorderable favorites** in the top toolbar — drag to rearrange,
   right-click to remove, or pin any folder via its grid context menu / the **Go**
   menu. `🏠 Home` and `⬆ Up` are always available. **Color-tag** any favorite from its
-  right-click menu (an ANSI32 swatch grid) to fill the button with a color.
+  right-click menu (an ANSI32 swatch grid) to fill the button with a color. To keep the
+  top bar uncluttered it shows **only color-tagged favorites** by default (toggle in
+  **View → Favorites bar: colored only**); the rest stay in the Places dock, and a `+N`
+  marker notes how many are hidden.
 - **Places dock** with **Local** / **16colo.rs** sub-tabs — local holds Home, your
   on-disk favorites and saved smart filters; 16colo.rs holds the 🌐 browse entry and your
   remote pins (e.g. a pinned artist that re-runs its search on click).
