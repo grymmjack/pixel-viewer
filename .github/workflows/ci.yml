@@ -88,5 +88,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gui-screenshots
-          path: target/gui-screenshots/*.png
+          # The whole dir: the rendered PNGs + captions.md (per-shot action notes).
+          path: target/gui-screenshots/
           if-no-files-found: warn

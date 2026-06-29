@@ -13029,43 +13029,242 @@ mod gui_tests {
     }
 }
 
-/// Renders real GUI screenshots of the app chrome to `target/gui-screenshots/`,
-/// for CI artifacts / visual review. Gated behind the `gui-screenshots` feature
-/// because it needs egui_kittest's wgpu backend (a Vulkan driver — lavapipe in
-/// CI); the normal `cargo test` neither compiles wgpu nor needs a GPU. Run with
-/// `cargo test --features gui-screenshots gui_screenshots`.
+/// Renders real GUI screenshots to `target/gui-screenshots/` for CI artifacts /
+/// visual review. Each *scenario* drives the actual app headlessly (egui_kittest
+/// boots `PixelView`, opens art, clicks controls) and captures the frame; the only
+/// thing painted onto the image is the spatial click marker (a ring) — kittest
+/// already paints the mouse cursor at the pointer. The *textual* annotations
+/// (action / keys / mouse / which change a shot demonstrates) are written as
+/// captions to `captions.md` beside the PNGs, not overlaid on the UI.
+///
+/// Reusable + parameterized: pick a subset with the `GUI_SHOTS` env var, matching
+/// a scenario `name` or `tag` — e.g. `GUI_SHOTS=ui-change` renders just the shots
+/// for this PR's changes. Default (unset) renders all.
+///
+/// Gated behind the `gui-screenshots` feature (egui_kittest's wgpu backend needs a
+/// Vulkan driver — lavapipe in CI); normal `cargo test` neither compiles wgpu nor
+/// needs a GPU. Run with `cargo test --features gui-screenshots gui_screenshots`.
 #[cfg(all(test, feature = "gui-screenshots"))]
 mod gui_screenshots {
     use super::*;
     use egui_kittest::kittest::Queryable;
     use egui_kittest::Harness;
+    use std::path::Path;
 
-    fn shot(harness: &mut Harness<'_, PixelView>, name: &str) {
-        let dir = std::path::Path::new("target/gui-screenshots");
-        std::fs::create_dir_all(dir).expect("create screenshot dir");
-        let img = harness.render().expect("wgpu render failed");
-        img.save(dir.join(format!("{name}.png")))
-            .expect("save screenshot png");
+    // A small text-mode piece so the viewer shows the text-mode-only controls
+    // (CRT aspect, 9-dot cell) and a baud player: colored blocks, a title, dither.
+    const SAMPLE_ANS: &[u8] = b"\x1b[0;1;31m\xdb\xdb\x1b[33m\xdb\xdb\x1b[32m\xdb\xdb\x1b[36m\xdb\xdb\x1b[34m\xdb\xdb\x1b[35m\xdb\xdb\x1b[37m\xdb\xdb\x1b[0m\r\n\x1b[1;36m  pixelview \x1b[0;37mUI cleanup demo\x1b[0m\r\n\x1b[1;30m\xb0\xb1\xb2\x1b[0;36m\xb2\xb1\xb0 \x1b[1;33mtext-mode art\x1b[0m\r\n";
+
+    /// One screenshot scenario. `drive` puts the app in a state and returns the
+    /// click point (image px) to ring, if any. `action`/`shows` become captions.
+    struct Shot {
+        name: &'static str,
+        tags: &'static [&'static str],
+        action: &'static str,
+        shows: &'static str,
+        drive: fn(&mut Harness<'_, PixelView>, &Path) -> Option<(i32, i32)>,
     }
 
-    #[test]
-    fn render_chrome_screenshots() {
-        let mut harness = Harness::builder()
+    fn build(folder: &Path) -> Harness<'static, PixelView> {
+        let args = CliArgs {
+            folder: Some(folder.to_path_buf()),
+            ..Default::default()
+        };
+        Harness::builder()
             .with_size([1280.0, 860.0])
             .wgpu()
-            .build_eframe(|cc| PixelView::new(cc, CliArgs::default()));
-        harness.run();
-        shot(&mut harness, "01-startup");
+            .build_eframe(move |cc| PixelView::new(cc, args))
+    }
 
-        // The View menu (Grid/Table toggle, panes, Preferences…).
-        harness.get_by_label("View").click();
-        harness.run();
-        shot(&mut harness, "02-view-menu");
+    // Let async work (folder scan, thumbnail decode on the worker pool) catch up.
+    // Use `step` (one frame), not `run`: pixelview keeps requesting repaints
+    // (spinners / pending thumbnails / the player), so `run` never "settles" and
+    // would hit its max-steps assertion.
+    fn settle(h: &mut Harness<'_, PixelView>, frames: usize) {
+        for _ in 0..frames {
+            h.step();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
 
-        // The Preferences dialog (theme, grid spacing, hotkeys, OSD…).
-        harness.get_by_label("Preferences…").click();
-        harness.run();
-        shot(&mut harness, "03-preferences");
+    // Open `sample` in the single/viewer view, exactly as a grid click would
+    // (load_full decodes synchronously, then flip the mode).
+    fn enter_viewer(h: &mut Harness<'_, PixelView>, sample: &Path) {
+        let ctx = h.ctx.clone();
+        {
+            let st = h.state_mut();
+            st.load_full(&ctx, sample.to_path_buf());
+            st.mode = Mode::Single;
+        }
+        h.run_steps(2);
+    }
+
+    // Click a labelled widget; return its center in image pixels (for the ring).
+    fn click(h: &mut Harness<'_, PixelView>, label: &str) -> (i32, i32) {
+        let ppp = h.ctx.pixels_per_point();
+        let center = {
+            let n = h.get_by_label(label);
+            let c = n.rect().center();
+            n.click();
+            c
+        };
+        h.run_steps(2);
+        ((center.x * ppp) as i32, (center.y * ppp) as i32)
+    }
+
+    // A subtle 3px magenta ring at the click point — the one thing we paint on the
+    // image, because "where the click landed" is spatial and can't be a caption.
+    // Complements the mouse cursor kittest already draws at the pointer.
+    fn ring(buf: &mut [u8], w: u32, h: u32, cx: i32, cy: i32) {
+        for step in 0..1440 {
+            let a = step as f32 * std::f32::consts::PI / 720.0;
+            for r in [17.0f32, 18.0, 19.0] {
+                let x = cx + (a.cos() * r).round() as i32;
+                let y = cy + (a.sin() * r).round() as i32;
+                if x < 0 || y < 0 || x as u32 >= w || y as u32 >= h {
+                    continue;
+                }
+                let i = ((y as u32 * w + x as u32) * 4) as usize;
+                if i + 3 < buf.len() {
+                    buf[i] = 255;
+                    buf[i + 1] = 70;
+                    buf[i + 2] = 210;
+                    buf[i + 3] = 255;
+                }
+            }
+        }
+    }
+
+    const SHOTS: &[Shot] = &[
+        Shot {
+            name: "01-breadcrumb-favorites",
+            tags: &["ui-change", "browse"],
+            action: "Open a folder (here via --folder), with the folder pinned. No click.",
+            shows: "Change D — the ★ Pin button and the 📁 folder favorites now live at \
+                    the right end of the breadcrumb row; the old standalone \"Favorites:\" \
+                    strip (a whole row for one button) is gone.",
+            drive: |h, sample| {
+                if let Some(parent) = sample.parent() {
+                    h.state_mut().favorites.push(parent.to_path_buf());
+                }
+                h.run_steps(2);
+                None
+            },
+        },
+        Shot {
+            name: "02-viewer-status-bar",
+            tags: &["ui-change", "viewer"],
+            action: "Open a piece of art in the single/viewer view. No click.",
+            shows: "Changes A/B/C — the viewer status bar is collapsed: a 📺 CRT popover \
+                    and a ▶ Auto popover replace ~18 inline widgets, the long zoom hint is \
+                    now a compact ? tooltip, and the playback readout no longer repeats the \
+                    byte position.",
+            drive: |h, sample| {
+                enter_viewer(h, sample);
+                None
+            },
+        },
+        Shot {
+            name: "03-crt-popover",
+            tags: &["ui-change", "viewer"],
+            action: "Mouse: click the “📺 CRT” button in the status bar (ringed).",
+            shows: "Change A — all retro-monitor effects (scanlines, scale, glow + amount, \
+                    black background, plus CRT aspect & 9-dot cell for text-mode art) are \
+                    collapsed into this one popover.",
+            drive: |h, sample| {
+                enter_viewer(h, sample);
+                Some(click(h, "📺 CRT"))
+            },
+        },
+        Shot {
+            name: "04-auto-popover",
+            tags: &["ui-change", "viewer"],
+            action: "Mouse: click the “▶ Auto” button in the status bar (ringed).",
+            shows: "Change A — the slideshow (auto-advance + delay) and the random-pack \
+                    screensaver controls are collapsed into this one popover; the button \
+                    title turns yellow while a slideshow is paused.",
+            drive: |h, sample| {
+                enter_viewer(h, sample);
+                Some(click(h, "▶ Auto"))
+            },
+        },
+        Shot {
+            name: "05-view-menu",
+            tags: &["chrome"],
+            action: "Mouse: click the View menu (ringed).",
+            shows: "Top-level chrome (unchanged by this PR): Grid/Table toggle, panes, \
+                    Preferences….",
+            drive: |h, _| Some(click(h, "View")),
+        },
+        Shot {
+            name: "06-preferences",
+            tags: &["chrome"],
+            action: "Mouse: View → Preferences… (ring marks the final click).",
+            shows: "The Preferences dialog (unchanged by this PR): theme, grid spacing, \
+                    hotkeys, table columns, viewer OSD.",
+            drive: |h, _| {
+                let _ = click(h, "View");
+                Some(click(h, "Preferences…"))
+            },
+        },
+    ];
+
+    #[test]
+    fn render_app_screenshots() {
+        let dir = std::env::temp_dir().join(format!("pv_shots_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sample = dir.join("ACID-DEMO.ans");
+        std::fs::write(&sample, SAMPLE_ANS).unwrap();
+
+        let out = Path::new("target/gui-screenshots");
+        std::fs::create_dir_all(out).unwrap();
+
+        let want = std::env::var("GUI_SHOTS").ok();
+        let selected = |s: &Shot| {
+            want.as_deref().map_or(true, |w| {
+                w.split(',')
+                    .map(str::trim)
+                    .any(|n| n == s.name || s.tags.contains(&n))
+            })
+        };
+
+        let mut captions = String::from(
+            "# GUI screenshots\n\nGenerated by the `gui_screenshots` test: each shot drives \
+             the real app headlessly (egui_kittest + wgpu) and captures it. The mouse cursor \
+             and a magenta ring mark where a click landed; these captions describe the action \
+             rather than overlaying text on the UI.\n\n",
+        );
+
+        for shot in SHOTS {
+            if !selected(shot) {
+                continue;
+            }
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut h = build(&dir);
+                settle(&mut h, 4);
+                let marker = (shot.drive)(&mut h, &sample);
+                let mut img = h.render().expect("wgpu render failed");
+                let (w, ht) = (img.width(), img.height());
+                if let Some((mx, my)) = marker {
+                    ring(&mut img, w, ht, mx, my);
+                }
+                img.save(out.join(format!("{}.png", shot.name)))
+                    .expect("save png");
+            }));
+            let note = if res.is_ok() {
+                ""
+            } else {
+                eprintln!("[gui-screenshots] scenario {} failed to render", shot.name);
+                "  _(render failed — see log)_"
+            };
+            captions.push_str(&format!(
+                "## {}.png{}\n\n- **Action:** {}\n- **Shows:** {}\n\n",
+                shot.name, note, shot.action, shot.shows
+            ));
+        }
+
+        std::fs::write(out.join("captions.md"), captions).expect("write captions.md");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
