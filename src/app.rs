@@ -583,6 +583,7 @@ enum MenuAction {
     ResetThumb,
     Hotkeys,
     Prefs,
+    Associations,
     File(FileAction),
     Undo,
     Search,
@@ -826,6 +827,12 @@ pub struct PixelView {
     places_tab: u8,                          // Places sub-tab: 0 = Local, 1 = 16colo.rs
     show_hotkeys: bool,
     show_prefs: bool,
+    show_associations: bool, // the View → Associations editor window is open
+    // User-defined external "Open in…" programs by file type (persisted).
+    openers: Vec<Opener>,
+    assoc_selected: usize, // selected opener row in the Associations editor
+    // Decoded icon textures for openers (keyed by icon path; `None` = decode failed/cached).
+    opener_icons: HashMap<PathBuf, Option<egui::TextureHandle>>,
 
     // preferences (round 2 #10)
     theme: u8,                                              // 0 = dark, 1 = light
@@ -1034,6 +1041,8 @@ impl PixelView {
     /// Storage key for saved searches ("smart filters"): `Vec<Vec<String>>`, each
     /// row = `[display_name, name, ext, wmin, wmax, hmin, hmax, sauce]`.
     const SAVED_FILTERS_KEY: &'static str = "saved_filters";
+    /// External "Open in…" program associations (flattened `Vec<Vec<String>>`).
+    const OPENERS_KEY: &'static str = "openers";
     /// Storage key for the last-opened folder (reopened on launch).
     const FOLDER_KEY: &'static str = "last_folder";
     /// Storage keys for sort & filter state.
@@ -1141,6 +1150,15 @@ impl PixelView {
             .into_iter()
             .filter(|row| !row.is_empty())
             .map(|row| (row[0].clone(), SearchSpec::from_record(&row[1..])))
+            .collect();
+
+        // External "Open in…" programs: each persisted row is one flattened `Opener`.
+        let openers: Vec<Opener> = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Vec<Vec<String>>>(s, Self::OPENERS_KEY))
+            .unwrap_or_default()
+            .iter()
+            .map(|row| Opener::from_record(row))
             .collect();
 
         let last_folder = cc
@@ -1428,6 +1446,10 @@ impl PixelView {
             places_tab: 0,
             show_hotkeys: false,
             show_prefs: false,
+            show_associations: false,
+            openers,
+            assoc_selected: 0,
+            opener_icons: HashMap::new(),
             theme,
             grid_gap,
             grid_gap_y,
@@ -5272,6 +5294,8 @@ impl PixelView {
         let mut smart_on: Option<(usize, SmartCriterion)> = None; // "Smart filter on…"
         let mut toggle_viewed: Option<(usize, bool)> = None; // "Mark as (not) viewed"
         let mut rate_to: Option<(usize, u8)> = None; // "Rating ▸ N" context-menu choice
+        let mut open_with: Option<(usize, usize)> = None; // (entry idx, opener idx)
+        let mut open_other: Option<usize> = None; // "Open in… → Other" on this entry
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // 16colo download (idx, want_pack)
         let can_paste = self.clipboard.is_some();
@@ -5554,8 +5578,10 @@ impl PixelView {
                             let colo_pin =
                                 colo_pin_label.as_deref().map(|l| (l, colo_pin_pinned));
                             let colo_piece = self.colo_pieces.contains_key(&entry.path);
+                            let openers = self.opener_items();
                             if let Some(pick) = entry_context_menu(
                                 ui, &entry, can_paste, pinned, viewed, colo_pin, colo_piece,
+                                &openers,
                             ) {
                                 match pick {
                                     TilePick::Pin => pin_dir = Some(idx),
@@ -5565,6 +5591,8 @@ impl PixelView {
                                     TilePick::ToggleViewed(b) => toggle_viewed = Some((idx, b)),
                                     TilePick::Download(pack) => dl = Some((idx, pack)),
                                     TilePick::Rate(stars) => rate_to = Some((idx, stars)),
+                                    TilePick::OpenWith(oi) => open_with = Some((idx, oi)),
+                                    TilePick::OpenWithOther => open_other = Some(idx),
                                 }
                             }
                         });
@@ -5625,6 +5653,12 @@ impl PixelView {
         }
         if let Some((idx, stars)) = rate_to {
             self.rate_entry(idx, stars);
+        }
+        if let Some((idx, oi)) = open_with {
+            self.open_with(idx, oi);
+        }
+        if let Some(idx) = open_other {
+            self.open_with_other(idx);
         }
         if pin_current {
             self.pin_current_folder();
@@ -5858,6 +5892,8 @@ impl PixelView {
         let mut smart_on: Option<(usize, SmartCriterion)> = None;
         let mut toggle_viewed: Option<(usize, bool)> = None; // "Mark as (not) viewed"
         let mut rate_to: Option<(usize, u8)> = None; // "Rating ▸ N" context-menu choice
+        let mut open_with: Option<(usize, usize)> = None; // (entry idx, opener idx)
+        let mut open_other: Option<usize> = None; // "Open in… → Other" on this entry
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // (idx, want_pack)
         let mut colo_link: Option<(usize, ColKind)> = None; // pack/year/group link click
@@ -6275,8 +6311,10 @@ impl PixelView {
                     let colo_pin = colo_pin_label.as_deref().map(|l| (l, colo_pin_pinned));
                     let colo_piece = piece.is_some();
                     resp.context_menu(|ui| {
+                        let openers = self.opener_items();
                         if let Some(pick) = entry_context_menu(
                             ui, &entry, can_paste, pinned, viewed, colo_pin, colo_piece,
+                            &openers,
                         ) {
                             match pick {
                                 TilePick::Pin => pin_dir = Some(idx),
@@ -6286,6 +6324,8 @@ impl PixelView {
                                 TilePick::ToggleViewed(b) => toggle_viewed = Some((idx, b)),
                                 TilePick::Download(pack) => dl = Some((idx, pack)),
                                 TilePick::Rate(stars) => rate_to = Some((idx, stars)),
+                                TilePick::OpenWith(oi) => open_with = Some((idx, oi)),
+                                TilePick::OpenWithOther => open_other = Some(idx),
                             }
                         }
                     });
@@ -6394,6 +6434,12 @@ impl PixelView {
         }
         if let Some((idx, stars)) = rate_to {
             self.rate_entry(idx, stars);
+        }
+        if let Some((idx, oi)) = open_with {
+            self.open_with(idx, oi);
+        }
+        if let Some(idx) = open_other {
+            self.open_with_other(idx);
         }
         if pin_current {
             self.pin_current_folder();
@@ -7688,6 +7734,318 @@ impl PixelView {
         self.status = format!("Rated: {}", stars_label(stars));
     }
 
+    /// Launch external program `exec` on `path` with the opener's args/env. `args` is
+    /// space-split; a `{}` token is replaced by the (resolved, real) file path, otherwise
+    /// the path is appended as the last argument. `env` is `KEY=VALUE` per line. Spawns
+    /// detached (non-blocking); a virtual 16colo/archive path resolves to its real file.
+    fn launch_external(&mut self, exec: &str, args: &str, env: &str, path: &Path) {
+        if exec.trim().is_empty() {
+            self.status = "No program set for this opener".into();
+            return;
+        }
+        let real = self.resolve_local(path);
+        let p = real.to_string_lossy().to_string();
+        let mut argv: Vec<String> = Vec::new();
+        let mut used = false;
+        for tok in args.split_whitespace() {
+            if tok.contains("{}") {
+                argv.push(tok.replace("{}", &p));
+                used = true;
+            } else {
+                argv.push(tok.to_string());
+            }
+        }
+        if !used {
+            argv.push(p);
+        }
+        let mut cmd = std::process::Command::new(exec.trim());
+        cmd.args(&argv);
+        for line in env.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                cmd.env(k.trim(), v.trim());
+            }
+        }
+        match cmd.spawn() {
+            Ok(_) => {
+                self.status = format!("Opened {} in {}", short_name(path), exec.trim());
+            }
+            Err(e) => self.status = format!("Couldn't launch {}: {e}", exec.trim()),
+        }
+    }
+
+    /// Run the registered opener at `idx` on the entry at `entry_idx`.
+    fn open_with(&mut self, entry_idx: usize, opener_idx: usize) {
+        let Some(path) = self.entries.get(entry_idx).map(|e| e.path.clone()) else {
+            return;
+        };
+        let Some(o) = self.openers.get(opener_idx).cloned() else {
+            return;
+        };
+        self.launch_external(&o.exec, &o.args, &o.env, &path);
+    }
+
+    /// "Open in… → Other": pick an arbitrary program with a file dialog and run it once.
+    fn open_with_other(&mut self, entry_idx: usize) {
+        let Some(path) = self.entries.get(entry_idx).map(|e| e.path.clone()) else {
+            return;
+        };
+        if let Some(exec) = rfd::FileDialog::new().set_title("Choose a program").pick_file() {
+            let exec = exec.to_string_lossy().to_string();
+            self.launch_external(&exec, "", "", &path);
+        }
+    }
+
+    /// Decode any not-yet-cached opener icons into small textures (cheap: cached by path,
+    /// `None` on failure so we don't re-decode every frame). Drives the menu + editor icons.
+    fn ensure_opener_icons(&mut self, ctx: &egui::Context) {
+        let paths: Vec<PathBuf> = self
+            .openers
+            .iter()
+            .filter(|o| !o.icon.trim().is_empty())
+            .map(|o| PathBuf::from(o.icon.trim()))
+            .filter(|p| !self.opener_icons.contains_key(p))
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        let reg = self.registry.clone();
+        for key in paths {
+            let tex = crate::thumb::decode_thumb(&reg, &key, 32).map(|(w, h, rgba)| {
+                let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+                ctx.load_texture(
+                    format!("opener_icon:{}", key.display()),
+                    img,
+                    egui::TextureOptions::LINEAR,
+                )
+            });
+            self.opener_icons.insert(key, tex);
+        }
+    }
+
+    /// One owned snapshot of every opener for the right-click menu (global index, name,
+    /// loaded icon id, exts) — built once per frame so `entry_context_menu` (a free fn that
+    /// can't borrow `self`) can filter by the entry's extension without per-tile work.
+    fn opener_items(&self) -> Vec<OpenerItem> {
+        self.openers
+            .iter()
+            .enumerate()
+            .map(|(idx, o)| OpenerItem {
+                idx,
+                name: o.name.clone(),
+                icon: self
+                    .opener_icons
+                    .get(Path::new(o.icon.trim()))
+                    .and_then(|t| t.as_ref())
+                    .map(|t| t.id()),
+                exts: o.ext_list(),
+            })
+            .collect()
+    }
+
+    /// The File-type associations editor (View → Associations…): a left list of openers +
+    /// a right field editor for the selected one, with add/preset/remove. Structural edits
+    /// are deferred so the closures needn't mutate `self.openers` while borrowing it.
+    fn ui_associations(&mut self, ctx: &egui::Context) {
+        if !self.show_associations {
+            return;
+        }
+        // Owned name+icon snapshot so the list pane doesn't borrow `self.openers` while we
+        // also `get_mut` the selected one for the editor pane.
+        let list: Vec<(String, Option<egui::TextureId>)> = self
+            .openers
+            .iter()
+            .map(|o| {
+                let name = if o.name.trim().is_empty() {
+                    "(unnamed)".to_string()
+                } else {
+                    o.name.clone()
+                };
+                let icon = self
+                    .opener_icons
+                    .get(Path::new(o.icon.trim()))
+                    .and_then(|t| t.as_ref())
+                    .map(|t| t.id());
+                (name, icon)
+            })
+            .collect();
+        if self.assoc_selected >= self.openers.len() {
+            self.assoc_selected = self.openers.len().saturating_sub(1);
+        }
+
+        let mut open = true;
+        let mut add_blank = false;
+        let mut add_preset: Option<Opener> = None;
+        let mut remove: Option<usize> = None;
+        egui::Window::new("File-type associations")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(580.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Register external programs to open files by type. Right-click a file → \
+                     Open in… to launch one.",
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("➕ Add").clicked() {
+                        add_blank = true;
+                    }
+                    ui.menu_button("Add preset ▾", |ui| {
+                        for p in opener_presets() {
+                            if ui.button(&p.name).clicked() {
+                                add_preset = Some(p);
+                                ui.close();
+                            }
+                        }
+                    });
+                });
+                ui.separator();
+                if self.openers.is_empty() {
+                    ui.weak(
+                        "No associations yet. Click Add (or pick a preset) and set its \
+                         program path + extensions.",
+                    );
+                    return;
+                }
+
+                let mut select: Option<usize> = None;
+                ui.columns(2, |cols| {
+                    // Left: the opener list.
+                    egui::ScrollArea::vertical()
+                        .id_salt("assoc_list")
+                        .max_height(320.0)
+                        .show(&mut cols[0], |ui| {
+                            for (i, (name, icon)) in list.iter().enumerate() {
+                                let sel = i == self.assoc_selected;
+                                let resp = match icon {
+                                    Some(id) => {
+                                        let img = egui::Image::new(egui::load::SizedTexture::new(
+                                            *id,
+                                            egui::vec2(16.0, 16.0),
+                                        ));
+                                        ui.add(
+                                            egui::Button::image_and_text(img, name).selected(sel),
+                                        )
+                                    }
+                                    None => ui.selectable_label(sel, name),
+                                };
+                                if resp.clicked() {
+                                    select = Some(i);
+                                }
+                            }
+                        });
+
+                    // Right: edit the selected opener's fields.
+                    let rui = &mut cols[1];
+                    let sel = self.assoc_selected;
+                    let icon_id = list.get(sel).and_then(|(_, ic)| *ic);
+                    if let Some(o) = self.openers.get_mut(sel) {
+                        egui::Grid::new("assoc_edit")
+                            .num_columns(2)
+                            .spacing([8.0, 6.0])
+                            .show(rui, |ui| {
+                                ui.label("Name");
+                                ui.text_edit_singleline(&mut o.name);
+                                ui.end_row();
+
+                                ui.label("Program");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut o.exec)
+                                            .desired_width(200.0)
+                                            .hint_text("gimp, /usr/bin/inkscape, …"),
+                                    );
+                                    if ui.button("Browse…").clicked() {
+                                        if let Some(p) = rfd::FileDialog::new()
+                                            .set_title("Choose program")
+                                            .pick_file()
+                                        {
+                                            o.exec = p.to_string_lossy().into_owned();
+                                        }
+                                    }
+                                });
+                                ui.end_row();
+
+                                ui.label("Extensions");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut o.exts)
+                                        .desired_width(260.0)
+                                        .hint_text("png, jpg, ans, xb …"),
+                                );
+                                ui.end_row();
+
+                                ui.label("Arguments");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut o.args)
+                                        .desired_width(260.0)
+                                        .hint_text("optional; {} = file path, else appended"),
+                                );
+                                ui.end_row();
+
+                                ui.label("Icon");
+                                ui.horizontal(|ui| {
+                                    if let Some(id) = icon_id {
+                                        ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                                            id,
+                                            egui::vec2(20.0, 20.0),
+                                        )));
+                                    }
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut o.icon)
+                                            .desired_width(170.0)
+                                            .hint_text("optional image"),
+                                    );
+                                    if ui.button("Browse…").clicked() {
+                                        if let Some(p) = rfd::FileDialog::new()
+                                            .set_title("Choose an icon image")
+                                            .pick_file()
+                                        {
+                                            o.icon = p.to_string_lossy().into_owned();
+                                        }
+                                    }
+                                });
+                                ui.end_row();
+
+                                ui.label("Environment");
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut o.env)
+                                        .desired_width(260.0)
+                                        .desired_rows(2)
+                                        .hint_text("KEY=VALUE per line (optional)"),
+                                );
+                                ui.end_row();
+                            });
+                        rui.add_space(6.0);
+                        if rui.button("🗑 Remove this association").clicked() {
+                            remove = Some(sel);
+                        }
+                    }
+                });
+                if let Some(i) = select {
+                    self.assoc_selected = i;
+                }
+            });
+        self.show_associations = open;
+
+        // Apply deferred structural edits.
+        if add_blank {
+            self.openers.push(Opener::default());
+            self.assoc_selected = self.openers.len() - 1;
+        }
+        if let Some(p) = add_preset {
+            self.openers.push(p);
+            self.assoc_selected = self.openers.len() - 1;
+        }
+        if let Some(i) = remove {
+            self.openers.remove(i);
+            self.assoc_selected = self.assoc_selected.min(self.openers.len().saturating_sub(1));
+        }
+    }
+
     /// Bottom status bar: counts + total size, and the current selection.
     /// VSCode-style activity rail on the far left: icon toggles for the side docks
     /// plus quick actions. Deliberately narrow with room reserved for more buttons.
@@ -8179,6 +8537,14 @@ impl PixelView {
                     ui.close();
                 }
                 ui.separator();
+                if ui
+                    .button("Associations…")
+                    .on_hover_text("Register external programs to open files by type")
+                    .clicked()
+                {
+                    action = Some(MenuAction::Associations);
+                    ui.close();
+                }
                 if ui.button("Preferences…").clicked() {
                     action = Some(MenuAction::Prefs);
                     ui.close();
@@ -8282,6 +8648,7 @@ impl PixelView {
             MenuAction::ResetThumb => self.thumb_size = DEFAULT_TILE,
             MenuAction::Hotkeys => self.show_hotkeys = true,
             MenuAction::Prefs => self.show_prefs = true,
+            MenuAction::Associations => self.show_associations = true,
             MenuAction::Search => {
                 self.show_search = true;
                 self.focus_adv_search = true;
@@ -8423,6 +8790,8 @@ impl eframe::App for PixelView {
         // Track the live zoom factor (changed by Ctrl +/-) so `save` can persist it.
         self.ui_zoom = ctx.zoom_factor();
         self.want_repaint = false;
+        // Decode any new "Open in…" program icons (cheap: returns early when all cached).
+        self.ensure_opener_icons(&ctx);
 
         // F11 — immersive mode: hide every bar/dock, drop the window decorations, and go
         // OS-fullscreen, showing only the art. Bars reveal when the mouse reaches the
@@ -9093,6 +9462,9 @@ impl eframe::App for PixelView {
             self.show_prefs = open;
         }
 
+        // File-type associations editor (View → Associations…).
+        self.ui_associations(&ctx);
+
         // Rename dialog (F2 / Edit menu / right-click / new-folder). The buffer is
         // owned by `self.renaming`; we lift it out for editing and decide its fate.
         if let Some((path, mut name)) = self.renaming.take() {
@@ -9163,6 +9535,8 @@ impl eframe::App for PixelView {
             })
             .collect();
         eframe::set_value(storage, Self::SAVED_FILTERS_KEY, &filters);
+        let openers: Vec<Vec<String>> = self.openers.iter().map(|o| o.record()).collect();
+        eframe::set_value(storage, Self::OPENERS_KEY, &openers);
         // Remember where we were. Save the *display* path, not `self.folder`: inside an
         // archive / downloaded 16colo pack, `self.folder` is a temp dir that's gone next
         // launch, whereas the display path (`pack.zip/…`, `<16colo.rs>/year/pack`) is
@@ -10797,6 +11171,87 @@ enum TilePick {
     ToggleViewed(bool),     // mark this entry viewed (true) / not viewed (false)
     Download(bool),         // save a 16colo piece (false) or its whole pack .zip (true)
     Rate(u8),               // set this entry's star rating (0 = clear), via the context menu
+    OpenWith(usize),        // "Open in…" → launch the external opener at this index
+    OpenWithOther,          // "Open in…" → pick an arbitrary program (one-off, rfd)
+}
+
+/// A user-defined external program registered to open files of certain types ("open in
+/// GIMP / PabloDraw / …"). Edited under View → Associations and offered in the right-click
+/// **Open in…** menu for files whose extension is in `exts`. Persisted (flattened to a
+/// `Vec<String>` like [`SearchSpec`], since the project has no serde-derive).
+#[derive(Clone, Default)]
+struct Opener {
+    name: String, // display name ("GIMP")
+    exec: String, // program path / command ("gimp", "/usr/bin/inkscape")
+    args: String, // extra args, space-separated; `{}` → the file path, else appended
+    env: String,  // environment, one `KEY=VALUE` per line
+    icon: String, // optional path to an icon image (shown in the menu + editor)
+    exts: String, // extensions this opener handles, comma/space-separated ("png, ans …")
+}
+
+impl Opener {
+    /// Flatten for persistence: a fixed `[name, exec, args, env, icon, exts]` row.
+    /// `from_record` tolerates short/legacy rows (missing fields default to empty).
+    fn record(&self) -> Vec<String> {
+        vec![
+            self.name.clone(),
+            self.exec.clone(),
+            self.args.clone(),
+            self.env.clone(),
+            self.icon.clone(),
+            self.exts.clone(),
+        ]
+    }
+
+    fn from_record(r: &[String]) -> Self {
+        let g = |i: usize| r.get(i).cloned().unwrap_or_default();
+        Opener {
+            name: g(0),
+            exec: g(1),
+            args: g(2),
+            env: g(3),
+            icon: g(4),
+            exts: g(5),
+        }
+    }
+
+    /// The extensions parsed into a normalized list (lowercased, leading dots stripped).
+    fn ext_list(&self) -> Vec<String> {
+        self.exts
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|e| !e.is_empty())
+            .collect()
+    }
+}
+
+/// A per-frame snapshot of an opener for the right-click menu (so `entry_context_menu`,
+/// a free fn, needn't borrow `self`): its global index, name, optional loaded icon, exts.
+struct OpenerItem {
+    idx: usize,
+    name: String,
+    icon: Option<egui::TextureId>,
+    exts: Vec<String>,
+}
+
+/// Starter associations for common pixel-art / scene-art editors. The `exec` is the usual
+/// command name (the user adjusts the path if needed); extensions are pre-filled.
+fn opener_presets() -> Vec<Opener> {
+    let mk = |name: &str, exec: &str, exts: &str| Opener {
+        name: name.to_string(),
+        exec: exec.to_string(),
+        exts: exts.to_string(),
+        ..Default::default()
+    };
+    vec![
+        mk("DRAW", "", "png jpg jpeg gif bmp"),
+        mk("GIMP", "gimp", "png jpg jpeg bmp gif webp tga tiff xcf"),
+        mk("LibreSprite", "libresprite", "png aseprite ase gif bmp"),
+        mk("Aseprite", "aseprite", "aseprite ase png gif bmp"),
+        mk("Inkscape", "inkscape", "svg"),
+        mk("Moebius", "moebius", "ans asc nfo diz xb xbin bin"),
+        mk("PabloDraw", "pablodraw", "ans asc nfo diz xb xbin bin rip"),
+    ]
 }
 
 /// The shared right-click context menu for a browse entry (used by both the grid tile
@@ -10804,6 +11259,7 @@ enum TilePick {
 /// open. `pinned` (already-a-favorite) and `can_paste` are passed in so this needn't
 /// touch `self`. `colo_pin` is `Some(label)` inside a 16colo flat listing — the rows are
 /// *pieces* (not dirs), so this offers pinning the current artist/group/search itself.
+#[allow(clippy::too_many_arguments)]
 fn entry_context_menu(
     ui: &mut egui::Ui,
     entry: &Entry,
@@ -10812,8 +11268,53 @@ fn entry_context_menu(
     viewed: bool,
     colo_pin: Option<(&str, bool)>, // (label, already-pinned)
     colo_piece: bool,               // a 16colo.rs piece → offer Download
+    openers: &[OpenerItem],         // user "Open in…" programs (filtered here by extension)
 ) -> Option<TilePick> {
     let mut pick = None;
+    // Open in… an external program registered for this file's type (View → Associations).
+    if !entry.is_dir {
+        let ext = entry
+            .path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        ui.menu_button("Open in…", |ui| {
+            let mut shown = 0;
+            for o in openers
+                .iter()
+                .filter(|o| o.exts.iter().any(|x| x.eq_ignore_ascii_case(&ext)))
+            {
+                let clicked = match o.icon {
+                    Some(id) => {
+                        let img = egui::Image::new(egui::load::SizedTexture::new(
+                            id,
+                            egui::vec2(16.0, 16.0),
+                        ));
+                        ui.add(egui::Button::image_and_text(img, &o.name)).clicked()
+                    }
+                    None => ui.button(&o.name).clicked(),
+                };
+                if clicked {
+                    pick = Some(TilePick::OpenWith(o.idx));
+                    ui.close();
+                }
+                shown += 1;
+            }
+            if shown > 0 {
+                ui.separator();
+            } else {
+                ui.weak("No program for this type");
+                ui.weak("(set one in View → Associations)");
+                ui.separator();
+            }
+            if ui.button("Other program…").clicked() {
+                pick = Some(TilePick::OpenWithOther);
+                ui.close();
+            }
+        });
+        ui.separator();
+    }
     // 16colo.rs piece: save the single file or the whole pack .zip to disk.
     if colo_piece {
         if ui

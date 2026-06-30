@@ -38,6 +38,7 @@ and the rest of the demoscene / textmode art world — right down to baud-rate
   - [Star ratings](#star-ratings)
   - [Search & smart filters](#search--smart-filters)
   - [File operations](#file-operations)
+  - [Open in… (external program associations)](#open-in-external-program-associations)
   - [Archives & 16colo.rs](#archives--16colors)
   - [Scene art, ANSImation & retro effects](#scene-art-ansimation--retro-effects)
   - [Animated GIFs](#animated-gifs)
@@ -321,6 +322,22 @@ Full file management, with **undo**:
 - **Ctrl + Z** undoes the last operation (trash restore, move-back, delete a created
   folder, or remove pasted copies).
 
+### Open in… (external program associations)
+
+Register your own editors and open files in them by type:
+
+- Right-click a file → **Open in…** lists the programs registered for that extension
+  (e.g. an `.ans` → Moebius / PabloDraw; a `.png` → GIMP / LibreSprite; an `.svg` →
+  Inkscape), plus **Other program…** to pick one ad-hoc.
+- Edit the list under **View → Associations…**: each association has a **name**,
+  **program** (path or command, with a Browse button), **extensions** it handles,
+  optional **arguments** (`{}` is replaced by the file path, otherwise it's appended),
+  optional **environment** variables (`KEY=VALUE` per line), and an optional **icon**
+  (shown in the menu). **Add preset** seeds common tools (GIMP, Inkscape, Aseprite,
+  LibreSprite, Moebius, PabloDraw, …).
+- Works on virtual art too: a 16colo.rs piece or a file inside an archive is launched
+  from its real on-disk (downloaded/extracted) copy.
+
 ### Archives & 16colo.rs
 
 - **Archives as virtual folders** — open a `.zip` / `.lha` / `.arj` / `.arc` /
@@ -454,7 +471,7 @@ the command line override the persisted ones and are remembered afterward.**
 |---|---|
 | **File** | Open folder… · Quit |
 | **Edit** | ↩ Undo · Copy · Cut · Paste · New folder · Rename… · Move to trash · Find images… (Ctrl+F) |
-| **View** | Table view · Explorer pane · Details pane · Recolor pane · Reset thumbnail size · Preferences… |
+| **View** | Table view · Explorer pane · Details pane · Recolor pane · Reset thumbnail size · Associations… · Preferences… |
 | **Sort** | Name · Type · Modified · Created · Size · Rating · Colors · Descending · Directories first |
 | **Go** | ⬆ Up · 🏠 Home · *(your pinned favorites)* |
 | **Help** | Keyboard shortcuts |

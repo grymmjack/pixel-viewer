@@ -239,6 +239,23 @@ group/artist=its SAUCE field (shown only for `is_textmode_ext`). Both are deferr
 the listing's virtual path encodes the search (`…/search/artist/x`), the pinned favorite
 re-runs that exact artist/group/search when clicked — the way to bookmark an artist.
 
+**External "Open in…" associations (`Opener`, `openers`, editor `ui_associations`)** — a
+file tile's context menu has an **Open in…** submenu listing the user's programs registered
+for that extension (+ "Other program…" → an rfd one-off). An `Opener` is `{name, exec, args,
+env, icon, exts}` (`exts` comma/space-separated; `ext_list()` normalizes), persisted as a
+flat `Vec<Vec<String>>` (`record`/`from_record`, no serde-derive — like `SearchSpec`).
+`launch_external` spawns `Command::new(exec)` with `args` (a `{}` token → the **`resolve_local`d
+real** file path, else appended — so virtual 16colo/archive art opens from its on-disk copy)
+and `env` (`KEY=VALUE` lines). `entry_context_menu` is a free fn so it can't borrow `self`; it
+takes an owned `&[OpenerItem]` snapshot (`opener_items`, built inside the menu closure) and
+filters by the entry's extension; the pick (`TilePick::OpenWith(idx)` / `OpenWithOther`) is a
+deferred `open_with`/`open_other` local applied after the grid/table loop. Icons decode via
+`ensure_opener_icons` (registry → 32px texture, cached by path in `opener_icons`; `None` on
+failure so it doesn't re-decode). The editor (View → Associations…, `show_associations`) is a
+two-pane window — a left list + right field editor on the `assoc_selected` opener, with
+add/`opener_presets()`/remove deferred; it precomputes an owned `list` of (name, icon) so the
+list pane doesn't borrow `openers` while the editor `get_mut`s the selected one.
+
 **Table view (`ui_table`, `table_view` bool, persisted)** — an *alternate renderer*
 for the browse mode, **not a third `Mode`**: `Mode` stays `Grid` and the central panel
 picks `ui_table` vs `ui_grid` by `self.table_view`, so selection (`PathBuf`-keyed),
