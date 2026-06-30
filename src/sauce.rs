@@ -24,7 +24,15 @@ pub struct Sauce {
 impl Sauce {
     /// Authoritative character width for Character-type art, if specified.
     pub fn char_width(&self) -> Option<usize> {
-        (self.data_type == 1 && self.tinfo1 > 0).then_some(self.tinfo1 as usize)
+        match self.data_type {
+            // Character-type art (ANSi/ASCII/TundraDraw/…) carries its canvas width in TInfo1.
+            1 if self.tinfo1 > 0 => Some(self.tinfo1 as usize),
+            // BinaryText (.BIN) has no header width; SAUCE stores it as FileType × 2
+            // (the spec's encoding, e.g. an 80-column screen → FileType 40). Without this
+            // a non-160-wide .BIN falls back to the 160 default and shears (33-N1.BIN: 500).
+            5 if self.file_type > 0 => Some(self.file_type as usize * 2),
+            _ => None,
+        }
     }
 
     /// A short human label for the art kind, e.g. "ANSi", "XBin", "TundraDraw".
@@ -186,6 +194,20 @@ mod tests {
         assert_eq!(p.char_width(), Some(80));
         assert!(p.ice);
         assert_eq!(p.date_pretty(), "1994-10-05");
+    }
+
+    #[test]
+    fn binarytext_width_comes_from_filetype_times_two() {
+        // A .BIN is DataType 5 (BinaryText); there's no header width, so SAUCE encodes it
+        // as FileType × 2. 33-N1.BIN has FileType 250 → a 500-column canvas (not the 160
+        // default, which sheared it). Guards the BinaryText branch of char_width().
+        let s = rec(|s| {
+            s[94] = 5; // BinaryText
+            s[95] = 250; // FileType → width / 2
+        });
+        let p = parse(&s).unwrap();
+        assert_eq!(p.kind_label(), "BinaryText");
+        assert_eq!(p.char_width(), Some(500));
     }
 
     #[test]

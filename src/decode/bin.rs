@@ -37,13 +37,13 @@ impl Decoder for BinDecoder {
         if pairs.is_empty() {
             return Err(DecodeError::Malformed("empty BIN".into()));
         }
-        // Prefer SAUCE's line count; otherwise infer from the data length.
-        let height = sauce
-            .as_ref()
-            .map(|s| s.tinfo2 as usize)
-            .filter(|&h| h > 0)
-            .unwrap_or_else(|| pairs.len().div_ceil(width))
-            .max(1);
+        // Height is inferred from the data length, NOT SAUCE's TInfo2: for an
+        // uncompressed (char, attr) stream the byte count is authoritative, and ansilove
+        // (what 16colo.rs renders with) computes rows = bytes/2/width, ignoring TInfo2 for
+        // BIN. A stale/garbage TInfo2 would otherwise pad the canvas with blank rows or
+        // clip the art — the same wrong-dimension trap as the width default. This also
+        // matches every other binary decoder here (IDF/ADF/Tundra all infer from data).
+        let height = pairs.len().div_ceil(width).max(1);
         if width * height > MAX_CELLS {
             return Err(DecodeError::Malformed("BIN too large".into()));
         }
@@ -88,6 +88,27 @@ mod tests {
         assert_eq!(img.pixels[0], [0, 0, 170, 255], "VGA index 1 = blue");
         // The second cell starts at x=8 in the same top row.
         assert_eq!(img.pixels[8], [170, 0, 0, 255], "VGA index 4 = red");
+    }
+
+    #[test]
+    fn binarytext_filetype_sets_width_and_height_is_inferred() {
+        // The real-world bug (33-N1.BIN): a .BIN is SAUCE DataType 5 (BinaryText), whose
+        // width is FileType × 2 — not TInfo1, which char_width() used to ignore for
+        // non-Character art, so it fell back to 160 and sheared. Here FileType 2 → width 4;
+        // 8 pairs / 4 = 2 rows (inferred from data, NOT the bogus TInfo2 below).
+        let mut data = Vec::new();
+        for _ in 0..8 {
+            data.extend_from_slice(&[0xDB, 0x04]); // 8 red blocks
+        }
+        let mut s = vec![0u8; 128];
+        s[..7].copy_from_slice(b"SAUCE00");
+        s[94] = 5; // BinaryText
+        s[95] = 2; // FileType → width = 4
+        s[98] = 99; // TInfo2 = 99 (garbage line count — must be ignored)
+        data.extend_from_slice(&s);
+        let img = BinDecoder.decode(&data).unwrap();
+        // 4 cols × 8px wide, 2 inferred rows × 16px tall — not 99 rows, not 160 wide.
+        assert_eq!((img.width, img.height), (4 * 8, 2 * 16));
     }
 
     #[test]
