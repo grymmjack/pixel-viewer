@@ -246,7 +246,10 @@ env, icon, exts}` (`exts` comma/space-separated; `ext_list()` normalizes), persi
 flat `Vec<Vec<String>>` (`record`/`from_record`, no serde-derive — like `SearchSpec`).
 `launch_external` spawns `Command::new(exec)` with `args` (a `{}` token → the **`resolve_local`d
 real** file path, else appended — so virtual 16colo/archive art opens from its on-disk copy)
-and `env` (`KEY=VALUE` lines). `entry_context_menu` is a free fn so it can't borrow `self`; it
+and `env` (`KEY=VALUE` lines). `open_external_for` routes both paths: a 16colo flat-listing
+piece **not yet downloaded** kicks off `start_piece_open` and stashes `(exec,args,env)` in
+`pending_external`, which `poll_colo_open` consumes to launch the program once the real file
+lands (instead of opening the viewer); everything else launches immediately. `entry_context_menu` is a free fn so it can't borrow `self`; it
 takes an owned `&[OpenerItem]` snapshot (`opener_items`, built inside the menu closure) and
 filters by the entry's extension; the pick (`TilePick::OpenWith(idx)` / `OpenWithOther`) is a
 deferred `open_with`/`open_other` local applied after the grid/table loop. Icons decode via

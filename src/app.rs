@@ -1010,6 +1010,9 @@ pub struct PixelView {
     #[allow(clippy::type_complexity)]
     colo_open_rx:
         Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf, Option<crate::sauce::Sauce>), String>>>,
+    // When set, the in-flight `colo_open_rx` download is for an external "Open in…" launch
+    // `(exec, args, env)` — `poll_colo_open` runs the program instead of opening the viewer.
+    pending_external: Option<(String, String, String)>,
     // Status messages from "Download file/pack" save threads (drained into `status`).
     colo_save_rx: Option<std::sync::mpsc::Receiver<String>>,
     // Background pack-SAUCE fetcher for *inspected* (hovered) 16colo pieces. 16colo
@@ -1569,6 +1572,7 @@ impl PixelView {
             colo_thumbs,
             colo_files: HashMap::new(),
             colo_open_rx: None,
+            pending_external: None,
             colo_save_rx: None,
             colo_sauce_tx,
             colo_sauce_rx,
@@ -1936,6 +1940,8 @@ impl PixelView {
     /// Download a piece's single `raw` file (not its whole pack) so the viewer can open
     /// it; the local path lands via `colo_open_rx` → [`poll_colo_open`].
     fn start_piece_open(&mut self, vpath: PathBuf) {
+        // Default this download to a viewer-open; `open_external_for` re-sets it after.
+        self.pending_external = None;
         let Some(piece) = self.colo_pieces.get(&vpath) else {
             return;
         };
@@ -1985,16 +1991,26 @@ impl PixelView {
                 } else {
                     self.sauce_cache.remove(&vpath);
                 }
-                self.load_full(ctx, vpath);
-                self.mode = Mode::Single;
+                // The download was kicked off for an external "Open in…" → launch the
+                // program on the now-real file instead of opening the in-app viewer.
+                if let Some((exec, args, env)) = self.pending_external.take() {
+                    self.launch_external(&exec, &args, &env, &vpath);
+                } else {
+                    self.load_full(ctx, vpath);
+                    self.mode = Mode::Single;
+                }
                 self.want_repaint = true;
             }
             Ok(Err(e)) => {
                 self.colo_open_rx = None;
+                self.pending_external = None;
                 self.status = format!("Open failed: {e}");
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
-            Err(_) => self.colo_open_rx = None,
+            Err(_) => {
+                self.colo_open_rx = None;
+                self.pending_external = None;
+            }
         }
     }
 
@@ -7777,6 +7793,24 @@ impl PixelView {
         }
     }
 
+    /// Launch an external program on `path` — but if it's a 16colo.rs flat-listing piece
+    /// not yet downloaded, fetch its `raw` file first (`start_piece_open`) and defer the
+    /// launch to `poll_colo_open` once the real file lands (`pending_external`).
+    fn open_external_for(&mut self, path: PathBuf, exec: String, args: String, env: String) {
+        if exec.trim().is_empty() {
+            self.status = "No program set for this opener".into();
+            return;
+        }
+        if self.colo_pieces.contains_key(&path) && !self.colo_files.contains_key(&path) {
+            self.start_piece_open(path); // clears pending_external, sets colo_open_rx
+            if self.colo_open_rx.is_some() {
+                self.pending_external = Some((exec, args, env));
+            }
+            return;
+        }
+        self.launch_external(&exec, &args, &env, &path);
+    }
+
     /// Run the registered opener at `idx` on the entry at `entry_idx`.
     fn open_with(&mut self, entry_idx: usize, opener_idx: usize) {
         let Some(path) = self.entries.get(entry_idx).map(|e| e.path.clone()) else {
@@ -7785,7 +7819,7 @@ impl PixelView {
         let Some(o) = self.openers.get(opener_idx).cloned() else {
             return;
         };
-        self.launch_external(&o.exec, &o.args, &o.env, &path);
+        self.open_external_for(path, o.exec, o.args, o.env);
     }
 
     /// "Open in… → Other": pick an arbitrary program with a file dialog and run it once.
@@ -7795,7 +7829,7 @@ impl PixelView {
         };
         if let Some(exec) = rfd::FileDialog::new().set_title("Choose a program").pick_file() {
             let exec = exec.to_string_lossy().to_string();
-            self.launch_external(&exec, "", "", &path);
+            self.open_external_for(path, exec, String::new(), String::new());
         }
     }
 
