@@ -831,6 +831,11 @@ pub struct PixelView {
     show_prefs: bool,
     show_associations: bool, // the View → Associations editor window is open
     assoc_tab: u8,           // Associations window tab: 0 = Files, 1 = Folders
+    // Optional format "plugins" (Preferences checkboxes; persisted). Off = that file type
+    // drops out of the listing + won't decode. Applied to the shared `Registry`.
+    plugin_pdf: bool,
+    plugin_audio: bool,
+    plugin_code: bool,
     // User-defined external "Open in…" programs by file type (persisted).
     openers: Vec<Opener>,
     assoc_selected: usize, // selected opener row in the Associations editor (Files tab)
@@ -1063,6 +1068,10 @@ impl PixelView {
     const OPENERS_KEY: &'static str = "openers";
     /// "Open folder in…" folder actions (flattened `Vec<Vec<String>>`, like openers).
     const FOLDER_ACTIONS_KEY: &'static str = "folder_actions";
+    /// Optional format-plugin on/off toggles (Preferences).
+    const PLUGIN_PDF_KEY: &'static str = "plugin_pdf";
+    const PLUGIN_AUDIO_KEY: &'static str = "plugin_audio";
+    const PLUGIN_CODE_KEY: &'static str = "plugin_code";
     /// Storage key for the last-opened folder (reopened on launch).
     const FOLDER_KEY: &'static str = "last_folder";
     /// Storage keys for sort & filter state.
@@ -1124,6 +1133,19 @@ impl PixelView {
 
     pub fn new(cc: &eframe::CreationContext<'_>, cli: CliArgs) -> Self {
         let registry = Arc::new(Registry::with_builtins());
+        // Optional format plugins (persisted, default on) → apply to the registry so a
+        // disabled one drops its file types from the listing + skips decoding.
+        let load_bool = |key: &str, default: bool| -> bool {
+            cc.storage
+                .and_then(|s| eframe::get_value::<bool>(s, key))
+                .unwrap_or(default)
+        };
+        let plugin_pdf = load_bool(Self::PLUGIN_PDF_KEY, true);
+        let plugin_audio = load_bool(Self::PLUGIN_AUDIO_KEY, true);
+        let plugin_code = load_bool(Self::PLUGIN_CODE_KEY, true);
+        registry.set_plugin("pdf", plugin_pdf);
+        registry.set_plugin("audio", plugin_audio);
+        registry.set_plugin("code", plugin_code);
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
@@ -1484,6 +1506,9 @@ impl PixelView {
             show_prefs: false,
             show_associations: false,
             assoc_tab: 0,
+            plugin_pdf,
+            plugin_audio,
+            plugin_code,
             openers,
             assoc_selected: 0,
             folder_actions,
@@ -9738,6 +9763,7 @@ impl eframe::App for PixelView {
 
         if self.show_prefs {
             let mut open = true;
+            let mut prefs_refresh = false; // a plugin toggle → re-scan the folder after
             egui::Window::new("Preferences")
                 .open(&mut open)
                 .collapsible(false)
@@ -9894,6 +9920,29 @@ impl eframe::App for PixelView {
                     });
 
                     ui.add_space(10.0);
+                    ui.label("Format plugins");
+                    ui.weak("Turn off a file type you don't want the viewer to handle.");
+                    let mut plug_changed = false;
+                    plug_changed |= ui
+                        .checkbox(&mut self.plugin_code, "Source code / text")
+                        .on_hover_text("Syntax-highlighted source & text files (.rs, .py, .md …)")
+                        .changed();
+                    plug_changed |= ui
+                        .checkbox(&mut self.plugin_pdf, "PDF")
+                        .on_hover_text("PDF page thumbnail + page/title/author info")
+                        .changed();
+                    plug_changed |= ui
+                        .checkbox(&mut self.plugin_audio, "Audio")
+                        .on_hover_text("Audio waveform + metadata + in-app preview")
+                        .changed();
+                    if plug_changed {
+                        self.registry.set_plugin("code", self.plugin_code);
+                        self.registry.set_plugin("pdf", self.plugin_pdf);
+                        self.registry.set_plugin("audio", self.plugin_audio);
+                        prefs_refresh = true; // re-scan so the listing adds/drops those types
+                    }
+
+                    ui.add_space(10.0);
                     ui.label("16colo.rs cache");
                     let (bytes, count) = crate::cache::stats();
                     ui.horizontal(|ui| {
@@ -9915,6 +9964,9 @@ impl eframe::App for PixelView {
                     });
                 });
             self.show_prefs = open;
+            if prefs_refresh {
+                self.refresh();
+            }
         }
 
         // File-type associations editor (View → Associations…).
@@ -10058,6 +10110,9 @@ impl eframe::App for PixelView {
         let folder_actions: Vec<Vec<String>> =
             self.folder_actions.iter().map(|o| o.record()).collect();
         eframe::set_value(storage, Self::FOLDER_ACTIONS_KEY, &folder_actions);
+        eframe::set_value(storage, Self::PLUGIN_PDF_KEY, &self.plugin_pdf);
+        eframe::set_value(storage, Self::PLUGIN_AUDIO_KEY, &self.plugin_audio);
+        eframe::set_value(storage, Self::PLUGIN_CODE_KEY, &self.plugin_code);
         // Remember where we were. Save the *display* path, not `self.folder`: inside an
         // archive / downloaded 16colo pack, `self.folder` is a temp dir that's gone next
         // launch, whereas the display path (`pack.zip/…`, `<16colo.rs>/year/pack`) is

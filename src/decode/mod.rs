@@ -79,12 +79,21 @@ pub trait Decoder: Send + Sync {
 
 pub struct Registry {
     decoders: Vec<Box<dyn Decoder>>,
+    // Optional "plugin" decoders the user can turn off (Preferences). Runtime flags —
+    // `Registry` is shared as an `Arc` across worker threads, so these are atomics rather
+    // than `&mut`. When off, the plugin's extensions vanish from the listing + won't decode.
+    pdf_on: std::sync::atomic::AtomicBool,
+    audio_on: std::sync::atomic::AtomicBool,
+    code_on: std::sync::atomic::AtomicBool,
 }
 
 impl Registry {
     pub fn with_builtins() -> Self {
         install_panic_filter(); // a malformed file must never crash a worker / the app
         Self {
+            pdf_on: std::sync::atomic::AtomicBool::new(true),
+            audio_on: std::sync::atomic::AtomicBool::new(true),
+            code_on: std::sync::atomic::AtomicBool::new(true),
             decoders: vec![
                 Box::new(pcx::PcxDecoder),            // hand-written, palette-preserving
                 Box::new(aseprite::AsepriteDecoder),  // .aseprite/.ase (asefile crate)
@@ -108,9 +117,33 @@ impl Registry {
         }
     }
 
-    /// Does any decoder claim this extension? Used to filter a folder listing.
+    /// Enable/disable an optional plugin by name ("pdf" / "audio" / "code"). Takes `&self`
+    /// (atomic) so it works through the shared `Arc<Registry>`. Unknown names are ignored.
+    pub fn set_plugin(&self, name: &str, on: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        match name {
+            "pdf" => self.pdf_on.store(on, Relaxed),
+            "audio" => self.audio_on.store(on, Relaxed),
+            "code" => self.code_on.store(on, Relaxed),
+            _ => {}
+        }
+    }
+
+    /// Whether the extension belongs to a plugin that's currently switched OFF.
+    fn plugin_disabled(&self, ext: &str) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        (!self.pdf_on.load(Relaxed) && ext == "pdf")
+            || (!self.audio_on.load(Relaxed) && audio::AUDIO_EXTS.contains(&ext))
+            || (!self.code_on.load(Relaxed) && code::CODE_EXTS.contains(&ext))
+    }
+
+    /// Does any decoder claim this extension? Used to filter a folder listing. A disabled
+    /// plugin's extensions report `false` here, so those files drop out of the grid.
     pub fn known_extension(&self, ext: &str) -> bool {
         let ext = ext.to_ascii_lowercase();
+        if self.plugin_disabled(&ext) {
+            return false;
+        }
         self.decoders
             .iter()
             .any(|d| d.extensions().iter().any(|e| *e == ext))
@@ -123,6 +156,14 @@ impl Registry {
 
     pub fn decode_bytes(&self, bytes: &[u8], path: &Path) -> Result<PixImage, DecodeError> {
         let header = &bytes[..bytes.len().min(32)];
+
+        // A switched-off plugin doesn't decode its types at all (even on a direct open),
+        // so nothing sneaks past the listing filter via the sniff/PDF-magic path.
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if self.plugin_disabled(&ext.to_ascii_lowercase()) {
+                return Err(DecodeError::Unsupported);
+            }
+        }
 
         // 1) A decoder whose magic bytes match wins.
         for d in &self.decoders {
