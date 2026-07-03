@@ -15,11 +15,13 @@ mod code;
 mod cp437_font;
 mod cp437_font_8x8;
 mod idf;
+pub mod opl3; // OPL3 FM-synth chip emulator (Opal port) — drives RAD playback
 mod pcx;
 mod pdf;
 mod petmate;
 mod petscii;
 mod psd;
+pub mod rad; // Reality Adlib Tracker replayer (RADPlayer port) — .rad → OPL3 register writes
 mod rip;
 mod rip_chr;
 mod svg;

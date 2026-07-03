@@ -13437,6 +13437,10 @@ fn decode_audio(
         // pull out its individual samples for the explorer/keyboard/export.
         let (s, c, r) = render_tracker(&bytes)?;
         (s, c, r, extract_tracker_samples(&bytes))
+    } else if is_rad_ext(&ext) {
+        // A Reality Adlib Tracker module: OPL3 FM synthesis (no PCM samples to extract).
+        let (s, c, r) = render_rad(&bytes)?;
+        (s, c, r, Vec::new())
     } else if is_midi_ext(&ext) {
         // A MIDI file: synthesize it through a General MIDI SoundFont (note events → audio).
         let sf = midi_sf.ok_or_else(|| {
@@ -13465,6 +13469,45 @@ fn decode_audio(
         peaks,
         tracker_samples,
     })
+}
+
+/// Extensions we play through the OPL3 FM synth (Reality Adlib Tracker modules).
+fn is_rad_ext(ext: &str) -> bool {
+    ext == "rad"
+}
+
+/// Render a RAD (Reality Adlib Tracker) module to interleaved-stereo f32 by driving our ported
+/// RADPlayer replayer into the ported Opal OPL3 chip emulator: each tick, the replayer emits OPL
+/// register writes; between ticks we pull `sr/hz` chip samples. RAD is FM synthesis, not PCM —
+/// this is what actually makes `.rad` audible. `Err` if it isn't a readable module.
+fn render_rad(
+    bytes: &[u8],
+) -> Result<(Vec<rodio::Sample>, rodio::ChannelCount, rodio::SampleRate), String> {
+    use crate::decode::{opl3::Opl3, rad::RadPlayer};
+    let sr = 44_100u32;
+    let mut player = RadPlayer::new(bytes).ok_or_else(|| "not a RAD module".to_string())?;
+    let mut chip = Opl3::new(sr);
+    let hz = player.hz().clamp(1.0, 1000.0);
+    let per_tick = (sr as f64 / hz).round().max(1.0) as usize; // ~882 samples at 50 Hz
+    let max_frames = sr as usize * 600; // 10-minute safety cap
+    let mut out: Vec<rodio::Sample> = Vec::new();
+    loop {
+        let playing = player.update(&mut |reg, val| chip.write_reg(reg, val));
+        for _ in 0..per_tick {
+            let (l, r) = chip.sample();
+            out.push(l as f32 / 32768.0);
+            out.push(r as f32 / 32768.0);
+        }
+        if !playing || out.len() >= max_frames * 2 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        return Err("empty RAD render".to_string());
+    }
+    let ch = std::num::NonZeroU16::new(2).unwrap();
+    let rate = std::num::NonZeroU32::new(sr).unwrap();
+    Ok((out, ch, rate))
 }
 
 /// Render a tracker module (MOD/XM/S3M/IT) to interleaved-stereo f32 samples via `xmrs`, so
