@@ -792,7 +792,10 @@ pub struct PixelView {
     pdf_view: Option<PdfView>, // in-app multi-page PDF viewer state (None = not viewing a PDF)
     audio_cache: HashMap<PathBuf, Option<crate::decode::AudioInfo>>, // lazy audio metadata
     sf_cache: HashMap<PathBuf, Option<crate::soundfont::SoundFontInfo>>, // lazy .sf2 directory info
+    sfz_cache: HashMap<PathBuf, Option<crate::sfz::SfzInfo>>, // lazy .sfz directory info
+    dls_cache: HashMap<PathBuf, Option<crate::dls::DlsInfo>>, // lazy .dls directory info
     audio_player: Option<AudioPlayer>, // in-app play/pause/seek preview (rodio), None = idle
+    audio_decode_cache: Vec<(PathBuf, u64, DecodedAudio)>, // LRU of decoded audio (key: path+sig)
     audio_autoplay: bool,      // start playing on select + loop until stopped (persisted)
     audio_drag: Option<f32>,   // waveform drag-select anchor time (transient)
     audio_octave: i32,         // onscreen-keyboard octave offset (transient)
@@ -1524,7 +1527,10 @@ impl PixelView {
             pdf_cache: HashMap::new(),
             pdf_view: None,
             audio_cache: HashMap::new(),
+            audio_decode_cache: Vec::new(),
             sf_cache: HashMap::new(),
+            sfz_cache: HashMap::new(),
+            dls_cache: HashMap::new(),
             audio_player: None,
             audio_autoplay,
             audio_drag: None,
@@ -1711,8 +1717,7 @@ impl PixelView {
         if let Some(dir) = open_target {
             if dir.is_dir()
                 || crate::sixteen::is_remote(&dir)
-                || (dir.is_file()
-                    && (crate::archive::is_archive(&dir) || crate::soundfont::is_soundfont(&dir)))
+                || (dir.is_file() && (crate::archive::is_archive(&dir) || is_sample_bank(&dir)))
             {
                 app.open_folder(dir);
             }
@@ -1738,9 +1743,17 @@ impl PixelView {
             self.enter_archive(dir);
             return;
         }
-        // A SoundFont is likewise a virtual folder — of the WAVs we extract from its samples.
+        // A SoundFont / SFZ / DLS is likewise a virtual folder — of the samples inside it.
         if dir.is_file() && crate::soundfont::is_soundfont(&dir) {
             self.enter_soundfont(dir);
+            return;
+        }
+        if dir.is_file() && crate::sfz::is_sfz(&dir) {
+            self.enter_sfz(dir);
+            return;
+        }
+        if dir.is_file() && crate::dls::is_dls(&dir) {
+            self.enter_dls(dir);
             return;
         }
         // Opening a real local folder. If we were inside a mounted archive / 16colo.rs
@@ -1773,7 +1786,7 @@ impl PixelView {
                     // (decoded as CP437 text). A known extension must actually match.
                     .is_none_or(|x| self.registry.known_extension(x))
                     || crate::archive::is_archive(&p)
-                    || crate::soundfont::is_soundfont(&p)
+                    || is_sample_bank(&p)
                 {
                     all.push(make_entry(p, false));
                 }
@@ -2296,6 +2309,26 @@ impl PixelView {
         self.sf_cache.get(path).cloned().flatten()
     }
 
+    /// Lazily parse + cache an SFZ's directory (region / sample counts + key range) for Details.
+    fn sfz_info(&mut self, path: &Path) -> Option<crate::sfz::SfzInfo> {
+        if !self.sfz_cache.contains_key(path) {
+            let real = self.resolve_local(path);
+            self.sfz_cache
+                .insert(path.to_path_buf(), crate::sfz::info(&real));
+        }
+        self.sfz_cache.get(path).cloned().flatten()
+    }
+
+    /// Lazily parse + cache a DLS bank's directory (instrument / sample counts) for Details.
+    fn dls_info(&mut self, path: &Path) -> Option<crate::dls::DlsInfo> {
+        if !self.dls_cache.contains_key(path) {
+            let real = self.resolve_local(path);
+            self.dls_cache
+                .insert(path.to_path_buf(), crate::dls::info(&real));
+        }
+        self.dls_cache.get(path).cloned().flatten()
+    }
+
     /// Open a file in the OS default application (xdg-open / open / explorer). Used by the
     /// Details "Open in default app" button for documents like PDFs.
     fn open_in_default_app(&mut self, path: &Path) {
@@ -2314,13 +2347,12 @@ impl PixelView {
                 return;
             }
         }
-        // Load a new file: decode once + open the device.
-        let real = self.resolve_local(path);
-        let Ok(bytes) = std::fs::read(&real) else {
-            self.status = "Couldn't read the audio file".into();
+        // Load a new file: decode (cached) + open the device.
+        let Some(decoded) = self.decode_audio_cached(path) else {
+            self.status = "Couldn't read/decode the audio file".into();
             return;
         };
-        match AudioPlayer::open(path, bytes) {
+        match AudioPlayer::from_decoded(path, decoded) {
             Ok(mut ap) => {
                 ap.volume = self.audio_volume;
                 ap.muted = self.audio_muted;
@@ -2443,9 +2475,10 @@ impl PixelView {
         if self.is_audio_loaded(path) || !self.plugin_audio {
             return;
         }
-        let real = self.resolve_local(path);
-        let Ok(bytes) = std::fs::read(&real) else { return };
-        if let Ok(mut ap) = AudioPlayer::open(path, bytes) {
+        let Some(decoded) = self.decode_audio_cached(path) else {
+            return;
+        };
+        if let Ok(mut ap) = AudioPlayer::from_decoded(path, decoded) {
             ap.volume = self.audio_volume;
             ap.muted = self.audio_muted;
             ap.looping = self.audio_autoplay;
@@ -2454,6 +2487,49 @@ impl PixelView {
             }
             self.audio_player = Some(ap);
         }
+    }
+
+    /// Decode `path`'s audio, going through an in-memory LRU so a **revisit skips the expensive
+    /// decode** — a tracker module (seconds of `xmrs` synthesis) is cloned from the cache instead
+    /// of re-synthesized. Keyed by the display path + a size/mtime signature (so an edited file
+    /// re-decodes); the cache is bounded to ~192 MB, evicting least-recently-used. Returns the
+    /// decoded data (a clone; a copy also stays cached), or `None` if the file can't be decoded.
+    fn decode_audio_cached(&mut self, path: &Path) -> Option<DecodedAudio> {
+        let real = self.resolve_local(path);
+        let sig = std::fs::metadata(&real)
+            .ok()
+            .map(|m| {
+                let mt = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                m.len() ^ (mt << 1)
+            })
+            .unwrap_or(0);
+        // Cache hit: move it to the front (most-recent) and hand back a clone.
+        if let Some(pos) = self
+            .audio_decode_cache
+            .iter()
+            .position(|(p, s, _)| p == path && *s == sig)
+        {
+            let entry = self.audio_decode_cache.remove(pos);
+            let decoded = entry.2.clone();
+            self.audio_decode_cache.insert(0, entry);
+            return Some(decoded);
+        }
+        // Miss: read + decode (the costly step), cache it, and evict to the byte budget.
+        let bytes = std::fs::read(&real).ok()?;
+        let decoded = decode_audio(path, bytes).ok()?;
+        self.audio_decode_cache
+            .insert(0, (path.to_path_buf(), sig, decoded.clone()));
+        let mut total = 0usize;
+        self.audio_decode_cache.retain(|(_, _, d)| {
+            total += d.approx_bytes();
+            total <= 192 * 1024 * 1024
+        });
+        Some(decoded)
     }
 
     /// Draw the audio player — transport + interactive waveform + onscreen keyboard — for
@@ -2916,6 +2992,39 @@ impl PixelView {
                 self.status = format!("Opened {} · {n} samples", short_name(&sf2));
             }
             Err(e) => self.status = format!("Couldn't open {}: {e}", short_name(&sf2)),
+        }
+    }
+
+    /// Enter an SFZ instrument: mount a temp dir of symlinks to the samples it references and
+    /// browse them (each is a real audio file → opens/plays/exports like any other).
+    fn enter_sfz(&mut self, sfz: PathBuf) {
+        match crate::sfz::mount_to_cache(&sfz) {
+            Ok(temp_root) => {
+                self.archive_mount = Some(ArchiveMount {
+                    archive: sfz.clone(),
+                    temp_root: temp_root.clone(),
+                });
+                self.open_folder(temp_root);
+                let n = crate::sfz::info(&sfz).map(|i| i.samples).unwrap_or(0);
+                self.status = format!("Opened {} · {n} samples", short_name(&sfz));
+            }
+            Err(e) => self.status = format!("Couldn't open {}: {e}", short_name(&sfz)),
+        }
+    }
+
+    /// Enter a DLS bank: extract each wave-pool sample to a WAV in a temp dir and browse them.
+    fn enter_dls(&mut self, dls: PathBuf) {
+        match crate::dls::extract_to_cache(&dls) {
+            Ok(temp_root) => {
+                self.archive_mount = Some(ArchiveMount {
+                    archive: dls.clone(),
+                    temp_root: temp_root.clone(),
+                });
+                self.open_folder(temp_root);
+                let n = crate::dls::info(&dls).map(|i| i.samples).unwrap_or(0);
+                self.status = format!("Opened {} · {n} samples", short_name(&dls));
+            }
+            Err(e) => self.status = format!("Couldn't open {}: {e}", short_name(&dls)),
         }
     }
 
@@ -4927,6 +5036,17 @@ impl PixelView {
                     } else {
                         None
                     };
+                    // SFZ / DLS sample banks (cached).
+                    let sfz = if crate::sfz::is_sfz(&entry.path) {
+                        self.sfz_info(&entry.path)
+                    } else {
+                        None
+                    };
+                    let dls = if crate::dls::is_dls(&entry.path) {
+                        self.dls_info(&entry.path)
+                    } else {
+                        None
+                    };
                     // Plain thumbnail (the recolored preview lives in the Recolor pane).
                     if let Some(tex) = self.thumb_tex.get(&entry.path) {
                         let tsz = tex.size_vec2();
@@ -5039,6 +5159,33 @@ impl PixelView {
                                 ui.end_row();
                                 ui.weak("Samples");
                                 ui.label(sf.samples.to_string());
+                                ui.end_row();
+                            } else if let Some(z) = &sfz {
+                                // SFZ instrument: regions + referenced samples + key range.
+                                ui.weak("Type");
+                                ui.label("SFZ instrument");
+                                ui.end_row();
+                                ui.weak("Regions");
+                                ui.label(z.regions.to_string());
+                                ui.end_row();
+                                ui.weak("Samples");
+                                ui.label(z.samples.to_string());
+                                ui.end_row();
+                                if let (Some(lo), Some(hi)) = (z.key_lo, z.key_hi) {
+                                    ui.weak("Key range");
+                                    ui.label(format!("{} – {}", midi_note_name(lo), midi_note_name(hi)));
+                                    ui.end_row();
+                                }
+                            } else if let Some(d) = &dls {
+                                // DLS bank: instrument + sample counts.
+                                ui.weak("Type");
+                                ui.label("DLS bank");
+                                ui.end_row();
+                                ui.weak("Instruments");
+                                ui.label(d.instruments.to_string());
+                                ui.end_row();
+                                ui.weak("Samples");
+                                ui.label(d.samples.to_string());
                                 ui.end_row();
                             } else if is_audio {
                                 // A tracker/voc/au/midi we can't decode — still label it audio.
@@ -11055,6 +11202,15 @@ fn short_name(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
+/// Format a MIDI note number as a name like `C4` / `F#3` (middle C = 60 = C4).
+fn midi_note_name(n: u8) -> String {
+    const NAMES: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    let octave = n as i32 / 12 - 1;
+    format!("{}{}", NAMES[(n % 12) as usize], octave)
+}
+
 /// Make a string safe to use as a filename stem (for sample-export default names): keep
 /// alphanumerics / `-_.` / spaces, replace the rest with `_`, and fall back to "sample".
 fn sanitize_filename(s: &str) -> String {
@@ -12590,6 +12746,13 @@ fn fit_centered(into: egui::Rect, content: egui::Vec2) -> egui::Rect {
     egui::Rect::from_center_size(into.center(), size)
 }
 
+/// A non-archive file we mount as a **virtual folder of samples**: SoundFont (`.sf2`), SFZ
+/// (`.sfz`), or DLS (`.dls`). Each has its own `enter_*` extractor but is otherwise treated
+/// like an archive throughout the listing/navigation.
+fn is_sample_bank(path: &Path) -> bool {
+    crate::soundfont::is_soundfont(path) || crate::sfz::is_sfz(path) || crate::dls::is_dls(path)
+}
+
 /// Build an `Entry` with its cheap metadata (size, mtime) read up front. The rating
 /// is left 0 here and resolved by the app (`read_rating`), which has the sidecar and
 /// the display-path context a free function lacks.
@@ -12598,10 +12761,10 @@ fn make_entry(path: PathBuf, is_dir: bool) -> Entry {
     let size = md.as_ref().map(|m| m.len()).unwrap_or(0);
     let mtime = md.as_ref().and_then(|m| m.modified().ok());
     let ctime = md.as_ref().and_then(|m| m.created().ok());
-    // A `.sf2` is browsed like an archive (a virtual folder of its samples), so it shares
-    // the `is_archive` flag — folder glyph + badge, click-to-enter, prev/next skipping.
-    let is_archive = !is_dir
-        && (crate::archive::is_archive(&path) || crate::soundfont::is_soundfont(&path));
+    // A sample bank (.sf2 / .sfz / .dls) is browsed like an archive (a virtual folder of its
+    // samples), so it shares the `is_archive` flag — folder glyph + badge, click-to-enter,
+    // prev/next skipping.
+    let is_archive = !is_dir && (crate::archive::is_archive(&path) || is_sample_bank(&path));
     Entry {
         path,
         is_dir,
@@ -12639,9 +12802,37 @@ struct SampleBuf {
 }
 
 /// One explorable, named sample extracted from a tracker module (later: a SoundFont).
+#[derive(Clone)]
 struct NamedSample {
     name: String,
     buf: SampleBuf,
+}
+
+/// The **CPU-decoded** audio data for a file — the expensive part (tracker synthesis via
+/// `xmrs`, or PCM/compressed decode + peak analysis). Kept separate from the device-bound
+/// `AudioPlayer` so it can be **cached** (revisiting a file — especially a tracker, which
+/// takes seconds to synthesize — clones this instead of re-decoding).
+#[derive(Clone)]
+struct DecodedAudio {
+    samples: Vec<rodio::Sample>,
+    channels: rodio::ChannelCount,
+    sample_rate: rodio::SampleRate,
+    duration: f32,
+    peaks: Vec<f32>,
+    tracker_samples: Vec<NamedSample>,
+}
+
+impl DecodedAudio {
+    /// Approximate heap footprint (for the cache's byte budget): 4 bytes per f32 sample.
+    fn approx_bytes(&self) -> usize {
+        4 * (self.samples.len()
+            + self.peaks.len()
+            + self
+                .tracker_samples
+                .iter()
+                .map(|s| s.buf.samples.len() + s.buf.peaks.len())
+                .sum::<usize>())
+    }
 }
 
 /// The in-app audio preview player (rodio). Decodes the file to interleaved samples ONCE so
@@ -12672,46 +12863,28 @@ struct AudioPlayer {
 }
 
 impl AudioPlayer {
-    /// Decode `bytes` and open the default device. `Err` if the format can't be decoded
-    /// in-app, or no output device is available (caller shows the message in the status bar).
-    /// Tracker modules (mod/xm/s3m/it) are synthesized to samples by `xmrs`; everything else
-    /// goes through rodio's PCM/compressed decoders.
+    /// Decode `bytes` and open the default device — a convenience wrapping `decode_audio` +
+    /// `from_decoded` for callers that don't consult the decode cache.
+    #[cfg(test)]
     fn open(path: &Path, bytes: Vec<u8>) -> Result<Self, String> {
-        use rodio::Source;
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .unwrap_or_default();
-        let (samples, channels, sample_rate, tracker_samples) = if is_tracker_ext(&ext) {
-            // A tracker module: synthesize the whole song for the transport, and separately
-            // pull out its individual samples for the explorer/keyboard/export.
-            let (s, c, r) = render_tracker(&bytes)?;
-            (s, c, r, extract_tracker_samples(&bytes))
-        } else {
-            let decoder = rodio::Decoder::new(std::io::Cursor::new(bytes))
-                .map_err(|_| "can't decode this audio format in-app".to_string())?;
-            let channels = decoder.channels();
-            let sample_rate = decoder.sample_rate();
-            let samples: Vec<rodio::Sample> = decoder.collect();
-            (samples, channels, sample_rate, Vec::new())
-        };
-        let ch = channels.get() as usize;
-        let sr = sample_rate.get() as f32;
-        let frames = samples.len() / ch.max(1);
-        let duration = frames as f32 / sr;
-        let peaks = compute_peaks(&samples, ch, 2400);
+        Self::from_decoded(path, decode_audio(path, bytes)?)
+    }
+
+    /// Wrap already-decoded audio in a fresh device-bound player. `Err` only if no output
+    /// device is available — the (expensive) decode already happened in `decode_audio`.
+    fn from_decoded(path: &Path, d: DecodedAudio) -> Result<Self, String> {
         let stream = rodio::DeviceSinkBuilder::open_default_sink().map_err(|e| e.to_string())?;
         let player = rodio::Player::connect_new(stream.mixer());
+        let duration = d.duration;
         Ok(Self {
             _stream: stream,
             player,
             path: path.to_path_buf(),
-            samples,
-            channels,
-            sample_rate,
+            samples: d.samples,
+            channels: d.channels,
+            sample_rate: d.sample_rate,
             duration,
-            peaks,
+            peaks: d.peaks,
             sel_start: 0.0,
             sel_end: duration,
             looping: false,
@@ -12721,7 +12894,7 @@ impl AudioPlayer {
             play_speed: 1.0,
             volume: 1.0,
             muted: false,
-            tracker_samples,
+            tracker_samples: d.tracker_samples,
             active_sample: None,
             song_backup: None,
         })
@@ -12947,6 +13120,45 @@ fn open_midi_port(
         tx,
     )
     .ok()
+}
+
+/// The expensive, device-free part of loading an audio file: decode/synthesize `bytes` to
+/// interleaved f32 samples + a peak envelope, and (for trackers) pull out the sample bank.
+/// Tracker modules go through `xmrs` (synthesis — can take seconds), everything else through
+/// rodio's PCM/compressed decoders. Cached by the app so a revisit skips all of this.
+fn decode_audio(path: &Path, bytes: Vec<u8>) -> Result<DecodedAudio, String> {
+    use rodio::Source;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let (samples, channels, sample_rate, tracker_samples) = if is_tracker_ext(&ext) {
+        // A tracker module: synthesize the whole song for the transport, and separately
+        // pull out its individual samples for the explorer/keyboard/export.
+        let (s, c, r) = render_tracker(&bytes)?;
+        (s, c, r, extract_tracker_samples(&bytes))
+    } else {
+        let decoder = rodio::Decoder::new(std::io::Cursor::new(bytes))
+            .map_err(|_| "can't decode this audio format in-app".to_string())?;
+        let channels = decoder.channels();
+        let sample_rate = decoder.sample_rate();
+        let samples: Vec<rodio::Sample> = decoder.collect();
+        (samples, channels, sample_rate, Vec::new())
+    };
+    let ch = channels.get() as usize;
+    let sr = sample_rate.get() as f32;
+    let frames = samples.len() / ch.max(1);
+    let duration = frames as f32 / sr;
+    let peaks = compute_peaks(&samples, ch, 2400);
+    Ok(DecodedAudio {
+        samples,
+        channels,
+        sample_rate,
+        duration,
+        peaks,
+        tracker_samples,
+    })
 }
 
 /// Render a tracker module (MOD/XM/S3M/IT) to interleaved-stereo f32 samples via `xmrs`, so
