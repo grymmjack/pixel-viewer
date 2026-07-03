@@ -13,7 +13,12 @@ pub struct AnsiDecoder;
 const FONT_W: usize = 8;
 const FONT_H: usize = 16;
 const WRAP: usize = 80; // classic ANSI terminal width
-const MAX_COLS: usize = 300; // hard cap for cursor-addressed columns
+// Hard cap for cursor-addressed / SAUCE-declared columns. Real scene art is usually 80,
+// but "wide" ANSI (e.g. Mistigris party pieces) declares hundreds of columns via SAUCE
+// TInfo1 — this file's THE_BIG_PIRANHA is 800. The cap only exists so a runaway cursor
+// (ESC[99999C) can't grow an unbounded canvas; it must sit well above any real width or
+// the art auto-wraps at the cap and scrambles (800 clamped to 300 → reflowed to noise).
+const MAX_COLS: usize = 20000;
 const MAX_ROWS: usize = 10000; // safety cap for very long files (canvas sizes to the
                                // *actual* content rows; this is only the upper bound)
 
@@ -670,6 +675,24 @@ mod tests {
         // With no declared width, stay at the content width (don't force 80).
         let bare = AnsiDecoder.decode(b"abc").unwrap();
         assert_eq!(bare.width, 3 * 8, "no SAUCE width → content width");
+    }
+
+    #[test]
+    fn wide_sauce_width_is_not_clamped() {
+        // "Wide" ANSI (Mistigris party pieces) declares hundreds of columns via SAUCE
+        // TInfo1 — THE_BIG_PIRANHA.ANS is 800. It must render 800 cells wide, not auto-wrap
+        // at a narrow cap (an old MAX_COLS=300 reflowed it into scrambled noise). Regression
+        // guard for the cap bump — the SAUCE width has to survive `wrap`'s clamp.
+        let mut file = b"X".to_vec();
+        let mut s = vec![0u8; 128];
+        s[..7].copy_from_slice(b"SAUCE00");
+        s[94] = 1; // Character
+        s[95] = 1; // ANSi
+        s[96] = 0x20; // TInfo1 low byte
+        s[97] = 0x03; // TInfo1 high byte → 0x0320 = 800 columns
+        file.extend_from_slice(&s);
+        let img = AnsiDecoder.decode(&file).unwrap();
+        assert_eq!(img.width, 800 * 8, "800-col SAUCE width renders full, not clamped to 300");
     }
 
     #[test]
