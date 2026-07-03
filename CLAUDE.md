@@ -760,10 +760,15 @@ inside `caught(||…)` (the same panic guard as `decode_caught`). Both always re
   buffer, so loop/region/playhead/waveform all work for modules too. voc/au/midi (no in-app
   decoder) keep the icon tile + external open.
 
+The Details pane also has an **onscreen piano keyboard** (`piano_keyboard`) + Oct −/+ to
+audition the sample as a one-shot instrument — a key plays the selected region pitch-shifted
+via rodio `speed()` (2^(semitone/12)); `AudioPlayer::play_note` / `play_speed` keep the playhead
+correct at a pitched tempo.
+
 `rodio → cpal → alsa-sys` needs **`libasound2-dev` at BUILD time** on Linux (added to CI + the
-first-time-deps list above), so `rodio`/`xmrs` are normal (non-feature-gated) deps. Still
-deferred: a MIDI-key "audition the sample" keyboard (octaves/notes) — optional, user-requested
-for later.
+first-time-deps list above), so `rodio`/`xmrs` are normal (non-feature-gated) deps. The
+slideshow **auto-advance skips PDFs / audio / source-text** (you'd lose your place / cut a
+track) — only images, text-mode art and RIP auto-advance.
 
 **The icy ecosystem (Mike Krüger's scene-art formats), the lean way.** Mike's
 `icy_engine` *renders* but hard-depends on `icy_net` → **tokio "full"** — too heavy for
