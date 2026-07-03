@@ -39,6 +39,7 @@ and the rest of the demoscene / textmode art world — right down to baud-rate
   - [Search & smart filters](#search--smart-filters)
   - [File operations](#file-operations)
   - [Open in… (external program associations)](#open-in-external-program-associations)
+  - [Source code, PDF & audio (plugins)](#source-code-pdf--audio-plugins)
   - [Archives & 16colo.rs](#archives--16colors)
   - [Scene art, ANSImation & retro effects](#scene-art-ansimation--retro-effects)
   - [Animated GIFs](#animated-gifs)
@@ -69,6 +70,10 @@ and the rest of the demoscene / textmode art world — right down to baud-rate
   → dithering), with live preview and export.
 - **A library of 55 bundled palettes** (CGA, EGA, VGA, Game Boy, NES, C64, PICO-8,
   DawnBringer, Endesga, …) plus `.GPL` import/export.
+- **Beyond images** — view **source code** (~90 languages, syntax-highlighted), **PDFs**
+  (real rendered pages + a 1-/2-page viewer), and **audio** (an in-app waveform player with
+  looping, a piano-key sampler, and tracker-module playback). Each is a **toggleable plugin**
+  you can switch off in Preferences.
 - **Star ratings** stored as KDE Baloo xattrs (interoperate with Gwenview), with a
   cross-platform sidecar so even art inside a zip or on 16colo.rs is ratable.
 - **A fading metadata OSD** in the viewer — title, artist(s), SAUCE comment and
@@ -106,10 +111,14 @@ down to the extensions a decoder claims.
 | **BBS vector** | **RIPscript** (`.rip`) | 640×350 EGA, hand-rolled BGI rasterizer |
 | **Animation** | Animated **GIF** | Plays in the viewer; hover-to-play in the grid |
 | **Archives (virtual folders)** | `.zip` `.lha` `.arj` `.arc` `.zoo` `.7z` `.rar` … | Browsed read-only; contents extracted on demand |
+| **Source code / text** *(plugin)* | ~90 exts — `rs` `c/cpp/h` `py` `js/ts` `css` `html` `php` `lua` `asm` `gd` `json` `yaml` `md` `log` `ipynb` … | CP437-rasterized with a hand-rolled syntax highlighter |
+| **PDF** *(plugin)* | `.pdf` | Real first-page tile + in-app 1-/2-page viewer (needs poppler) |
+| **Audio** *(plugin)* | `mp3` `wav` `ogg` `flac` + trackers `mod` `xm` `s3m` `it` | Waveform tile + in-app play/loop/seek/sampler |
 
 Scene-art formats are decoded with **SAUCE** metadata awareness (the standard
 trailer ANSI artists use to record title/author/group/dimensions), shown in the
-**Details** pane.
+**Details** pane. The last three rows — **source code, PDF and audio** — are
+[**toggleable plugins**](#source-code-pdf--audio-plugins) you can switch off in Preferences.
 
 ---
 
@@ -135,8 +144,13 @@ cargo build --release
 
 ```sh
 sudo apt-get install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-                     libxkbcommon-dev libssl-dev
+                     libxkbcommon-dev libssl-dev libasound2-dev
 ```
+
+`libasound2-dev` (ALSA) is needed **at build time** for the in-app audio player (rodio →
+cpal → ALSA). The audio device itself is opened lazily and fallibly, so a headless box still
+builds and runs fine. For **PDF rendering**, install **poppler** (`poppler-utils` — provides
+`pdftoppm`) at runtime; without it, PDFs still show metadata and a labeled placeholder tile.
 
 eframe uses the **wgpu** backend by default — that's what gives the pixel-perfect
 nearest-neighbor textures, and it runs fine on KDE Plasma 6 / Wayland.
@@ -338,6 +352,50 @@ Register your own editors and open files in them by type:
 - Works on virtual art too: a 16colo.rs piece or a file inside an archive is launched
   from its real on-disk (downloaded/extracted) copy.
 
+### Source code, PDF & audio (plugins)
+
+pixelview isn't only for pixels. Three extra viewers let you browse a folder that mixes
+art with **source code, PDFs and audio** — each shows a real thumbnail in the grid and
+opens in a purpose-built viewer:
+
+![A folder of a WAV, a Rust source file and a PDF — each with a real thumbnail](docs/screenshots/plugins-grid.png)
+
+**Source code / text** — ~90 languages (`rs`, `c`/`cpp`, `py`, `js`/`ts`, `css`, `html`,
+`php`, `lua`, `asm`, `gd`, `json`, `yaml`, `md`, `log`, Jupyter `ipynb`, …) are rasterized
+with the CP437 font and a lean, hand-rolled syntax highlighter (comment/string/keyword
+rules, a line-number gutter, tab expansion) — no heavyweight dependency. Press **Enter** to
+open the file in its associated editor.
+
+![A Rust source file rendered with syntax highlighting and a line-number gutter](docs/screenshots/source-viewer.png)
+
+**PDF** — the grid tile is the **real first page** (rendered via poppler's `pdftoppm`; a
+labeled placeholder if poppler isn't installed), and opening one enters an in-app viewer
+with **Prev / Next**, a page counter, and a **1-page / 2-page spread** toggle (`←`/`→` turn
+pages). Page count, size, and title/author come from the PDF's metadata.
+
+![The in-app PDF viewer showing a two-page spread and page controls](docs/screenshots/pdf-viewer.png)
+
+**Audio** — `mp3` / `wav` / `ogg` / `flac` (and tracker modules `mod` / `xm` / `s3m` / `it`)
+get a **waveform tile**, and opening one drops a full player into the viewer: an interactive
+waveform (**drag** to set a loop region, **click** to seek, with a moving playhead), a
+transport (play/pause, stop, loop, Autoplay), **Spacebar** play/pause, and an **onscreen
+piano keyboard** that auditions the sample pitch-shifted across octaves. Master **mute /
+stop / volume** controls also live at the far right of the menu bar.
+
+![The in-app audio player with a large waveform, transport controls and a piano keyboard](docs/screenshots/audio-player.png)
+
+**They're plugins — turn off what you don't want.** Source code, PDF and audio are each a
+runtime **toggle** in **Preferences → Format plugins**. Switch one off and its file type
+disappears from folder listings and is never decoded — so if you only care about pixel art,
+you can keep the viewer lean.
+
+<img src="docs/screenshots/format-plugins.png" width="360" alt="Preferences panel with the Format plugins toggles for Source code / text, PDF and Audio" />
+
+> The three are otherwise ordinary files: **any** file also gets an **Open in default app**
+> entry (xdg-open / open / explorer) in the right-click *Open in…* menu, the Details pane, and
+> via **Enter** in the viewer — so anything the viewer doesn't render still drops into its OS
+> default program.
+
 ### Archives & 16colo.rs
 
 - **Archives as virtual folders** — open a `.zip` / `.lha` / `.arj` / `.arc` /
@@ -427,6 +485,8 @@ The rest are fixed (this is the same list shown in **Help → Keyboard shortcuts
 | `1` – `5` | Set star rating |
 | `0` | Clear rating |
 | `R` | Jump to a random 16colo.rs pack |
+| `Enter` | Open the current file in its OS default app |
+| `Space` | Play / pause the audio preview |
 | `Click` | Open image / enter folder |
 | `Ctrl + Click` | Toggle selection |
 | `Shift + Click` | Range-select |
@@ -477,8 +537,9 @@ the command line override the persisted ones and are remembered afterward.**
 | **Help** | Keyboard shortcuts |
 
 **Preferences** covers theme (Dark/Light), grid spacing, caption fields, table columns,
-the default textmode zoom, the metadata-OSD position/hold, the palette directory, the
-16colo.rs cache (size + Clear), and the rebindable **Hotkeys**.
+the default textmode zoom, the metadata-OSD position/hold, the rebindable **Hotkeys**,
+the **Format plugins** toggles (source code / PDF / audio), the palette directory, and the
+16colo.rs cache (size + Clear).
 
 ---
 
@@ -577,7 +638,7 @@ cargo run --release      # build + launch
 cargo check              # fast type-check
 cargo clippy             # lint
 cargo fmt                # format
-cargo test               # 161 tests (unit + headless egui_kittest GUI tests)
+cargo test               # 180 tests (unit + headless egui_kittest GUI tests)
 cargo test gui_tests     # just the GUI tests
 ```
 
