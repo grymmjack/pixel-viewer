@@ -115,7 +115,7 @@ down to the extensions a decoder claims.
 | **Archives (virtual folders)** | `.zip` `.lha` `.arj` `.arc` `.zoo` `.7z` `.rar` … | Browsed read-only; contents extracted on demand |
 | **Source code / text** *(plugin)* | ~90 exts — `rs` `c/cpp/h` `py` `js/ts` `css` `html` `php` `lua` `asm` `gd` `json` `yaml` `md` `log` `ipynb` … | CP437-rasterized with a hand-rolled syntax highlighter |
 | **PDF** *(plugin)* | `.pdf` | Real first-page tile + in-app 1-/2-page viewer (needs poppler) |
-| **Audio** *(plugin)* | `mp3` `wav` `ogg` `flac` + trackers `mod` `xm` `s3m` `it` | Waveform tile + in-app play/loop/seek/sampler/MIDI |
+| **Audio** *(plugin)* | `mp3` `wav` `ogg` `flac` + trackers `mod` `xm` `s3m` `it` + **MIDI** `mid` `midi` | Waveform + in-app play/loop/seek/sampler/MIDI-in (MIDI synthesized via a SoundFont) |
 | **Sample banks** *(plugin)* | `.sf2` (SoundFont) · `.sfz` · `.dls` | Browsed as a folder of their samples |
 
 Scene-art formats are decoded with **SAUCE** metadata awareness (the standard
@@ -404,8 +404,13 @@ The audio player goes further than playback:
 
 ![A SoundFont opened as a folder — every sample shown as a named WAV tile with its waveform](docs/screenshots/soundfont-folder.png)
 
-Opening or revisiting audio is **cached** — a tracker module that takes seconds to synthesize is
-decoded once and cloned from memory on the next visit, so flipping back and forth is instant.
+- **Play MIDI files.** A `.mid` / `.midi` is only note events, so it's **synthesized to audio
+  through a General MIDI SoundFont** (auto-detected from your system, or pick one in Preferences →
+  *MIDI SoundFont*) and plays in the full player — waveform, transport, keyboard and all.
+
+Opening or revisiting audio is **cached** — a tracker or MIDI file that takes a moment to
+synthesize is decoded once and cloned from memory on the next visit, so flipping back and forth is
+instant.
 
 **They're plugins — turn off what you don't want.** Source code, PDF and audio are each a
 runtime **toggle** in **Preferences → Format plugins**. Switch one off and its file type

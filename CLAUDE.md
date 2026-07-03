@@ -773,8 +773,15 @@ inside `caught(||…)` (the same panic guard as `decode_caught`). Both always re
   down so it can't keep looping.
 - **Trackers** (MOD/XM/S3M/IT): `AudioPlayer::open` routes tracker extensions to **`xmrs`**
   (pure Rust — parses + synthesizes to interleaved-stereo i16 → f32) into the same sample
-  buffer, so loop/region/playhead/waveform all work for modules too. voc/au/midi (no in-app
+  buffer, so loop/region/playhead/waveform all work for modules too. voc/au (no in-app
   decoder) keep the icon tile + external open.
+- **MIDI** (`.mid`/`.midi`/`.kar`): a MIDI file is only note events, so `render_midi` synthesizes
+  it to PCM through a **General MIDI SoundFont** via `rustysynth` (`MidiFileSequencer::render`) —
+  then it feeds the same player path as any audio. The SoundFont is a persisted preference
+  (`midi_soundfont` / Preferences → "MIDI SoundFont"), else auto-detected from common system paths
+  (**preferring a small ~6 MB TimGM6mb over a 100+ MB FluidR3** — the load is synchronous). The
+  loaded font is cached in `midi_sf_cache` (an `Arc`, parsed once per session, not per MIDI);
+  changing it clears that + the decode cache. `None` available → the player shows a "set one" note.
 
 Both player surfaces also have an **onscreen piano keyboard** (`piano_keyboard(ui, octave, h)`
 — `h` sizes it big vs compact) + Oct −/+ to audition the sample as a one-shot instrument — a
