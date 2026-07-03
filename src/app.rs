@@ -4523,15 +4523,21 @@ impl PixelView {
                             }
                         });
                     ui.add_space(8.0);
-                    // Audio preview: transport + an interactive waveform (decodable formats
-                    // only — trackers/midi have no in-app playback, only the icon tile).
-                    if is_audio && audio.is_some() {
-                        let dur = audio
+                    // Audio preview: transport + an interactive waveform. Shown for every audio
+                    // type — PCM/compressed play via rodio, trackers via xmrs; formats neither
+                    // can decode (voc/au/midi) just report it in the status bar on Play.
+                    if is_audio {
+                        let loaded = self.is_audio_loaded(&entry.path);
+                        // Duration: the loaded player knows it exactly (needed for trackers,
+                        // which have no symphonia metadata); else the parsed metadata; else 0.
+                        let dur = self
+                            .audio_player
                             .as_ref()
-                            .map(|a| a.duration_secs)
+                            .filter(|_| loaded)
+                            .map(|ap| ap.duration)
+                            .or_else(|| audio.as_ref().map(|a| a.duration_secs))
                             .unwrap_or(0.0)
                             .max(0.1);
-                        let loaded = self.is_audio_loaded(&entry.path);
                         let (pos, playing, looping, sel_lo, sel_hi) = self
                             .audio_player
                             .as_ref()
@@ -12134,13 +12140,25 @@ struct AudioPlayer {
 impl AudioPlayer {
     /// Decode `bytes` and open the default device. `Err` if the format can't be decoded
     /// in-app, or no output device is available (caller shows the message in the status bar).
+    /// Tracker modules (mod/xm/s3m/it) are synthesized to samples by `xmrs`; everything else
+    /// goes through rodio's PCM/compressed decoders.
     fn open(path: &Path, bytes: Vec<u8>) -> Result<Self, String> {
         use rodio::Source;
-        let decoder = rodio::Decoder::new(std::io::Cursor::new(bytes))
-            .map_err(|_| "can't decode this audio format in-app".to_string())?;
-        let channels = decoder.channels();
-        let sample_rate = decoder.sample_rate();
-        let samples: Vec<rodio::Sample> = decoder.collect();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let (samples, channels, sample_rate) = if is_tracker_ext(&ext) {
+            render_tracker(&bytes)?
+        } else {
+            let decoder = rodio::Decoder::new(std::io::Cursor::new(bytes))
+                .map_err(|_| "can't decode this audio format in-app".to_string())?;
+            let channels = decoder.channels();
+            let sample_rate = decoder.sample_rate();
+            let samples: Vec<rodio::Sample> = decoder.collect();
+            (samples, channels, sample_rate)
+        };
         let ch = channels.get() as usize;
         let sr = sample_rate.get() as f32;
         let frames = samples.len() / ch.max(1);
@@ -12230,6 +12248,36 @@ fn is_pdf_path(p: &Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+}
+
+/// Extensions we play via the `xmrs` tracker synthesizer (rather than rodio's PCM decoders).
+fn is_tracker_ext(ext: &str) -> bool {
+    matches!(ext, "mod" | "xm" | "s3m" | "it" | "mtm" | "stm" | "mptm")
+}
+
+/// Render a tracker module (MOD/XM/S3M/IT) to interleaved-stereo f32 samples via `xmrs`, so
+/// it feeds the same player/waveform path as PCM audio. `Err` if it isn't a readable module.
+fn render_tracker(
+    bytes: &[u8],
+) -> Result<(Vec<rodio::Sample>, rodio::ChannelCount, rodio::SampleRate), String> {
+    use xmrsplayer::xmrsplayer::XmrsPlayer;
+    let module = xmrs::core::module::Module::load(bytes)
+        .map_err(|e| format!("not a tracker module: {e:?}"))?;
+    let sr = 44_100u32;
+    let mut player = XmrsPlayer::new(&module, sr, 0);
+    player.set_max_loop_count(1); // one pass, then the iterator ends (finite render)
+    let cap = sr as usize * 2 * 600; // 10-min stereo safety cap
+                                     // XmrsPlayer yields interleaved-stereo i16; map to rodio's f32 sample.
+    let samples: Vec<rodio::Sample> = (&mut player)
+        .take(cap)
+        .map(|s| s as f32 / 32768.0)
+        .collect();
+    if samples.is_empty() {
+        return Err("empty module".to_string());
+    }
+    let ch = std::num::NonZeroU16::new(2).unwrap();
+    let rate = std::num::NonZeroU32::new(sr).unwrap();
+    Ok((samples, ch, rate))
 }
 
 /// Lay two rendered pages side by side (a small gutter between), each top-aligned on a white

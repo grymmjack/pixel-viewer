@@ -3458,6 +3458,8 @@ dependencies = [
  "ureq",
  "xattr",
  "xcf",
+ "xmrs",
+ "xmrsplayer",
 ]
 
 [[package]]
@@ -4261,6 +4263,12 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "sidera"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab23512582d338f8b892c3247974ec6f65447a04dade7d6a2471b6dcc24cf0ba"
 
 [[package]]
 name = "signal-hook-registry"
@@ -6414,6 +6422,25 @@ name = "xmlwriter"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
+
+[[package]]
+name = "xmrs"
+version = "0.14.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "891622ae5fc3a868e33174cb381017a5fe41eb8f2604139c324d5b164177e840"
+dependencies = [
+ "serde",
+ "sidera",
+]
+
+[[package]]
+name = "xmrsplayer"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58eb50a9bc5f0ae369b571b4536bc6a1532ebec0e4846f6082686e2915dacee7"
+dependencies = [
+ "xmrs",
+]
 
 [[package]]
 name = "yoke"

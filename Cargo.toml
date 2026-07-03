@@ -52,6 +52,10 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 rodio = { version = "0.22", default-features = false, features = [
     "playback", "mp3", "wav", "vorbis", "flac",
 ] }
+# Tracker-module playback (MOD/XM/S3M/IT), pure Rust — parses + synthesizes to samples we
+# feed the same rodio sink as PCM audio. No C dependency (unlike libopenmpt).
+xmrs = "0.14"
+xmrsplayer = "0.14"
 
 [profile.release]
 opt-level = 3
