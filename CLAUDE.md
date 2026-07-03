@@ -26,7 +26,13 @@ embedded CP437 VGA font), and the binary scene formats **XBin** (`.xb`/`.xbin`),
 **Artworx** (`.adf`), **PETSCII** (`.seq`/`.pet` — Commodore C64), **petmate** (`.petmate`
 — nurpax/petmate JSON PETSCII) and **RIPscript**
 (`.rip` — EGA vector BBS graphics), both via Mike Krüger's `icy_parser_core` — all with
-SAUCE-driven hints, shown in the Details pane.
+SAUCE-driven hints, shown in the Details pane. Also **source code + text** (~90 exts: rs,
+c/cpp/h, py, js/ts, css, html, php, lua, asm, gd, json, yaml, md, log, … — rasterized with
+the CP437 font + a lean hand-rolled syntax highlighter, `decode/code.rs`), **PDF** (a
+placeholder page tile + page-count/size/title/author metadata via `lopdf`, `decode/pdf.rs`;
+real page rendering is deferred), and **audio** (`decode/audio.rs`: a real waveform tile for
+mp3/wav/ogg/flac via `symphonia`, else a music-note icon for trackers/voc/au/midi; duration/
+rate/channels/codec in Details). PDF + audio double as "open in your external editor/player".
 **Animated GIFs** play (autoplay + seek in the viewer,
 hover-to-play in the grid). Archives (`.zip`/`.lha`/`.arj`/…) and **16colo.rs** (the
 online ANSI archive: a Places entry with a nav bar — Years / Latest / Groups / Artists
@@ -78,6 +84,19 @@ src/
     xbin.rs          .xb/.xbin — binary ANSI: palette/font + RLE; shared render_textmode;
                      default palette is ansi::VGA_PALETTE (raw VGA attr order, not SGR)
     bin.rs           .bin — raw char/attr pairs (SAUCE width); idf/adf reuse render_textmode
+    code.rs          source code / text (~90 exts) → CP437 8x16 raster + a lean hand-rolled
+                     highlighter (per-language comment/string rules, shared keyword union,
+                     line-number gutter, tab expand, UTF-8→CP437, line+cell budget). `CODE_EXTS`
+                     re-exported; registry routes code exts to `decode_ext(bytes, ext)`. ipynb
+                     flattens to highlighted Python. Zero heavy deps (no syntect).
+    pdf.rs           .pdf — placeholder page tile (red PDF badge + page count) + metadata
+                     (page count / MediaBox size / /Info title+author) via `lopdf` (pure Rust).
+                     `pdf_meta`/`PdfMeta` feed the Details pane; real page raster is deferred.
+    audio.rs         audio → waveform tile (mp3/wav/ogg/flac via `symphonia`: decode → peak
+                     envelope → resample → mirror) else a music-note icon (trackers/voc/au/midi).
+                     `audio_info`/`AudioInfo` (duration/rate/channels/codec) feed Details.
+                     Device-free (no playback) so `cargo test` stays headless; `AUDIO_EXTS`
+                     re-exported; registry routes audio exts to `decode_ext` (needs the ext hint).
     tundra.rs        .tnd — TundraDraw 24-bit truecolor command stream
     idf.rs           .idf — iCE Draw: bounds + RLE + end-of-file font/palette
     adf.rs           .adf — Artworx: version + 64-color palette + font + pairs
@@ -117,7 +136,7 @@ cargo build --release
 cargo check              # fast type-check during edits
 cargo clippy             # lint
 cargo fmt                # format
-cargo test               # 161 tests (151 unit + 10 headless egui_kittest GUI tests; +11 ignored network/real-trash)
+cargo test               # 180 tests (170 unit + 10 headless egui_kittest GUI tests; +11 ignored network/real-trash)
 cargo test gui_tests     # just the egui_kittest UI tests; cargo test <name> for one
 ```
 
@@ -700,7 +719,25 @@ Copy `decode/pcx.rs`, implement the `Decoder` trait (`name`, `extensions`,
 `sniff`, `decode`), and add one `Box::new(...)` line to `Registry::with_builtins`
 in `decode/mod.rs`. Use `from_indexed` if the format is palette-based (IFF/ILBM,
 LBM), `from_rgba` otherwise. Place the new sniff-able decoder ahead of
-`ImageCrateDecoder` if its magic bytes could be ambiguous.
+`ImageCrateDecoder` if its magic bytes could be ambiguous. Adding extensions to a
+decoder's `extensions()` makes them viewable via `known_extension` **and** the two hard-coded
+parallel lists in `app.rs` — `is_image_ext` (montages/counts/prev-next; `code.rs`/`audio.rs`
+re-export `CODE_EXTS`/`AUDIO_EXTS` so it shares one list) and `is_textmode_ext` (crisp-integer
+textmode zoom + CellReveal typeout + SAUCE panel — usually *not* wanted for non-scene files).
+
+**Extension-routed decoders (`code`/`audio`).** A `Decoder::decode` only gets `bytes`, not
+the path — but source code needs the extension to pick a language spec and audio needs it as a
+format hint. So `decode_bytes` special-cases `CODE_EXTS`/`AUDIO_EXTS` *before* the generic
+extension loop, calling `CodeDecoder::decode_ext(bytes, ext)` / `SoundDecoder::decode_ext`
+inside `caught(||…)` (the same panic guard as `decode_caught`). Both always return *some* image
+(highlighted text / plain / waveform / icon), never an error, so a weird file still shows a tile.
+
+**Deferred, feature-gated fast-follows** (planned, not built): real PDF page rasterization +
+an in-app 1/2-page viewer via `pdfium-render` behind a `pdf-render` feature (ships a pdfium
+sidecar, runtime-bound — no build-time system dep); in-app audio **playback** (play/pause/seek)
+via `rodio` behind an `audio-playback` feature, and tracker playback via `xmrs` (pure Rust).
+Both playback features MUST stay default-OFF: `rodio → cpal → alsa-sys` needs `libasound2-dev`
++ an output device, which would break the headless `cargo test` / CI.
 
 **The icy ecosystem (Mike Krüger's scene-art formats), the lean way.** Mike's
 `icy_engine` *renders* but hard-depends on `icy_net` → **tokio "full"** — too heavy for
@@ -814,7 +851,7 @@ than assuming a logic bug. Already hit and migrated for 0.34.3:
 
 ## Testing
 
-`cargo test` runs 161 tests, all headless (151 unit + 10 GUI; plus 11 `#[ignore]`
+`cargo test` runs 180 tests, all headless (170 unit + 10 GUI; plus 11 `#[ignore]`
 network / real-trash tests that hit the live 16colo.rs API or the system trash):
 - **Unit tests** (`#[cfg(test)] mod tests` per module): PCX decode + sniff,
   `Registry` dispatch (incl. a real PNG via the `image` crate), `make_thumb` /
