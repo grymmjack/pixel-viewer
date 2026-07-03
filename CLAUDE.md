@@ -750,20 +750,30 @@ inside `caught(||…)` (the same panic guard as `decode_caught`). Both always re
 - **Audio** (`AudioPlayer` in app.rs, `rodio`): decodes the file to a sample buffer ONCE, then
   each play appends a fresh `SamplesBuffer` of the selected region to a new `Player` — so it
   restarts cleanly (the old "play once" bug), loops (`repeat_infinite`), and plays a drag-
-  selected region. The Details pane draws an **interactive waveform** (hi-res peaks + a moving
-  loop-aware playhead + shaded region): drag = set loop region, click = seek; plus a loop
-  toggle, an **Autoplay** checkbox (persisted: play on select + loop until Stop), a Stop button,
-  and **Spacebar** play/pause. The device opens **lazily + fallibly on first Play** — a headless
-  box reports "no audio output" and `cargo test` never touches a device.
+  selected region. Opening an audio file puts the **full player right in the main viewer**
+  (not just the side pane): `load_full` calls `ensure_audio_loaded` (decode + open device
+  without necessarily starting — Autoplay starts it) so the transport + waveform + keyboard
+  are visible **immediately on open**, no Play press needed. The whole player UI lives in one
+  shared method, **`draw_audio_controls(ui, path, big, meta_dur)`**, called two ways: `ui_single`
+  draws it `big` (220px waveform + 130px keyboard) filling the viewer when the open file
+  `is_audio_ext`; `ui_details` draws it compact (`big=false`, 96px/66px) under the metadata grid.
+  It draws an **interactive waveform** (hi-res peaks + a moving loop-aware playhead + shaded
+  region): drag = set loop region, click = seek; plus a loop toggle, an **Autoplay** checkbox
+  (persisted: play on select + loop until Stop), a Stop button, and **Spacebar** play/pause. The
+  method collects `want_*` locals while drawing and applies them at its own end (it's a
+  `&mut self` method, not an egui closure, so no caller-side deferral). The device opens
+  **lazily + fallibly on first Play** — a headless box reports "no audio output" and `cargo test`
+  never touches a device. Leaving the file (`load_full` on a non-audio path) tears the player
+  down so it can't keep looping.
 - **Trackers** (MOD/XM/S3M/IT): `AudioPlayer::open` routes tracker extensions to **`xmrs`**
   (pure Rust — parses + synthesizes to interleaved-stereo i16 → f32) into the same sample
   buffer, so loop/region/playhead/waveform all work for modules too. voc/au/midi (no in-app
   decoder) keep the icon tile + external open.
 
-The Details pane also has an **onscreen piano keyboard** (`piano_keyboard`) + Oct −/+ to
-audition the sample as a one-shot instrument — a key plays the selected region pitch-shifted
-via rodio `speed()` (2^(semitone/12)); `AudioPlayer::play_note` / `play_speed` keep the playhead
-correct at a pitched tempo.
+Both player surfaces also have an **onscreen piano keyboard** (`piano_keyboard(ui, octave, h)`
+— `h` sizes it big vs compact) + Oct −/+ to audition the sample as a one-shot instrument — a
+key plays the selected region pitch-shifted via rodio `speed()` (2^(semitone/12));
+`AudioPlayer::play_note` / `play_speed` keep the playhead correct at a pitched tempo.
 
 `rodio → cpal → alsa-sys` needs **`libasound2-dev` at BUILD time** on Linux (added to CI + the
 first-time-deps list above), so `rodio`/`xmrs` are normal (non-feature-gated) deps. The

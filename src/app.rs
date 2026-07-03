@@ -2277,6 +2277,234 @@ impl PixelView {
         self.audio_player.as_ref().is_some_and(|ap| ap.path == path)
     }
 
+    /// Load (decode + open device) the audio preview player for `path` WITHOUT necessarily
+    /// starting it — so the Details/viewer show the waveform + keyboard the moment a file is
+    /// opened, not only after a Play press. Autoplay starts it. No-op if already loaded / not
+    /// audio / the plugin is off; failures leave the transport (Play retries).
+    fn ensure_audio_loaded(&mut self, path: &Path) {
+        if self.is_audio_loaded(path) || !self.plugin_audio {
+            return;
+        }
+        let real = self.resolve_local(path);
+        let Ok(bytes) = std::fs::read(&real) else { return };
+        if let Ok(mut ap) = AudioPlayer::open(path, bytes) {
+            ap.looping = self.audio_autoplay;
+            if self.audio_autoplay {
+                ap.play_region();
+            }
+            self.audio_player = Some(ap);
+        }
+    }
+
+    /// Draw the audio player — transport + interactive waveform + onscreen keyboard — for
+    /// `path`, and apply its actions. `big` = the roomy main-viewer layout; `false` = the
+    /// compact Details-pane strip. `meta_dur` is the parsed duration (a fallback before the
+    /// player is loaded). A free-standing method (not a closure) so it can mutate `self`
+    /// directly after drawing. Shared by the main viewer and the Details pane.
+    fn draw_audio_controls(&mut self, ui: &mut egui::Ui, path: &Path, big: bool, meta_dur: Option<f32>) {
+        let loaded = self.is_audio_loaded(path);
+        let dur = self
+            .audio_player
+            .as_ref()
+            .filter(|_| loaded)
+            .map(|ap| ap.duration)
+            .or(meta_dur)
+            .unwrap_or(0.0)
+            .max(0.1);
+        let (pos, playing, looping, sel_lo, sel_hi) = self
+            .audio_player
+            .as_ref()
+            .filter(|_| loaded)
+            .map(|ap| (ap.pos(), ap.is_playing(), ap.looping, ap.sel_start, ap.sel_end))
+            .unwrap_or((0.0, false, self.audio_autoplay, 0.0, dur));
+
+        let mut want_toggle = false;
+        let mut want_stop = false;
+        let mut want_loop: Option<bool> = None;
+        let mut want_autoplay: Option<bool> = None;
+        let mut want_select: Option<(f32, f32)> = None;
+        let mut want_commit = false;
+        let mut want_seek: Option<f32> = None;
+        let mut want_note: Option<i32> = None;
+        let mut want_octave: Option<i32> = None;
+
+        // Transport row.
+        ui.horizontal(|ui| {
+            if ui
+                .button(if playing { "⏸" } else { "▶" })
+                .on_hover_text("Play / pause (Space)")
+                .clicked()
+            {
+                want_toggle = true;
+            }
+            if ui.button("⏹").on_hover_text("Stop").clicked() {
+                want_stop = true;
+            }
+            let mut lp = looping;
+            if ui
+                .toggle_value(&mut lp, "🔁")
+                .on_hover_text("Loop the selection")
+                .changed()
+            {
+                want_loop = Some(lp);
+            }
+            let mut ap_on = self.audio_autoplay;
+            if ui
+                .checkbox(&mut ap_on, "Autoplay")
+                .on_hover_text("Play on select + loop until you press Stop")
+                .changed()
+            {
+                want_autoplay = Some(ap_on);
+            }
+            let mm = |s: f32| format!("{}:{:02}", (s as u64) / 60, (s as u64) % 60);
+            ui.weak(format!("{} / {}", mm(pos), mm(dur)));
+        });
+        ui.add_space(4.0);
+
+        // Interactive waveform: hi-res bars, shaded loop region, moving playhead.
+        if let Some(ap) = self.audio_player.as_ref().filter(|_| loaded) {
+            let h = if big { 220.0 } else { 96.0 };
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), h),
+                egui::Sense::click_and_drag(),
+            );
+            let p = ui.painter_at(rect);
+            p.rect_filled(rect, 3.0, egui::Color32::from_rgb(16, 18, 24));
+            let w = rect.width().max(1.0);
+            let x_of = |t: f32| rect.left() + (t / dur).clamp(0.0, 1.0) * w;
+            p.rect_filled(
+                egui::Rect::from_x_y_ranges(x_of(sel_lo)..=x_of(sel_hi), rect.y_range()),
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(88, 196, 172, 34),
+            );
+            let mid = rect.center().y;
+            let cols = w as usize;
+            let n = ap.peaks.len().max(1);
+            for cx in 0..cols {
+                let a = cx * n / cols.max(1);
+                let b = ((cx + 1) * n / cols.max(1)).max(a + 1).min(n);
+                let peak = ap.peaks[a..b].iter().copied().fold(0.0, f32::max);
+                let half = (peak * (h * 0.44)).max(0.5);
+                let x = rect.left() + cx as f32;
+                let t = (cx as f32 / w) * dur;
+                let col = if t >= sel_lo && t <= sel_hi {
+                    egui::Color32::from_rgb(120, 220, 190)
+                } else {
+                    egui::Color32::from_rgb(66, 104, 96)
+                };
+                p.line_segment(
+                    [egui::pos2(x, mid - half), egui::pos2(x, mid + half)],
+                    egui::Stroke::new(1.0, col),
+                );
+            }
+            p.vline(
+                x_of(pos),
+                rect.y_range(),
+                egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 224, 130)),
+            );
+            let t_at = |x: f32| (((x - rect.left()) / w).clamp(0.0, 1.0)) * dur;
+            if resp.drag_started() {
+                self.audio_drag = resp.interact_pointer_pos().map(|pp| t_at(pp.x));
+            }
+            if resp.dragged() {
+                if let (Some(a), Some(pp)) = (self.audio_drag, resp.interact_pointer_pos()) {
+                    let b = t_at(pp.x);
+                    want_select = Some((a.min(b), a.max(b)));
+                }
+            }
+            if resp.drag_stopped() {
+                self.audio_drag = None;
+                want_commit = true;
+            }
+            if resp.clicked() {
+                if let Some(pp) = resp.interact_pointer_pos() {
+                    want_seek = Some(t_at(pp.x));
+                }
+            }
+            ui.weak("drag: set loop region · click: seek");
+        }
+
+        // Onscreen keyboard: audition the sample as a one-shot instrument.
+        if loaded {
+            ui.add_space(4.0);
+            let oct = self.audio_octave;
+            ui.horizontal(|ui| {
+                ui.weak("🎹");
+                if ui.small_button("Oct −").clicked() {
+                    want_octave = Some(oct - 1);
+                }
+                ui.weak(format!("{oct:+}"));
+                if ui.small_button("Oct +").clicked() {
+                    want_octave = Some(oct + 1);
+                }
+                ui.weak("click keys to pitch the sample");
+            });
+            if let Some(semi) = piano_keyboard(ui, oct, if big { 130.0 } else { 66.0 }) {
+                want_note = Some(semi);
+            }
+        } else if is_tracker_ext(
+            &path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .unwrap_or_default(),
+        ) || meta_dur.is_none()
+        {
+            ui.weak("Press ▶ to load — trackers/undecodable formats decode on play.");
+        } else {
+            ui.weak("Press ▶ to load the waveform + keyboard.");
+        }
+
+        // Apply the collected actions (order: adjust the region/loop before (re)starting).
+        if let Some(b) = want_autoplay {
+            self.audio_autoplay = b;
+        }
+        if let Some((lo, hi)) = want_select {
+            if let Some(ap) = &mut self.audio_player {
+                ap.sel_start = lo;
+                ap.sel_end = hi.max(lo + 0.01);
+            }
+        }
+        if let Some(b) = want_loop {
+            if let Some(ap) = &mut self.audio_player {
+                ap.looping = b;
+                if ap.is_playing() {
+                    ap.play_region();
+                }
+            }
+        }
+        if want_commit {
+            if let Some(ap) = &mut self.audio_player {
+                if ap.is_playing() || self.audio_autoplay {
+                    ap.play_region();
+                }
+            }
+        }
+        if want_toggle {
+            self.toggle_audio(path);
+        }
+        if want_stop {
+            self.stop_audio();
+        }
+        if let Some(o) = want_octave {
+            self.audio_octave = o.clamp(-4, 4);
+        }
+        if let Some(semi) = want_note {
+            if let Some(ap) = &mut self.audio_player {
+                ap.play_note(semi);
+            }
+        }
+        if let Some(secs) = want_seek {
+            if let Some(ap) = &self.audio_player {
+                let rel = (secs - ap.region_start).clamp(0.0, ap.region_len);
+                let _ = ap.player.try_seek(std::time::Duration::from_secs_f32(rel));
+            }
+        }
+        if self.audio_player.as_ref().is_some_and(|ap| ap.is_playing()) {
+            self.want_repaint = true;
+        }
+    }
+
     /// A downloaded 16colo.rs pack zip finished: extract + mount it (with the
     /// virtual pack path as its display identity, so the breadcrumb keeps reading
     /// `16colo.rs › year › pack › …`) and browse its contents.
@@ -3176,6 +3404,17 @@ impl PixelView {
             });
             self.render_pdf_to_full(ctx);
             return;
+        }
+
+        // Audio → load the interactive player now so the big transport + waveform + keyboard
+        // appear the instant the file opens (ui_single draws them). We still decode the file
+        // below so `full_tex` holds the waveform image for the Details thumbnail / minimap.
+        if is_audio_ext(&path) {
+            self.ensure_audio_loaded(&path);
+        } else if self.audio_player.is_some() {
+            // Left the audio file → tear the player down so it can't keep looping.
+            self.stop_audio();
+            self.audio_player = None;
         }
 
         // Baud-rate playback for stream art (ANSImation / "watch RIP draw"). The static
@@ -4303,15 +4542,7 @@ impl PixelView {
         let mut want_download = false;
         let mut want_pack: Option<PathBuf> = None;
         let mut want_open_default = false; // "Open in default app" (PDF)
-        let mut want_audio_toggle: Option<PathBuf> = None; // play/pause the audio preview
-        let mut want_audio_seek: Option<f32> = None; // seek the audio preview to N seconds
-        let mut want_audio_stop = false; // ⏹ stop the preview
-        let mut want_audio_select: Option<(f32, f32)> = None; // drag-selected loop region
-        let mut want_audio_loop: Option<bool> = None; // set the loop flag
-        let mut want_autoplay: Option<bool> = None; // set the autoplay preference
-        let mut want_audio_commit = false; // drag finished → (re)play the new region
-        let mut want_audio_note: Option<i32> = None; // onscreen-keyboard key → audition pitch
-        let mut want_octave: Option<i32> = None; // onscreen-keyboard octave shift
+        // Audio player actions are handled inside `draw_audio_controls`, not deferred here.
         let disp = self.to_display(&entry.path);
         // Inspecting a downloadable pack folder (it has a fetched zip URL). Keyed off
         // `remote_urls`, not path depth, so `groups/<g>` / `artists/<a>` listing folders
@@ -4527,164 +4758,15 @@ impl PixelView {
                             }
                         });
                     ui.add_space(8.0);
-                    // Audio preview: transport + an interactive waveform. Shown for every audio
-                    // type — PCM/compressed play via rodio, trackers via xmrs; formats neither
-                    // can decode (voc/au/midi) just report it in the status bar on Play.
+                    // Audio preview player (transport + interactive waveform + onscreen
+                    // keyboard) — the compact Details version; the main viewer shows a big one.
                     if is_audio {
-                        let loaded = self.is_audio_loaded(&entry.path);
-                        // Duration: the loaded player knows it exactly (needed for trackers,
-                        // which have no symphonia metadata); else the parsed metadata; else 0.
-                        let dur = self
-                            .audio_player
-                            .as_ref()
-                            .filter(|_| loaded)
-                            .map(|ap| ap.duration)
-                            .or_else(|| audio.as_ref().map(|a| a.duration_secs))
-                            .unwrap_or(0.0)
-                            .max(0.1);
-                        let (pos, playing, looping, sel_lo, sel_hi) = self
-                            .audio_player
-                            .as_ref()
-                            .filter(|_| loaded)
-                            .map(|ap| {
-                                (
-                                    ap.pos(),
-                                    ap.is_playing(),
-                                    ap.looping,
-                                    ap.sel_start,
-                                    ap.sel_end,
-                                )
-                            })
-                            .unwrap_or((0.0, false, self.audio_autoplay, 0.0, dur));
-                        // Transport row.
-                        ui.horizontal(|ui| {
-                            if ui
-                                .button(if playing { "⏸" } else { "▶" })
-                                .on_hover_text("Play / pause (Space)")
-                                .clicked()
-                            {
-                                want_audio_toggle = Some(entry.path.clone());
-                            }
-                            if ui.button("⏹").on_hover_text("Stop").clicked() {
-                                want_audio_stop = true;
-                            }
-                            let mut lp = looping;
-                            if ui
-                                .toggle_value(&mut lp, "🔁")
-                                .on_hover_text("Loop the selection")
-                                .changed()
-                            {
-                                want_audio_loop = Some(lp);
-                            }
-                            let mut ap_on = self.audio_autoplay;
-                            if ui
-                                .checkbox(&mut ap_on, "Autoplay")
-                                .on_hover_text("Play on select + loop until you press Stop")
-                                .changed()
-                            {
-                                want_autoplay = Some(ap_on);
-                            }
-                            let mm = |s: f32| format!("{}:{:02}", (s as u64) / 60, (s as u64) % 60);
-                            ui.weak(format!("{} / {}", mm(pos), mm(dur)));
-                        });
-                        ui.add_space(4.0);
-                        // Interactive waveform (drawn once the file is loaded → we have peaks):
-                        // hi-res bars, a shaded loop region, and a moving playhead. Drag to set
-                        // the loop region; click to seek.
-                        if let Some(ap) = self.audio_player.as_ref().filter(|_| loaded) {
-                            let h = 96.0;
-                            let (rect, resp) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), h),
-                                egui::Sense::click_and_drag(),
-                            );
-                            let p = ui.painter_at(rect);
-                            p.rect_filled(rect, 3.0, egui::Color32::from_rgb(16, 18, 24));
-                            let w = rect.width().max(1.0);
-                            let x_of = |t: f32| rect.left() + (t / dur).clamp(0.0, 1.0) * w;
-                            // Loop-region shading.
-                            p.rect_filled(
-                                egui::Rect::from_x_y_ranges(
-                                    x_of(sel_lo)..=x_of(sel_hi),
-                                    rect.y_range(),
-                                ),
-                                0.0,
-                                egui::Color32::from_rgba_unmultiplied(88, 196, 172, 34),
-                            );
-                            // Hi-res waveform bars (peaks resampled to pixel columns), the
-                            // selected span brighter.
-                            let mid = rect.center().y;
-                            let cols = w as usize;
-                            let n = ap.peaks.len().max(1);
-                            for cx in 0..cols {
-                                let a = cx * n / cols.max(1);
-                                let b = ((cx + 1) * n / cols.max(1)).max(a + 1).min(n);
-                                let peak = ap.peaks[a..b].iter().copied().fold(0.0, f32::max);
-                                let half = (peak * (h * 0.44)).max(0.5);
-                                let x = rect.left() + cx as f32;
-                                let t = (cx as f32 / w) * dur;
-                                let col = if t >= sel_lo && t <= sel_hi {
-                                    egui::Color32::from_rgb(120, 220, 190)
-                                } else {
-                                    egui::Color32::from_rgb(66, 104, 96)
-                                };
-                                p.line_segment(
-                                    [egui::pos2(x, mid - half), egui::pos2(x, mid + half)],
-                                    egui::Stroke::new(1.0, col),
-                                );
-                            }
-                            // Moving playhead.
-                            let phx = x_of(pos);
-                            p.vline(
-                                phx,
-                                rect.y_range(),
-                                egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 224, 130)),
-                            );
-                            // Interaction: drag → loop region; click → seek.
-                            let t_at = |x: f32| (((x - rect.left()) / w).clamp(0.0, 1.0)) * dur;
-                            if resp.drag_started() {
-                                self.audio_drag = resp.interact_pointer_pos().map(|pp| t_at(pp.x));
-                            }
-                            if resp.dragged() {
-                                if let (Some(a), Some(pp)) =
-                                    (self.audio_drag, resp.interact_pointer_pos())
-                                {
-                                    let b = t_at(pp.x);
-                                    want_audio_select = Some((a.min(b), a.max(b)));
-                                }
-                            }
-                            if resp.drag_stopped() {
-                                self.audio_drag = None;
-                                want_audio_commit = true; // play the freshly-set region
-                            }
-                            if resp.clicked() {
-                                if let Some(pp) = resp.interact_pointer_pos() {
-                                    want_audio_seek = Some(t_at(pp.x));
-                                }
-                            }
-                            ui.weak("drag: set loop region · click: seek");
-                        }
-                        // Onscreen keyboard: audition the sample as a one-shot instrument —
-                        // each key plays the (selected) region pitch-shifted to that note,
-                        // ± the octave offset. C = the sample's native pitch.
-                        if loaded {
-                            ui.add_space(4.0);
-                            let oct = self.audio_octave;
-                            ui.horizontal(|ui| {
-                                ui.weak("🎹");
-                                if ui.small_button("Oct −").clicked() {
-                                    want_octave = Some(oct - 1);
-                                }
-                                ui.weak(format!("{oct:+}"));
-                                if ui.small_button("Oct +").clicked() {
-                                    want_octave = Some(oct + 1);
-                                }
-                                ui.weak("click keys to pitch the sample");
-                            });
-                            if let Some(semi) = piano_keyboard(ui, oct) {
-                                want_audio_note = Some(semi);
-                            }
-                        }
-                        ui.add_space(4.0);
+                        self.draw_audio_controls(
+                            ui,
+                            &entry.path,
+                            false,
+                            audio.as_ref().map(|a| a.duration_secs),
+                        );
                     }
                     ui.horizontal(|ui| {
                         want_download = ui
@@ -4784,54 +4866,6 @@ impl PixelView {
         }
         if want_open_default {
             self.open_in_default_app(&entry.path);
-        }
-        if let Some(b) = want_autoplay {
-            self.audio_autoplay = b;
-        }
-        if let Some((lo, hi)) = want_audio_select {
-            if let Some(ap) = &mut self.audio_player {
-                ap.sel_start = lo;
-                ap.sel_end = hi.max(lo + 0.01);
-            }
-        }
-        if let Some(b) = want_audio_loop {
-            if let Some(ap) = &mut self.audio_player {
-                ap.looping = b;
-                if ap.is_playing() {
-                    ap.play_region(); // re-append with/without the infinite repeat
-                }
-            }
-        }
-        if want_audio_commit {
-            if let Some(ap) = &mut self.audio_player {
-                if ap.is_playing() || self.audio_autoplay {
-                    ap.play_region();
-                }
-            }
-        }
-        if let Some(p) = want_audio_toggle {
-            self.toggle_audio(&p);
-        }
-        if want_audio_stop {
-            self.stop_audio();
-        }
-        if let Some(o) = want_octave {
-            self.audio_octave = o.clamp(-4, 4);
-        }
-        if let Some(semi) = want_audio_note {
-            if let Some(ap) = &mut self.audio_player {
-                ap.play_note(semi);
-            }
-        }
-        if let Some(secs) = want_audio_seek {
-            if let Some(ap) = &self.audio_player {
-                let rel = (secs - ap.region_start).clamp(0.0, ap.region_len);
-                let _ = ap.player.try_seek(std::time::Duration::from_secs_f32(rel));
-            }
-        }
-        // Keep repainting while a preview is playing so the playhead + seek bar track it.
-        if self.audio_player.as_ref().is_some_and(|ap| ap.is_playing()) {
-            self.want_repaint = true;
         }
     }
 
@@ -7590,6 +7624,36 @@ impl PixelView {
                 return;
             }
             // else: at rest → fall through to the static view (recolor / minimap).
+        }
+
+        // Audio file open → the big interactive player (transport + hi-res waveform +
+        // onscreen keyboard) fills the viewer, so it's front-and-center instead of a static
+        // waveform image with the controls hidden in the narrow Details pane. Clone the path
+        // out first so the `self.full_tex` borrow ends before `draw_audio_controls`'s `&mut`.
+        let audio_path = self
+            .full_tex
+            .as_ref()
+            .and_then(|(p, _)| is_audio_ext(p).then(|| p.clone()));
+        if let Some(path) = audio_path {
+            egui::ScrollArea::vertical()
+                .id_salt("audio_viewer")
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.heading(short_name(&path));
+                    });
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.vertical(|ui| {
+                            ui.set_max_width((ui.available_width() - 16.0).max(200.0));
+                            self.draw_audio_controls(ui, &path, true, None);
+                        });
+                    });
+                });
+            return;
         }
 
         let Some((path, tex)) = self.full_tex.clone() else {
@@ -12316,6 +12380,14 @@ fn is_pdf_path(p: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
 }
 
+/// Is `p` an audio file we can preview in-app (PCM via rodio/symphonia + trackers via xmrs)?
+fn is_audio_ext(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| crate::decode::AUDIO_EXTS.contains(&e.as_str()))
+}
+
 /// Extensions we play via the `xmrs` tracker synthesizer (rather than rodio's PCM decoders).
 fn is_tracker_ext(ext: &str) -> bool {
     matches!(ext, "mod" | "xm" | "s3m" | "it" | "mtm" | "stm" | "mptm")
@@ -12377,10 +12449,9 @@ fn compose_side_by_side(
 /// Draw one octave of piano keys and return the clicked semitone (0 = C … 11 = B, plus
 /// `octave`×12), or `None`. Black keys are drawn + hit-tested last so they win where they
 /// overlap the white keys beneath.
-fn piano_keyboard(ui: &mut egui::Ui, octave: i32) -> Option<i32> {
-    const H: f32 = 66.0;
+fn piano_keyboard(ui: &mut egui::Ui, octave: i32, h: f32) -> Option<i32> {
     let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), H), egui::Sense::hover());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
     let p = ui.painter_at(rect);
     let ww = rect.width() / 7.0;
     let white = [0i32, 2, 4, 5, 7, 9, 11]; // C D E F G A B
@@ -12393,7 +12464,7 @@ fn piano_keyboard(ui: &mut egui::Ui, octave: i32) -> Option<i32> {
     for (i, &semi) in white.iter().enumerate() {
         let kr = egui::Rect::from_min_size(
             rect.left_top() + egui::vec2(i as f32 * ww, 0.0),
-            egui::vec2(ww, H),
+            egui::vec2(ww, h),
         );
         let resp = ui.interact(
             kr.shrink(1.0),
@@ -12418,7 +12489,7 @@ fn piano_keyboard(ui: &mut egui::Ui, octave: i32) -> Option<i32> {
             picked = Some(base + semi);
         }
     }
-    let (bw, bh) = (ww * 0.62, H * 0.6);
+    let (bw, bh) = (ww * 0.62, h * 0.6);
     for &(semi, bnd) in &black {
         let cx = rect.left() + bnd * ww;
         let kr =
