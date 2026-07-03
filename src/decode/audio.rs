@@ -121,10 +121,10 @@ const LABEL: [u8; 4] = [210, 210, 216, 255];
 const ACCENT: [u8; 4] = [120, 190, 255, 255];
 const NOTE: [u8; 4] = [130, 200, 255, 255];
 
-const WAVE_W: usize = 400;
-const WAVE_H: usize = 150;
+const WAVE_W: usize = 900; // crisp waveform tile
+const WAVE_H: usize = 200;
 const MAX_FRAMES: u64 = 12_000_000; // ~4.5 min @ 44.1k — bounds thumbnail-worker time
-const WINDOW: usize = 2048; // frames per peak sample
+const WINDOW: usize = 512; // frames per peak sample (finer envelope)
 
 /// Decode a peak envelope (0..1 per column) for the file, or `None` if undecodable.
 fn peaks(bytes: &[u8], ext: &str) -> Option<Vec<f32>> {

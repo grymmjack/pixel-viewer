@@ -791,6 +791,8 @@ pub struct PixelView {
     pdf_cache: HashMap<PathBuf, Option<crate::decode::PdfMeta>>, // lazy PDF metadata for Details
     audio_cache: HashMap<PathBuf, Option<crate::decode::AudioInfo>>, // lazy audio metadata
     audio_player: Option<AudioPlayer>, // in-app play/pause/seek preview (rodio), None = idle
+    audio_autoplay: bool,              // start playing on select + loop until stopped (persisted)
+    audio_drag: Option<f32>,           // waveform drag-select anchor time (transient)
     palettes: HashMap<PathBuf, Option<Vec<[u8; 4]>>>, // details swatches; None = too many colors
     thumb_rgba: HashMap<PathBuf, (usize, usize, Vec<u8>)>, // thumb CPU pixels (for grid recolor)
     grid_recolor: HashMap<PathBuf, (String, egui::TextureHandle)>, // recolored grid tiles, per recolor key
@@ -1073,6 +1075,8 @@ impl PixelView {
     const PLUGIN_PDF_KEY: &'static str = "plugin_pdf";
     const PLUGIN_AUDIO_KEY: &'static str = "plugin_audio";
     const PLUGIN_CODE_KEY: &'static str = "plugin_code";
+    /// Audio preview: start on select + loop until stopped.
+    const AUDIO_AUTOPLAY_KEY: &'static str = "audio_autoplay";
     /// Storage key for the last-opened folder (reopened on launch).
     const FOLDER_KEY: &'static str = "last_folder";
     /// Storage keys for sort & filter state.
@@ -1144,6 +1148,7 @@ impl PixelView {
         let plugin_pdf = load_bool(Self::PLUGIN_PDF_KEY, true);
         let plugin_audio = load_bool(Self::PLUGIN_AUDIO_KEY, true);
         let plugin_code = load_bool(Self::PLUGIN_CODE_KEY, true);
+        let audio_autoplay = load_bool(Self::AUDIO_AUTOPLAY_KEY, false);
         registry.set_plugin("pdf", plugin_pdf);
         registry.set_plugin("audio", plugin_audio);
         registry.set_plugin("code", plugin_code);
@@ -1476,6 +1481,8 @@ impl PixelView {
             pdf_cache: HashMap::new(),
             audio_cache: HashMap::new(),
             audio_player: None,
+            audio_autoplay,
+            audio_drag: None,
             palettes: HashMap::new(),
             thumb_rgba: HashMap::new(),
             grid_recolor: HashMap::new(),
@@ -2230,64 +2237,40 @@ impl PixelView {
     /// (re)open the default output device lazily and start it. The device init is fallible:
     /// a headless box (no sound card) just reports it in the status bar instead of panicking.
     fn toggle_audio(&mut self, path: &Path) {
-        if let Some(ap) = &self.audio_player {
+        // Same file already loaded → play/pause (or restart if it finished).
+        if let Some(ap) = &mut self.audio_player {
             if ap.path == path {
-                if ap.player.is_paused() {
-                    ap.player.play();
-                } else {
-                    ap.player.pause();
-                }
+                ap.toggle();
                 return;
             }
         }
+        // Load a new file: decode once + open the device.
         let real = self.resolve_local(path);
         let Ok(bytes) = std::fs::read(&real) else {
             self.status = "Couldn't read the audio file".into();
             return;
         };
-        let stream = match rodio::DeviceSinkBuilder::open_default_sink() {
-            Ok(s) => s,
-            Err(e) => {
-                self.status = format!("No audio output: {e}");
-                return;
+        match AudioPlayer::open(path, bytes) {
+            Ok(mut ap) => {
+                ap.looping = self.audio_autoplay; // autoplay = loop until stopped
+                ap.play_region();
+                self.audio_player = Some(ap);
+                self.status = format!("Playing {}", short_name(path));
             }
-        };
-        let player = rodio::Player::connect_new(stream.mixer());
-        let src = match rodio::Decoder::new(std::io::Cursor::new(bytes)) {
-            Ok(s) => s,
-            Err(_) => {
-                self.status = "Can't decode this audio format in-app".into();
-                return;
-            }
-        };
-        player.append(src);
-        player.play();
-        let duration = self
-            .audio_info(path)
-            .map(|a| a.duration_secs)
-            .unwrap_or(0.0);
-        self.audio_player = Some(AudioPlayer {
-            _stream: stream,
-            player,
-            path: path.to_path_buf(),
-            duration,
-        });
-        self.status = format!("Playing {}", short_name(path));
+            Err(e) => self.status = format!("Audio: {e}"),
+        }
     }
 
-    /// The in-app player's `(position_secs, playing, duration_secs)` for `path`, if it's the
-    /// file currently loaded in the player. Read for the Details play/seek controls.
-    fn audio_state(&self, path: &Path) -> Option<(f32, bool, f32)> {
-        self.audio_player
-            .as_ref()
-            .filter(|ap| ap.path == path)
-            .map(|ap| {
-                (
-                    ap.player.get_pos().as_secs_f32(),
-                    !ap.player.is_paused() && !ap.player.empty(),
-                    ap.duration,
-                )
-            })
+    /// Stop the preview player.
+    fn stop_audio(&mut self) {
+        if let Some(ap) = &mut self.audio_player {
+            ap.stop();
+        }
+    }
+
+    /// Is `path` the file currently loaded in the preview player?
+    fn is_audio_loaded(&self, path: &Path) -> bool {
+        self.audio_player.as_ref().is_some_and(|ap| ap.path == path)
     }
 
     /// A downloaded 16colo.rs pack zip finished: extract + mount it (with the
@@ -4251,6 +4234,11 @@ impl PixelView {
         let mut want_open_default = false; // "Open in default app" (PDF)
         let mut want_audio_toggle: Option<PathBuf> = None; // play/pause the audio preview
         let mut want_audio_seek: Option<f32> = None; // seek the audio preview to N seconds
+        let mut want_audio_stop = false; // ⏹ stop the preview
+        let mut want_audio_select: Option<(f32, f32)> = None; // drag-selected loop region
+        let mut want_audio_loop: Option<bool> = None; // set the loop flag
+        let mut want_autoplay: Option<bool> = None; // set the autoplay preference
+        let mut want_audio_commit = false; // drag finished → (re)play the new region
         let disp = self.to_display(&entry.path);
         // Inspecting a downloadable pack folder (it has a fetched zip URL). Keyed off
         // `remote_urls`, not path depth, so `groups/<g>` / `artists/<a>` listing folders
@@ -4330,8 +4318,6 @@ impl PixelView {
                     } else {
                         None
                     };
-                    // In-app player state (pos / playing / duration) for the seek controls.
-                    let audio_st = self.audio_state(&entry.path);
                     // Plain thumbnail (the recolored preview lives in the Recolor pane).
                     if let Some(tex) = self.thumb_tex.get(&entry.path) {
                         let tsz = tex.size_vec2();
@@ -4468,32 +4454,136 @@ impl PixelView {
                             }
                         });
                     ui.add_space(8.0);
-                    // Audio preview: play/pause + a seek bar (decodable formats only, i.e.
-                    // when `audio` metadata parsed — trackers/midi have no in-app playback).
+                    // Audio preview: transport + an interactive waveform (decodable formats
+                    // only — trackers/midi have no in-app playback, only the icon tile).
                     if is_audio && audio.is_some() {
                         let dur = audio
                             .as_ref()
                             .map(|a| a.duration_secs)
                             .unwrap_or(0.0)
                             .max(0.1);
-                        let (pos, playing) =
-                            audio_st.map(|(p, pl, _)| (p, pl)).unwrap_or((0.0, false));
+                        let loaded = self.is_audio_loaded(&entry.path);
+                        let (pos, playing, looping, sel_lo, sel_hi) = self
+                            .audio_player
+                            .as_ref()
+                            .filter(|_| loaded)
+                            .map(|ap| {
+                                (
+                                    ap.pos(),
+                                    ap.is_playing(),
+                                    ap.looping,
+                                    ap.sel_start,
+                                    ap.sel_end,
+                                )
+                            })
+                            .unwrap_or((0.0, false, self.audio_autoplay, 0.0, dur));
+                        // Transport row.
                         ui.horizontal(|ui| {
-                            if ui.button(if playing { "⏸" } else { "▶" }).clicked() {
+                            if ui
+                                .button(if playing { "⏸" } else { "▶" })
+                                .on_hover_text("Play / pause (Space)")
+                                .clicked()
+                            {
                                 want_audio_toggle = Some(entry.path.clone());
                             }
-                            let mut p = pos.min(dur);
-                            let slider = ui.add(
-                                egui::Slider::new(&mut p, 0.0..=dur)
-                                    .show_value(false)
-                                    .trailing_fill(true),
-                            );
-                            if slider.dragged() || slider.changed() {
-                                want_audio_seek = Some(p);
+                            if ui.button("⏹").on_hover_text("Stop").clicked() {
+                                want_audio_stop = true;
+                            }
+                            let mut lp = looping;
+                            if ui
+                                .toggle_value(&mut lp, "🔁")
+                                .on_hover_text("Loop the selection")
+                                .changed()
+                            {
+                                want_audio_loop = Some(lp);
+                            }
+                            let mut ap_on = self.audio_autoplay;
+                            if ui
+                                .checkbox(&mut ap_on, "Autoplay")
+                                .on_hover_text("Play on select + loop until you press Stop")
+                                .changed()
+                            {
+                                want_autoplay = Some(ap_on);
                             }
                             let mm = |s: f32| format!("{}:{:02}", (s as u64) / 60, (s as u64) % 60);
                             ui.weak(format!("{} / {}", mm(pos), mm(dur)));
                         });
+                        ui.add_space(4.0);
+                        // Interactive waveform (drawn once the file is loaded → we have peaks):
+                        // hi-res bars, a shaded loop region, and a moving playhead. Drag to set
+                        // the loop region; click to seek.
+                        if let Some(ap) = self.audio_player.as_ref().filter(|_| loaded) {
+                            let h = 96.0;
+                            let (rect, resp) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), h),
+                                egui::Sense::click_and_drag(),
+                            );
+                            let p = ui.painter_at(rect);
+                            p.rect_filled(rect, 3.0, egui::Color32::from_rgb(16, 18, 24));
+                            let w = rect.width().max(1.0);
+                            let x_of = |t: f32| rect.left() + (t / dur).clamp(0.0, 1.0) * w;
+                            // Loop-region shading.
+                            p.rect_filled(
+                                egui::Rect::from_x_y_ranges(
+                                    x_of(sel_lo)..=x_of(sel_hi),
+                                    rect.y_range(),
+                                ),
+                                0.0,
+                                egui::Color32::from_rgba_unmultiplied(88, 196, 172, 34),
+                            );
+                            // Hi-res waveform bars (peaks resampled to pixel columns), the
+                            // selected span brighter.
+                            let mid = rect.center().y;
+                            let cols = w as usize;
+                            let n = ap.peaks.len().max(1);
+                            for cx in 0..cols {
+                                let a = cx * n / cols.max(1);
+                                let b = ((cx + 1) * n / cols.max(1)).max(a + 1).min(n);
+                                let peak = ap.peaks[a..b].iter().copied().fold(0.0, f32::max);
+                                let half = (peak * (h * 0.44)).max(0.5);
+                                let x = rect.left() + cx as f32;
+                                let t = (cx as f32 / w) * dur;
+                                let col = if t >= sel_lo && t <= sel_hi {
+                                    egui::Color32::from_rgb(120, 220, 190)
+                                } else {
+                                    egui::Color32::from_rgb(66, 104, 96)
+                                };
+                                p.line_segment(
+                                    [egui::pos2(x, mid - half), egui::pos2(x, mid + half)],
+                                    egui::Stroke::new(1.0, col),
+                                );
+                            }
+                            // Moving playhead.
+                            let phx = x_of(pos);
+                            p.vline(
+                                phx,
+                                rect.y_range(),
+                                egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 224, 130)),
+                            );
+                            // Interaction: drag → loop region; click → seek.
+                            let t_at = |x: f32| (((x - rect.left()) / w).clamp(0.0, 1.0)) * dur;
+                            if resp.drag_started() {
+                                self.audio_drag = resp.interact_pointer_pos().map(|pp| t_at(pp.x));
+                            }
+                            if resp.dragged() {
+                                if let (Some(a), Some(pp)) =
+                                    (self.audio_drag, resp.interact_pointer_pos())
+                                {
+                                    let b = t_at(pp.x);
+                                    want_audio_select = Some((a.min(b), a.max(b)));
+                                }
+                            }
+                            if resp.drag_stopped() {
+                                self.audio_drag = None;
+                                want_audio_commit = true; // play the freshly-set region
+                            }
+                            if resp.clicked() {
+                                if let Some(pp) = resp.interact_pointer_pos() {
+                                    want_audio_seek = Some(t_at(pp.x));
+                                }
+                            }
+                            ui.weak("drag: set loop region · click: seek");
+                        }
                         ui.add_space(4.0);
                     }
                     ui.horizontal(|ui| {
@@ -4595,22 +4685,44 @@ impl PixelView {
         if want_open_default {
             self.open_in_default_app(&entry.path);
         }
+        if let Some(b) = want_autoplay {
+            self.audio_autoplay = b;
+        }
+        if let Some((lo, hi)) = want_audio_select {
+            if let Some(ap) = &mut self.audio_player {
+                ap.sel_start = lo;
+                ap.sel_end = hi.max(lo + 0.01);
+            }
+        }
+        if let Some(b) = want_audio_loop {
+            if let Some(ap) = &mut self.audio_player {
+                ap.looping = b;
+                if ap.is_playing() {
+                    ap.play_region(); // re-append with/without the infinite repeat
+                }
+            }
+        }
+        if want_audio_commit {
+            if let Some(ap) = &mut self.audio_player {
+                if ap.is_playing() || self.audio_autoplay {
+                    ap.play_region();
+                }
+            }
+        }
         if let Some(p) = want_audio_toggle {
             self.toggle_audio(&p);
         }
+        if want_audio_stop {
+            self.stop_audio();
+        }
         if let Some(secs) = want_audio_seek {
             if let Some(ap) = &self.audio_player {
-                let _ = ap
-                    .player
-                    .try_seek(std::time::Duration::from_secs_f32(secs.max(0.0)));
+                let rel = (secs - ap.region_start).clamp(0.0, ap.region_len);
+                let _ = ap.player.try_seek(std::time::Duration::from_secs_f32(rel));
             }
         }
-        // Keep repainting while a preview is playing so the seek bar tracks the playhead.
-        if self
-            .audio_player
-            .as_ref()
-            .is_some_and(|ap| !ap.player.is_paused() && !ap.player.empty())
-        {
+        // Keep repainting while a preview is playing so the playhead + seek bar track it.
+        if self.audio_player.as_ref().is_some_and(|ap| ap.is_playing()) {
             self.want_repaint = true;
         }
     }
@@ -9413,6 +9525,15 @@ impl eframe::App for PixelView {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.immersive));
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.immersive));
         }
+        // Space plays/pauses the loaded audio preview (only when one exists, so it doesn't
+        // steal Space from anything else). Restarts a finished clip.
+        if !typing && self.audio_player.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Space))
+        {
+            if let Some(ap) = &mut self.audio_player {
+                ap.toggle();
+            }
+            self.want_repaint = true;
+        }
         // Which chrome edges are visible: all of them normally; in immersive mode only the
         // edge the mouse is hovering (within EDGE px of the window border).
         let mut hide_cursor = false;
@@ -10229,6 +10350,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::PLUGIN_PDF_KEY, &self.plugin_pdf);
         eframe::set_value(storage, Self::PLUGIN_AUDIO_KEY, &self.plugin_audio);
         eframe::set_value(storage, Self::PLUGIN_CODE_KEY, &self.plugin_code);
+        eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
         // Remember where we were. Save the *display* path, not `self.folder`: inside an
         // archive / downloaded 16colo pack, `self.folder` is a temp dir that's gone next
         // launch, whereas the display path (`pack.zip/…`, `<16colo.rs>/year/pack`) is
@@ -11855,13 +11977,148 @@ fn make_entry(path: PathBuf, is_dir: bool) -> Entry {
 /// Hover-tooltip contents for a grid tile.
 /// A deferred right-click-menu choice for a grid tile / table row — applied by the
 /// caller (which holds `&mut self`), so the menu closure needn't borrow `self`.
-/// The in-app audio preview player (rodio). Holds the open output device alive (`_stream`
-/// must outlive `player`) plus which file is loaded and its duration for the seek bar.
+/// The in-app audio preview player (rodio). Decodes the file to interleaved samples ONCE so
+/// it can freely (re)start, loop, play a drag-selected region, and draw a moving playhead —
+/// each play appends a fresh `SamplesBuffer` of the region to a new `Player` on the held
+/// output device (`_stream` must outlive `player`).
 struct AudioPlayer {
     _stream: rodio::MixerDeviceSink,
     player: rodio::Player,
     path: PathBuf,
+    samples: Vec<rodio::Sample>, // interleaved, native rate/channels
+    channels: rodio::ChannelCount,
+    sample_rate: rodio::SampleRate,
     duration: f32,
+    peaks: Vec<f32>, // hi-res mono peak envelope (0..1) for the interactive waveform
+    sel_start: f32,  // playback region start (seconds); 0 = file start
+    sel_end: f32,    // playback region end (seconds); == duration = to the end
+    looping: bool,
+    region_start: f32, // start of the currently-appended source (for the playhead)
+    region_len: f32,   // its length (for the loop-modulo playhead)
+    started: bool,     // a source has been appended at least once
+}
+
+impl AudioPlayer {
+    /// Decode `bytes` and open the default device. `Err` if the format can't be decoded
+    /// in-app, or no output device is available (caller shows the message in the status bar).
+    fn open(path: &Path, bytes: Vec<u8>) -> Result<Self, String> {
+        use rodio::Source;
+        let decoder = rodio::Decoder::new(std::io::Cursor::new(bytes))
+            .map_err(|_| "can't decode this audio format in-app".to_string())?;
+        let channels = decoder.channels();
+        let sample_rate = decoder.sample_rate();
+        let samples: Vec<rodio::Sample> = decoder.collect();
+        let ch = channels.get() as usize;
+        let sr = sample_rate.get() as f32;
+        let frames = samples.len() / ch.max(1);
+        let duration = frames as f32 / sr;
+        let peaks = compute_peaks(&samples, ch, 2400);
+        let stream = rodio::DeviceSinkBuilder::open_default_sink().map_err(|e| e.to_string())?;
+        let player = rodio::Player::connect_new(stream.mixer());
+        Ok(Self {
+            _stream: stream,
+            player,
+            path: path.to_path_buf(),
+            samples,
+            channels,
+            sample_rate,
+            duration,
+            peaks,
+            sel_start: 0.0,
+            sel_end: duration,
+            looping: false,
+            region_start: 0.0,
+            region_len: duration.max(0.0001),
+            started: false,
+        })
+    }
+
+    /// (Re)start playback of the selected region on a fresh player (so a finished/looping
+    /// source is cleanly replaced), respecting the loop flag.
+    fn play_region(&mut self) {
+        use rodio::Source;
+        let ch = self.channels.get() as usize;
+        let sr = self.sample_rate.get() as f32;
+        let n = self.samples.len();
+        let start = self.sel_start.clamp(0.0, self.duration);
+        let end = self.sel_end.clamp(start, self.duration);
+        let s = (((start * sr) as usize) * ch).min(n);
+        let e = (((end * sr) as usize) * ch).min(n).max(s);
+        let region: Vec<rodio::Sample> = self.samples[s..e].to_vec();
+        let buf = rodio::buffer::SamplesBuffer::new(self.channels, self.sample_rate, region);
+        let player = rodio::Player::connect_new(self._stream.mixer());
+        if self.looping {
+            player.append(buf.repeat_infinite());
+        } else {
+            player.append(buf);
+        }
+        player.play();
+        self.player = player;
+        self.region_start = s as f32 / ch as f32 / sr;
+        self.region_len = ((e - s) as f32 / ch as f32 / sr).max(0.0001);
+        self.started = true;
+    }
+
+    /// Play/pause; a finished (or never-started) player restarts the region.
+    fn toggle(&mut self) {
+        if !self.started || self.player.empty() {
+            self.play_region();
+        } else if self.player.is_paused() {
+            self.player.play();
+        } else {
+            self.player.pause();
+        }
+    }
+
+    fn stop(&mut self) {
+        self.player.stop();
+        self.started = false;
+    }
+
+    fn is_playing(&self) -> bool {
+        self.started && !self.player.is_paused() && !self.player.empty()
+    }
+
+    /// The current playhead position in seconds (loop-aware).
+    fn pos(&self) -> f32 {
+        if !self.started {
+            return self.sel_start;
+        }
+        let elapsed = self.player.get_pos().as_secs_f32();
+        if self.looping {
+            self.region_start + (elapsed % self.region_len)
+        } else {
+            (self.region_start + elapsed).min(self.sel_end)
+        }
+    }
+}
+
+/// A mono peak envelope (0..1), `buckets` wide, from interleaved samples — for drawing the
+/// waveform at higher resolution than the decoder tile.
+fn compute_peaks(samples: &[rodio::Sample], channels: usize, buckets: usize) -> Vec<f32> {
+    let frames = samples.len() / channels.max(1);
+    if frames == 0 {
+        return vec![0.0; buckets];
+    }
+    let mut out = vec![0.0f32; buckets];
+    let mut peak = 0f32;
+    for (b, o) in out.iter_mut().enumerate() {
+        let f0 = b * frames / buckets;
+        let f1 = ((b + 1) * frames / buckets).max(f0 + 1).min(frames);
+        let mut m = 0f32;
+        for f in f0..f1 {
+            for c in 0..channels {
+                m = m.max(samples[f * channels + c].abs());
+            }
+        }
+        *o = m;
+        peak = peak.max(m);
+    }
+    let norm = peak.max(1e-4);
+    for o in out.iter_mut() {
+        *o /= norm;
+    }
+    out
 }
 
 enum TilePick {
