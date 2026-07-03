@@ -842,14 +842,20 @@ Extraction is synchronous on the UI thread (a huge multi-hundred-MB SF2 can hitc
 it's cached after). **REX/RX2** aren't supported: the format is proprietary (RX2 audio is DWOP-
 compressed) — decodable only by porting a reverse-engineered codec; deferred, not shipped.
 
-**Decode cache (CPU-intense work).** A tracker module re-synthesizes seconds of audio via `xmrs`
-on every open. `AudioPlayer::open` is split into the device-free `decode_audio` → `DecodedAudio`
-(the costly step) and `AudioPlayer::from_decoded` (opens the rodio device). `ensure_audio_loaded`
-/ `toggle_audio` go through `decode_audio_cached`: a path+mtime-keyed LRU (`audio_decode_cache`,
-~192 MB budget) so **revisiting a file clones the cached decode instead of re-synthesizing**. Other
-CPU work is already cached (thumbnails `thumb_tex`, `img_meta`, archive/soundfont extraction dirs,
-recolor tiles, minimap, SAUCE); a *persistent on-disk* thumbnail cache (across restarts) is the
-remaining unbuilt win.
+**Decode cache + async load (CPU-intense work).** A tracker re-synthesizes seconds of audio via
+`xmrs`, and a MIDI SoundFont can be 100+ MB to load — both far too slow for the UI thread.
+`AudioPlayer::open` is split into the device-free `decode_audio` → `DecodedAudio` (the costly step)
+and `AudioPlayer::from_decoded` (opens the rodio device). `ensure_audio_loaded`/`toggle_audio` call
+**`start_audio_load`**: a `decode_from_cache` hit builds instantly (a memcpy — path+mtime-keyed LRU
+`audio_decode_cache`, ~192 MB), a **miss spawns a worker thread** (reads bytes, loads the MIDI
+SoundFont if needed, runs `decode_audio`, sends `DecodedAudio` + the `Arc<SoundFont>` back).
+`poll_audio_load` (each frame) caches the result and builds the player; `paint_audio_loading_overlay`
+dims the viewport + shows an **animated Spinner + "Loading …"** (delayed 0.2s so quick loads don't
+flash) — so a slow load reads as *working*, not frozen. `load_full` cancels a pending load on
+navigation. Other CPU work is already cached (thumbnails `thumb_tex`, `img_meta`, archive/soundfont
+extraction dirs, recolor tiles, minimap, SAUCE); a *persistent on-disk* thumbnail cache (across
+restarts) is the remaining unbuilt win. NB **sample-bank extraction** (entering a big `.sf2`) is
+still synchronous — the same worker+spinner pattern could wrap it if it bites.
 
 `rodio → cpal → alsa-sys` needs **`libasound2-dev` at BUILD time** on Linux (added to CI + the
 first-time-deps list above), so `rodio`/`xmrs`/`midir` are normal (non-feature-gated) deps
