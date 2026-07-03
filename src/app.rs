@@ -13307,9 +13307,28 @@ fn is_tracker_ext(ext: &str) -> bool {
     matches!(ext, "mod" | "xm" | "s3m" | "it" | "mtm" | "stm" | "mptm")
 }
 
-/// Extensions we render through the rustysynth SoundFont synthesizer (standard MIDI files).
+/// Extensions we render through the rustysynth SoundFont synthesizer (standard MIDI + RMID).
 fn is_midi_ext(ext: &str) -> bool {
-    matches!(ext, "mid" | "midi" | "kar")
+    matches!(ext, "mid" | "midi" | "kar" | "rmi")
+}
+
+/// If `bytes` is an RMID (RIFF-wrapped MIDI, `.rmi`) file, return its inner Standard MIDI `data`
+/// chunk; otherwise return `bytes` unchanged — so `.rmi` plays through the normal MIDI path.
+fn rmid_inner(bytes: &[u8]) -> &[u8] {
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"RMID" {
+        let mut i = 12;
+        while i + 8 <= bytes.len() {
+            let sz = u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]])
+                as usize;
+            let start = i + 8;
+            let end = (start + sz).min(bytes.len());
+            if &bytes[i..i + 4] == b"data" {
+                return &bytes[start..end];
+            }
+            i = start + sz + (sz & 1); // next chunk (word-aligned)
+        }
+    }
+    bytes
 }
 
 /// Render a standard MIDI file to interleaved-stereo f32 by synthesizing it through `sound_font`
@@ -13327,7 +13346,8 @@ fn render_midi(
     let synth = Synthesizer::new(sound_font, &settings).map_err(|e| format!("synth: {e:?}"))?;
     let mut seq = MidiFileSequencer::new(synth);
     let midi = Arc::new(
-        MidiFile::new(&mut std::io::Cursor::new(bytes)).map_err(|_| "not a MIDI file".to_string())?,
+        MidiFile::new(&mut std::io::Cursor::new(rmid_inner(bytes)))
+            .map_err(|_| "not a MIDI file".to_string())?,
     );
     let secs = midi.get_length() + 1.0; // +1s tail so the last notes ring out
     seq.play(&midi, false);
@@ -16802,6 +16822,23 @@ mod hold_test {
         h.event(down(c, false));
         h.run();
         assert_eq!(h.state().flash, None, "released -> normal");
+    }
+
+    #[test]
+    fn rmid_unwraps_riff_wrapped_midi() {
+        // A minimal RMID: RIFF("RMID"){ data(<smf bytes>) }.
+        let smf = b"MThd\x00\x00\x00\x06\x00\x00\x00\x01\x00\x60payload";
+        let mut data = b"data".to_vec();
+        data.extend_from_slice(&(smf.len() as u32).to_le_bytes());
+        data.extend_from_slice(smf);
+        let mut body = b"RMID".to_vec();
+        body.extend_from_slice(&data);
+        let mut rmi = b"RIFF".to_vec();
+        rmi.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        rmi.extend_from_slice(&body);
+        assert_eq!(super::rmid_inner(&rmi), smf, "RMID → inner SMF");
+        // A plain SMF is returned unchanged.
+        assert_eq!(super::rmid_inner(smf), smf, "plain SMF passes through");
     }
 
     #[test]
