@@ -807,6 +807,8 @@ pub struct PixelView {
     midi_conn: Option<midir::MidiInputConnection<std::sync::mpsc::Sender<MidiNoteEvent>>>,
     midi_port: Option<String>, // chosen MIDI input device name (persisted)
     midi_ports: Vec<String>,   // last-enumerated device names (for the picker combo)
+    midi_sf: Option<PathBuf>,  // General MIDI SoundFont for playing .mid files (persisted; None = auto-detect)
+    midi_sf_cache: Option<(PathBuf, std::sync::Arc<rustysynth::SoundFont>)>, // loaded GM SoundFont (once/session)
     palettes: HashMap<PathBuf, Option<Vec<[u8; 4]>>>, // details swatches; None = too many colors
     thumb_rgba: HashMap<PathBuf, (usize, usize, Vec<u8>)>, // thumb CPU pixels (for grid recolor)
     grid_recolor: HashMap<PathBuf, (String, egui::TextureHandle)>, // recolored grid tiles, per recolor key
@@ -1096,6 +1098,8 @@ impl PixelView {
     const AUDIO_MUTED_KEY: &'static str = "audio_muted";
     /// Chosen MIDI input device (name; reconnected on launch if still present).
     const MIDI_PORT_KEY: &'static str = "midi_port";
+    /// General MIDI SoundFont path for rendering `.mid` files ("" = auto-detect a system one).
+    const MIDI_SF_KEY: &'static str = "midi_soundfont";
     /// Storage key for the last-opened folder (reopened on launch).
     const FOLDER_KEY: &'static str = "last_folder";
     /// Storage keys for sort & filter state.
@@ -1195,6 +1199,11 @@ impl PixelView {
             }
             _ => (None, None, saved_midi.clone()),
         };
+        let midi_sf = cc
+            .storage
+            .and_then(|s| eframe::get_value::<String>(s, Self::MIDI_SF_KEY))
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
         registry.set_plugin("pdf", plugin_pdf);
         registry.set_plugin("audio", plugin_audio);
         registry.set_plugin("code", plugin_code);
@@ -1541,6 +1550,8 @@ impl PixelView {
             midi_conn,
             midi_port,
             midi_ports,
+            midi_sf,
+            midi_sf_cache: None,
             palettes: HashMap::new(),
             thumb_rgba: HashMap::new(),
             grid_recolor: HashMap::new(),
@@ -2403,6 +2414,48 @@ impl PixelView {
         self.midi_ports = midi_input_port_names();
     }
 
+    /// The General MIDI SoundFont used to render `.mid` files: the user's configured one if set
+    /// and present, else the first common system GM soundfont found (fluidsynth/timidity ship
+    /// these). `None` → MIDI can't be synthesized (the player shows a "set one" message).
+    fn midi_soundfont(&self) -> Option<PathBuf> {
+        if let Some(p) = &self.midi_sf {
+            if p.is_file() {
+                return Some(p.clone());
+            }
+        }
+        // Prefer a *small* GM soundfont (TimGM6mb ≈ 6 MB loads sub-second) over a system default
+        // that may point at a 100+ MB FluidR3 — the load is synchronous, so size = responsiveness.
+        // The user can pick a bigger, better one in Preferences.
+        const CANDIDATES: &[&str] = &[
+            "/usr/share/sounds/sf2/TimGM6mb.sf2",
+            "/usr/share/soundfonts/TimGM6mb.sf2",
+            "/usr/share/sounds/sf2/default-GM.sf2",
+            "/usr/share/soundfonts/default.sf2",
+            "/usr/share/soundfonts/default-GM.sf2",
+            "/usr/share/sounds/sf2/FluidR3_GM.sf2",
+            "/usr/share/soundfonts/FluidR3_GM.sf2",
+        ];
+        CANDIDATES
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_file())
+    }
+
+    /// The GM SoundFont **loaded** into memory, cached for the session — a system default can be
+    /// 100+ MB, so we parse it once (not per MIDI). `None` if none is available or it won't parse.
+    fn midi_soundfont_arc(&mut self) -> Option<std::sync::Arc<rustysynth::SoundFont>> {
+        let path = self.midi_soundfont()?;
+        if let Some((p, sf)) = &self.midi_sf_cache {
+            if *p == path {
+                return Some(sf.clone());
+            }
+        }
+        let mut f = std::fs::File::open(&path).ok()?;
+        let sf = std::sync::Arc::new(rustysynth::SoundFont::new(&mut f).ok()?);
+        self.midi_sf_cache = Some((path, sf.clone()));
+        Some(sf)
+    }
+
     /// (Dis)connect the chosen MIDI input device. `None` closes any open port. Dropping the
     /// old connection closes it before a new one opens.
     fn connect_midi(&mut self, port: Option<String>) {
@@ -2520,8 +2573,26 @@ impl PixelView {
             return Some(decoded);
         }
         // Miss: read + decode (the costly step), cache it, and evict to the byte budget.
+        // MIDI files need a (cached) SoundFont to synthesize through — resolve it here.
         let bytes = std::fs::read(&real).ok()?;
-        let decoded = decode_audio(path, bytes).ok()?;
+        let midi_sf = if is_midi_ext(
+            &real
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .unwrap_or_default(),
+        ) {
+            self.midi_soundfont_arc()
+        } else {
+            None
+        };
+        let decoded = match decode_audio(path, bytes, midi_sf) {
+            Ok(d) => d,
+            Err(e) => {
+                self.status = e;
+                return None;
+            }
+        };
         self.audio_decode_cache
             .insert(0, (path.to_path_buf(), sig, decoded.clone()));
         let mut total = 0usize;
@@ -10933,6 +11004,42 @@ impl eframe::App for PixelView {
                         prefs_refresh = true; // re-scan so the listing adds/drops those types
                     }
 
+                    // MIDI needs a General MIDI SoundFont to synthesize .mid files into audio.
+                    if self.plugin_audio {
+                        ui.add_space(8.0);
+                        ui.label("MIDI SoundFont");
+                        let auto = self.midi_soundfont();
+                        let shown = match (&self.midi_sf, &auto) {
+                            (Some(p), _) if p.is_file() => short_name(p),
+                            (_, Some(p)) => format!("auto: {}", short_name(p)),
+                            _ => "none found — .mid files won't play".to_string(),
+                        };
+                        ui.weak(format!("Synthesizes .mid files · {shown}"));
+                        ui.horizontal(|ui| {
+                            if ui.button("Choose .sf2…").clicked() {
+                                if let Some(p) = rfd::FileDialog::new()
+                                    .add_filter("SoundFont", &["sf2"])
+                                    .pick_file()
+                                {
+                                    self.midi_sf = Some(p);
+                                    self.midi_sf_cache = None; // reload the new SF
+                                    self.audio_decode_cache.clear(); // re-render with it
+                                    self.status = "MIDI SoundFont set".into();
+                                }
+                            }
+                            if self.midi_sf.is_some()
+                                && ui
+                                    .button("Auto")
+                                    .on_hover_text("Auto-detect a system General MIDI SoundFont")
+                                    .clicked()
+                            {
+                                self.midi_sf = None;
+                                self.midi_sf_cache = None;
+                                self.audio_decode_cache.clear();
+                            }
+                        });
+                    }
+
                     ui.add_space(10.0);
                     ui.label("16colo.rs cache");
                     let (bytes, count) = crate::cache::stats();
@@ -11111,6 +11218,15 @@ impl eframe::App for PixelView {
             storage,
             Self::MIDI_PORT_KEY,
             &self.midi_port.clone().unwrap_or_default(),
+        );
+        eframe::set_value(
+            storage,
+            Self::MIDI_SF_KEY,
+            &self
+                .midi_sf
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
         );
         // Remember where we were. Save the *display* path, not `self.folder`: inside an
         // archive / downloaded 16colo pack, `self.folder` is a temp dir that's gone next
@@ -12867,7 +12983,7 @@ impl AudioPlayer {
     /// `from_decoded` for callers that don't consult the decode cache.
     #[cfg(test)]
     fn open(path: &Path, bytes: Vec<u8>) -> Result<Self, String> {
-        Self::from_decoded(path, decode_audio(path, bytes)?)
+        Self::from_decoded(path, decode_audio(path, bytes, None)?)
     }
 
     /// Wrap already-decoded audio in a fresh device-bound player. `Err` only if no output
@@ -13070,6 +13186,44 @@ fn is_tracker_ext(ext: &str) -> bool {
     matches!(ext, "mod" | "xm" | "s3m" | "it" | "mtm" | "stm" | "mptm")
 }
 
+/// Extensions we render through the rustysynth SoundFont synthesizer (standard MIDI files).
+fn is_midi_ext(ext: &str) -> bool {
+    matches!(ext, "mid" | "midi" | "kar")
+}
+
+/// Render a standard MIDI file to interleaved-stereo f32 by synthesizing it through `sound_font`
+/// (a General MIDI SoundFont), so it feeds the same player/waveform/keyboard path as PCM audio.
+/// A MIDI file is only note events — the SoundFont supplies the actual instrument samples. The
+/// (potentially large) SoundFont is loaded + cached by the caller, not re-read per render.
+fn render_midi(
+    bytes: &[u8],
+    sound_font: &std::sync::Arc<rustysynth::SoundFont>,
+) -> Result<(Vec<rodio::Sample>, rodio::ChannelCount, rodio::SampleRate), String> {
+    use rustysynth::{MidiFile, MidiFileSequencer, Synthesizer, SynthesizerSettings};
+    use std::sync::Arc;
+    let sr = 44_100i32;
+    let settings = SynthesizerSettings::new(sr);
+    let synth = Synthesizer::new(sound_font, &settings).map_err(|e| format!("synth: {e:?}"))?;
+    let mut seq = MidiFileSequencer::new(synth);
+    let midi = Arc::new(
+        MidiFile::new(&mut std::io::Cursor::new(bytes)).map_err(|_| "not a MIDI file".to_string())?,
+    );
+    let secs = midi.get_length() + 1.0; // +1s tail so the last notes ring out
+    seq.play(&midi, false);
+    let frames = (((sr as f64) * secs).ceil() as usize).clamp(1, sr as usize * 3600);
+    let mut left = vec![0f32; frames];
+    let mut right = vec![0f32; frames];
+    seq.render(&mut left, &mut right);
+    let mut samples = Vec::with_capacity(frames * 2);
+    for i in 0..frames {
+        samples.push(left[i]);
+        samples.push(right[i]);
+    }
+    let ch = std::num::NonZeroU16::new(2).unwrap();
+    let rate = std::num::NonZeroU32::new(sr as u32).unwrap();
+    Ok((samples, ch, rate))
+}
+
 /// A note event from a hardware MIDI controller: `(note 0..127, velocity 0..127, on)`.
 type MidiNoteEvent = (u8, u8, bool);
 
@@ -13126,7 +13280,11 @@ fn open_midi_port(
 /// interleaved f32 samples + a peak envelope, and (for trackers) pull out the sample bank.
 /// Tracker modules go through `xmrs` (synthesis — can take seconds), everything else through
 /// rodio's PCM/compressed decoders. Cached by the app so a revisit skips all of this.
-fn decode_audio(path: &Path, bytes: Vec<u8>) -> Result<DecodedAudio, String> {
+fn decode_audio(
+    path: &Path,
+    bytes: Vec<u8>,
+    midi_sf: Option<std::sync::Arc<rustysynth::SoundFont>>,
+) -> Result<DecodedAudio, String> {
     use rodio::Source;
     let ext = path
         .extension()
@@ -13138,6 +13296,13 @@ fn decode_audio(path: &Path, bytes: Vec<u8>) -> Result<DecodedAudio, String> {
         // pull out its individual samples for the explorer/keyboard/export.
         let (s, c, r) = render_tracker(&bytes)?;
         (s, c, r, extract_tracker_samples(&bytes))
+    } else if is_midi_ext(&ext) {
+        // A MIDI file: synthesize it through a General MIDI SoundFont (note events → audio).
+        let sf = midi_sf.ok_or_else(|| {
+            "no General MIDI SoundFont — set one in Preferences → MIDI SoundFont".to_string()
+        })?;
+        let (s, c, r) = render_midi(&bytes, &sf)?;
+        (s, c, r, Vec::new())
     } else {
         let decoder = rodio::Decoder::new(std::io::Cursor::new(bytes))
             .map_err(|_| "can't decode this audio format in-app".to_string())?;
