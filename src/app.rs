@@ -788,6 +788,7 @@ pub struct PixelView {
     thumb_tex: HashMap<PathBuf, egui::TextureHandle>,
     img_meta: HashMap<PathBuf, ImgMeta>,
     sauce_cache: HashMap<PathBuf, Option<crate::sauce::Sauce>>, // parsed SAUCE per path
+    pdf_cache: HashMap<PathBuf, Option<crate::decode::PdfMeta>>, // lazy PDF metadata for Details
     palettes: HashMap<PathBuf, Option<Vec<[u8; 4]>>>, // details swatches; None = too many colors
     thumb_rgba: HashMap<PathBuf, (usize, usize, Vec<u8>)>, // thumb CPU pixels (for grid recolor)
     grid_recolor: HashMap<PathBuf, (String, egui::TextureHandle)>, // recolored grid tiles, per recolor key
@@ -1448,6 +1449,7 @@ impl PixelView {
             thumb_tex: HashMap::new(),
             img_meta: HashMap::new(),
             sauce_cache: HashMap::new(),
+            pdf_cache: HashMap::new(),
             palettes: HashMap::new(),
             thumb_rgba: HashMap::new(),
             grid_recolor: HashMap::new(),
@@ -2155,6 +2157,26 @@ impl PixelView {
             .get(path)
             .cloned()
             .unwrap_or_else(|| path.to_path_buf())
+    }
+
+    /// Lazily parse + cache a PDF's metadata (page count / size / title / author) for the
+    /// Details pane. Reads the file once; `None` when it isn't a readable PDF.
+    fn pdf_info(&mut self, path: &Path) -> Option<crate::decode::PdfMeta> {
+        if !self.pdf_cache.contains_key(path) {
+            let real = self.resolve_local(path);
+            let meta = std::fs::read(&real)
+                .ok()
+                .and_then(|b| crate::decode::pdf_meta(&b));
+            self.pdf_cache.insert(path.to_path_buf(), meta);
+        }
+        self.pdf_cache.get(path).cloned().flatten()
+    }
+
+    /// Open a file in the OS default application (xdg-open / open / explorer). Used by the
+    /// Details "Open in default app" button for documents like PDFs.
+    fn open_in_default_app(&mut self, path: &Path) {
+        let o = os_file_manager();
+        self.launch_external(&o.exec, &o.args, &o.env, path);
     }
 
     /// A downloaded 16colo.rs pack zip finished: extract + mount it (with the
@@ -4115,6 +4137,7 @@ impl PixelView {
         // Deferred: the Save dialogs run after the closure (needs `&mut self`).
         let mut want_download = false;
         let mut want_pack: Option<PathBuf> = None;
+        let mut want_open_default = false; // "Open in default app" (PDF)
         let disp = self.to_display(&entry.path);
         // Inspecting a downloadable pack folder (it has a fetched zip URL). Keyed off
         // `remote_urls`, not path depth, so `groups/<g>` / `artists/<a>` listing folders
@@ -4171,6 +4194,17 @@ impl PixelView {
                     let meta = self.img_meta.get(&entry.path).copied();
                     // View history (count + last-viewed) for the stats rows below.
                     let views = self.view_record(&entry.path);
+                    // PDF: parse (cached) page count / size / title / author for the info rows.
+                    let is_pdf = entry
+                        .path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+                    let pdf = if is_pdf {
+                        self.pdf_info(&entry.path)
+                    } else {
+                        None
+                    };
                     // Plain thumbnail (the recolored preview lives in the Recolor pane).
                     if let Some(tex) = self.thumb_tex.get(&entry.path) {
                         let tsz = tex.size_vec2();
@@ -4218,7 +4252,29 @@ impl PixelView {
                                 fmt
                             });
                             ui.end_row();
-                            if let Some(m) = meta {
+                            if let Some(p) = &pdf {
+                                // PDF-specific info instead of the placeholder tile's dims.
+                                ui.weak("Pages");
+                                ui.label(p.pages.to_string());
+                                ui.end_row();
+                                ui.weak("Page size");
+                                ui.label(format!(
+                                    "{} × {} pt",
+                                    p.width_pt.round() as i32,
+                                    p.height_pt.round() as i32
+                                ));
+                                ui.end_row();
+                                if !p.title.trim().is_empty() {
+                                    ui.weak("Title");
+                                    ui.label(p.title.trim());
+                                    ui.end_row();
+                                }
+                                if !p.author.trim().is_empty() {
+                                    ui.weak("Author");
+                                    ui.label(p.author.trim());
+                                    ui.end_row();
+                                }
+                            } else if let Some(m) = meta {
                                 ui.weak("Dimensions");
                                 ui.label(format!("{} × {}", m.w, m.h));
                                 ui.end_row();
@@ -4272,6 +4328,15 @@ impl PixelView {
                                 .clicked()
                         {
                             want_pack = mount_pack.clone();
+                        }
+                        // Documents (PDF): open in the OS default viewer/editor.
+                        if is_pdf
+                            && ui
+                                .button("➡ Open in default app")
+                                .on_hover_text("Open this PDF in your OS default viewer/editor")
+                                .clicked()
+                        {
+                            want_open_default = true;
                         }
                     });
                     // SAUCE metadata — always shown for scene art / 16colo pieces so the
@@ -4342,6 +4407,9 @@ impl PixelView {
         }
         if let Some(vpath) = want_pack {
             self.download_pack(&vpath);
+        }
+        if want_open_default {
+            self.open_in_default_app(&entry.path);
         }
     }
 
@@ -11611,6 +11679,12 @@ fn opener_presets() -> Vec<Opener> {
         mk("Inkscape", "inkscape", "svg"),
         mk("Moebius", "moebius", "ans asc nfo diz xb xbin bin"),
         mk("PabloDraw", "pablodraw", "ans asc nfo diz xb xbin bin rip"),
+        mk("PDF viewer", "xdg-open", "pdf"),
+        mk(
+            "Text editor",
+            "xdg-open",
+            "txt md log rs c cpp h py js ts json toml yaml",
+        ),
     ]
 }
 
@@ -12493,7 +12567,7 @@ fn is_image_ext(p: &std::path::Path) -> bool {
         "png", "jpg", "jpeg", "gif", "bmp", "webp", "tga", "tif", "tiff", "ppm", "pgm", "pbm",
         "pnm", "qoi", "pcx", "psd", "aseprite", "ase", "xcf", "draw", "ico", "svg", "ans", "asc",
         "nfo", "diz", "txt", "xb", "xbin", "bin", "ice", "cia", "tnd", "idf", "adf", "seq", "pet",
-        "petscii", "petmate", "rip",
+        "petscii", "petmate", "rip", "pdf",
     ];
     match p.extension().and_then(|x| x.to_str()) {
         Some(x) => {

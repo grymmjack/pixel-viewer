@@ -15,6 +15,10 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 psd = "0.3.5"
 resvg = "0.47.0"
+# PDF metadata only (page count, MediaBox dimensions, /Info title+author) — pure Rust,
+# no system deps. We render a placeholder page tile + show info; real page rasterization
+# (pdfium) is a deferred, feature-gated fast-follow. default-features off keeps it lean.
+lopdf = { version = "0.43", default-features = false }
 # Read-only extraction of legacy + modern archives (zip/lha/arj/arc/zoo/7z/rar/…),
 # so archives can be browsed as virtual folders. Mike Krüger's crate (icy ecosystem).
 unarc-rs = "0.6"

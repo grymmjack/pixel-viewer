@@ -1,0 +1,343 @@
+//! PDF support (MVP): pure-Rust metadata via `lopdf` (page count, first-page size,
+//! /Info title + author) plus a recognizable placeholder "page" tile so PDFs appear in
+//! the grid, carry real dimensions, and get the right-click "Open in…" menu. Actual
+//! page rasterization + an in-app multi-page viewer are a deferred, feature-gated
+//! fast-follow (pdfium); for now double-click shows this tile and the user opens the
+//! file in their associated PDF editor.
+
+use super::cp437_font::CP437_8X16;
+use super::{DecodeError, Decoder};
+use crate::image_types::PixImage;
+
+/// Parsed PDF metadata for the Details pane (and to label the placeholder tile).
+#[derive(Clone, Default)]
+pub struct PdfMeta {
+    pub pages: usize,
+    pub width_pt: f32,
+    pub height_pt: f32,
+    pub title: String,
+    pub author: String,
+}
+
+/// Best-effort metadata parse — never panics; returns `None` only if lopdf can't load it.
+pub fn pdf_meta(bytes: &[u8]) -> Option<PdfMeta> {
+    let doc = lopdf::Document::load_mem(bytes).ok()?;
+    let pages = doc.get_pages();
+    let count = pages.len();
+    // First page MediaBox → page size in points (default US Letter if absent/odd).
+    let (mut w, mut h) = (612.0_f32, 792.0_f32);
+    if let Some((_, &pid)) = pages.iter().next() {
+        if let Some(mb) = media_box(&doc, pid) {
+            w = (mb[2] - mb[0]).abs();
+            h = (mb[3] - mb[1]).abs();
+            if w < 1.0 || h < 1.0 {
+                w = 612.0;
+                h = 792.0;
+            }
+        }
+    }
+    let (title, author) = info_strings(&doc);
+    Some(PdfMeta {
+        pages: count,
+        width_pt: w,
+        height_pt: h,
+        title,
+        author,
+    })
+}
+
+/// The page's MediaBox `[x0 y0 x1 y1]`, following `/Parent` inheritance.
+fn media_box(doc: &lopdf::Document, mut id: lopdf::ObjectId) -> Option<[f32; 4]> {
+    for _ in 0..32 {
+        let dict = doc.get_object(id).ok()?.as_dict().ok()?;
+        if let Ok(arr) = dict.get(b"MediaBox").and_then(|o| o.as_array()) {
+            let mut v = [0.0f32; 4];
+            for (i, o) in arr.iter().take(4).enumerate() {
+                v[i] = o
+                    .as_float()
+                    .or_else(|_| o.as_i64().map(|n| n as f32))
+                    .ok()?;
+            }
+            return Some(v);
+        }
+        // Walk up to the parent page-tree node.
+        id = dict.get(b"Parent").and_then(|o| o.as_reference()).ok()?;
+    }
+    None
+}
+
+/// /Info Title + Author, decoded best-effort (UTF-16BE BOM or Latin-1/PDFDoc).
+fn info_strings(doc: &lopdf::Document) -> (String, String) {
+    let get = |key: &[u8]| -> String {
+        doc.trailer
+            .get(b"Info")
+            .and_then(|o| o.as_reference())
+            .and_then(|id| doc.get_object(id))
+            .and_then(|o| o.as_dict())
+            .and_then(|d| d.get(key))
+            .and_then(|o| o.as_str())
+            .map(decode_pdf_string)
+            .unwrap_or_default()
+    };
+    (get(b"Title"), get(b"Author"))
+}
+
+fn decode_pdf_string(raw: &[u8]) -> String {
+    if raw.len() >= 2 && raw[0] == 0xFE && raw[1] == 0xFF {
+        // UTF-16BE.
+        let u16s: Vec<u16> = raw[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&u16s)
+    } else {
+        // PDFDocEncoding overlaps Latin-1 for the printable range; good enough here.
+        raw.iter().map(|&b| b as char).collect()
+    }
+}
+
+// Placeholder colors.
+const CANVAS: [u8; 4] = [24, 24, 30, 255];
+const PAGE: [u8; 4] = [242, 242, 236, 255];
+const BORDER: [u8; 4] = [168, 168, 168, 255];
+const RED: [u8; 4] = [198, 45, 45, 255];
+const DARK: [u8; 4] = [64, 64, 72, 255];
+const MID: [u8; 4] = [118, 118, 128, 255];
+
+/// Draw a recognizable PDF "page" tile: an off-white page at the true aspect ratio, a red
+/// PDF badge, and the page count + point size. This is the thumbnail *and* the viewer image.
+fn render_placeholder(meta: &PdfMeta) -> PixImage {
+    // Size the raster so the longer side is ~360px, preserving the page aspect.
+    let (pw, ph) = (meta.width_pt.max(1.0), meta.height_pt.max(1.0));
+    let long = 360.0;
+    let (w, h) = if pw >= ph {
+        (long, (long * ph / pw).round())
+    } else {
+        ((long * pw / ph).round(), long)
+    };
+    let (w, h) = (w.max(120.0) as usize, h.max(120.0) as usize);
+    let mut px = vec![CANVAS; w * h];
+
+    // Page rectangle inset from the canvas, with a border.
+    let inset = 10usize;
+    let (px0, py0, px1, py1) = (inset, inset, w - inset, h - inset);
+    fill_rect(&mut px, w, px0, py0, px1, py1, PAGE);
+    stroke_rect(&mut px, w, px0, py0, px1, py1, BORDER);
+
+    // Red PDF badge near the top, "PDF" scaled up.
+    let badge_h = (h / 7).clamp(28, 64);
+    fill_rect(
+        &mut px,
+        w,
+        px0 + 6,
+        py0 + 8,
+        px1 - 6,
+        py0 + 8 + badge_h,
+        RED,
+    );
+    let scale = (badge_h / 16).max(1);
+    let word = "PDF";
+    let tw = word.len() * 8 * scale;
+    let tx = px0 + 6 + ((px1 - px0 - 12).saturating_sub(tw)) / 2;
+    let ty = py0 + 8 + (badge_h.saturating_sub(16 * scale)) / 2;
+    blit_text(&mut px, w, tx, ty, word, [255, 255, 255, 255], scale);
+
+    // "N pages" centered below the badge.
+    let pages_line = if meta.pages == 1 {
+        "1 page".to_string()
+    } else {
+        format!("{} pages", meta.pages)
+    };
+    let s2 = (scale.saturating_sub(1)).max(1);
+    center_text(
+        &mut px,
+        w,
+        px0,
+        px1,
+        py0 + 8 + badge_h + 20,
+        &pages_line,
+        DARK,
+        s2,
+    );
+
+    // Point dimensions near the bottom.
+    let dims = format!(
+        "{} x {} pt",
+        meta.width_pt.round() as i32,
+        meta.height_pt.round() as i32
+    );
+    center_text(&mut px, w, px0, px1, py1.saturating_sub(24), &dims, MID, 1);
+
+    PixImage::from_rgba(w as u32, h as u32, px)
+}
+
+fn fill_rect(px: &mut [[u8; 4]], w: usize, x0: usize, y0: usize, x1: usize, y1: usize, c: [u8; 4]) {
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if x < w {
+                let i = y * w + x;
+                if i < px.len() {
+                    px[i] = c;
+                }
+            }
+        }
+    }
+}
+
+fn stroke_rect(
+    px: &mut [[u8; 4]],
+    w: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    c: [u8; 4],
+) {
+    for x in x0..x1 {
+        set(px, w, x, y0, c);
+        set(px, w, x, y1 - 1, c);
+    }
+    for y in y0..y1 {
+        set(px, w, x0, y, c);
+        set(px, w, x1 - 1, y, c);
+    }
+}
+
+fn set(px: &mut [[u8; 4]], w: usize, x: usize, y: usize, c: [u8; 4]) {
+    if x < w {
+        let i = y * w + x;
+        if i < px.len() {
+            px[i] = c;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn center_text(
+    px: &mut [[u8; 4]],
+    w: usize,
+    x0: usize,
+    x1: usize,
+    y: usize,
+    s: &str,
+    c: [u8; 4],
+    scale: usize,
+) {
+    let tw = s.chars().count() * 8 * scale;
+    let x = x0 + ((x1 - x0).saturating_sub(tw)) / 2;
+    blit_text(px, w, x, y, s, c, scale);
+}
+
+fn blit_text(
+    px: &mut [[u8; 4]],
+    w: usize,
+    x0: usize,
+    y0: usize,
+    s: &str,
+    c: [u8; 4],
+    scale: usize,
+) {
+    for (i, ch) in s.chars().enumerate() {
+        let byte = if (0x20..0x7f).contains(&(ch as u32)) {
+            ch as u8
+        } else {
+            b'?'
+        };
+        let glyph = &CP437_8X16[byte as usize];
+        let gx = x0 + i * 8 * scale;
+        for (ry, &bits) in glyph.iter().enumerate() {
+            for rx in 0..8 {
+                if (bits >> (7 - rx)) & 1 == 1 {
+                    for sy in 0..scale {
+                        for sx in 0..scale {
+                            set(px, w, gx + rx * scale + sx, y0 + ry * scale + sy, c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub struct PdfDecoder;
+
+impl Decoder for PdfDecoder {
+    fn name(&self) -> &'static str {
+        "pdf"
+    }
+
+    fn extensions(&self) -> &'static [&'static str] {
+        &["pdf"]
+    }
+
+    fn sniff(&self, header: &[u8]) -> bool {
+        header.starts_with(b"%PDF-")
+    }
+
+    fn decode(&self, bytes: &[u8]) -> Result<PixImage, DecodeError> {
+        let meta =
+            pdf_meta(bytes).ok_or_else(|| DecodeError::Malformed("not a readable PDF".into()))?;
+        Ok(render_placeholder(&meta))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lopdf::{dictionary, Document, Object};
+
+    /// A valid single-page Letter PDF built via lopdf (correct xref, no offset math).
+    fn mini_pdf() -> Vec<u8> {
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn sniffs_pdf_magic() {
+        assert!(PdfDecoder.sniff(b"%PDF-1.7\n..."));
+        assert!(!PdfDecoder.sniff(b"\x89PNG\r\n"));
+    }
+
+    #[test]
+    fn parses_page_count_and_size() {
+        let meta = pdf_meta(&mini_pdf()).expect("loads");
+        assert_eq!(meta.pages, 1);
+        assert!((meta.width_pt - 612.0).abs() < 1.0);
+        assert!((meta.height_pt - 792.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn renders_a_placeholder_tile() {
+        let img = PdfDecoder.decode(&mini_pdf()).unwrap();
+        assert!(img.width > 100 && img.height > 100);
+        // Portrait Letter → taller than wide.
+        assert!(img.height > img.width);
+    }
+
+    #[test]
+    fn utf16_title_decodes() {
+        let raw = [0xFE, 0xFF, 0x00, b'H', 0x00, b'i'];
+        assert_eq!(decode_pdf_string(&raw), "Hi");
+    }
+}

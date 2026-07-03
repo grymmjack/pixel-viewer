@@ -15,6 +15,7 @@ mod cp437_font;
 mod cp437_font_8x8;
 mod idf;
 mod pcx;
+mod pdf;
 mod petmate;
 mod petscii;
 mod psd;
@@ -39,6 +40,9 @@ pub use rip::RipStream;
 /// Every source-code / text extension the [`code::CodeDecoder`] handles — re-exported so
 /// `app.rs`'s viewer predicates (`is_image_ext`) can share the one list, not duplicate it.
 pub use code::CODE_EXTS;
+
+/// PDF metadata (page count / size / title / author) for the Details pane.
+pub use pdf::{pdf_meta, PdfMeta};
 
 #[derive(Debug)]
 pub enum DecodeError {
@@ -91,6 +95,7 @@ impl Registry {
                 Box::new(petmate::PetmateDecoder), // .petmate (nurpax/petmate JSON PETSCII)
                 Box::new(rip::RipDecoder),         // .rip (RIPscript vector; icy_parser_core)
                 Box::new(bin::BinDecoder),         // .bin (raw char/attr pairs, SAUCE width)
+                Box::new(pdf::PdfDecoder),         // .pdf placeholder page tile + metadata (lopdf)
                 Box::new(code::CodeDecoder), // source code / text (CP437 + hand-rolled highlight)
                 Box::new(builtin::ImageCrateDecoder), // png/gif/bmp/jpeg/webp/tga/tiff/pnm/qoi
             ],
