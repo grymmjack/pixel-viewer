@@ -10,6 +10,7 @@ mod rating;
 mod ratings;
 mod sauce;
 mod sixteen;
+mod soundfont;
 mod thumb;
 mod viewdb;
 

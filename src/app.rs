@@ -791,6 +791,7 @@ pub struct PixelView {
     pdf_cache: HashMap<PathBuf, Option<crate::decode::PdfMeta>>, // lazy PDF metadata for Details
     pdf_view: Option<PdfView>, // in-app multi-page PDF viewer state (None = not viewing a PDF)
     audio_cache: HashMap<PathBuf, Option<crate::decode::AudioInfo>>, // lazy audio metadata
+    sf_cache: HashMap<PathBuf, Option<crate::soundfont::SoundFontInfo>>, // lazy .sf2 directory info
     audio_player: Option<AudioPlayer>, // in-app play/pause/seek preview (rodio), None = idle
     audio_autoplay: bool,      // start playing on select + loop until stopped (persisted)
     audio_drag: Option<f32>,   // waveform drag-select anchor time (transient)
@@ -1523,6 +1524,7 @@ impl PixelView {
             pdf_cache: HashMap::new(),
             pdf_view: None,
             audio_cache: HashMap::new(),
+            sf_cache: HashMap::new(),
             audio_player: None,
             audio_autoplay,
             audio_drag: None,
@@ -1709,7 +1711,8 @@ impl PixelView {
         if let Some(dir) = open_target {
             if dir.is_dir()
                 || crate::sixteen::is_remote(&dir)
-                || (dir.is_file() && crate::archive::is_archive(&dir))
+                || (dir.is_file()
+                    && (crate::archive::is_archive(&dir) || crate::soundfont::is_soundfont(&dir)))
             {
                 app.open_folder(dir);
             }
@@ -1733,6 +1736,11 @@ impl PixelView {
         // history, favorite) handles archives uniformly.
         if dir.is_file() && crate::archive::is_archive(&dir) {
             self.enter_archive(dir);
+            return;
+        }
+        // A SoundFont is likewise a virtual folder — of the WAVs we extract from its samples.
+        if dir.is_file() && crate::soundfont::is_soundfont(&dir) {
+            self.enter_soundfont(dir);
             return;
         }
         // Opening a real local folder. If we were inside a mounted archive / 16colo.rs
@@ -1765,6 +1773,7 @@ impl PixelView {
                     // (decoded as CP437 text). A known extension must actually match.
                     .is_none_or(|x| self.registry.known_extension(x))
                     || crate::archive::is_archive(&p)
+                    || crate::soundfont::is_soundfont(&p)
                 {
                     all.push(make_entry(p, false));
                 }
@@ -2274,6 +2283,17 @@ impl PixelView {
             self.audio_cache.insert(path.to_path_buf(), info);
         }
         self.audio_cache.get(path).cloned().flatten()
+    }
+
+    /// Lazily parse + cache a SoundFont's directory (preset / instrument / sample counts) for
+    /// the Details pane. `None` when it isn't a readable `.sf2`.
+    fn sf_info(&mut self, path: &Path) -> Option<crate::soundfont::SoundFontInfo> {
+        if !self.sf_cache.contains_key(path) {
+            let real = self.resolve_local(path);
+            self.sf_cache
+                .insert(path.to_path_buf(), crate::soundfont::info(&real));
+        }
+        self.sf_cache.get(path).cloned().flatten()
     }
 
     /// Open a file in the OS default application (xdg-open / open / explorer). Used by the
@@ -2876,6 +2896,26 @@ impl PixelView {
                 self.status = format!("Opened {}", short_name(&archive));
             }
             Err(e) => self.status = format!("Couldn't open {}: {e}", short_name(&archive)),
+        }
+    }
+
+    /// Enter a SoundFont: extract each of its samples to a WAV in a temp dir (cached), mount
+    /// it like an archive, and browse it — so every sample opens in the audio player, plays,
+    /// and can be exported/rated. The breadcrumb shows the `.sf2` name via `to_display`.
+    fn enter_soundfont(&mut self, sf2: PathBuf) {
+        match crate::soundfont::extract_to_cache(&sf2) {
+            Ok(temp_root) => {
+                self.archive_mount = Some(ArchiveMount {
+                    archive: sf2.clone(),
+                    temp_root: temp_root.clone(),
+                });
+                self.open_folder(temp_root);
+                let n = crate::soundfont::info(&sf2)
+                    .map(|i| i.samples)
+                    .unwrap_or(0);
+                self.status = format!("Opened {} · {n} samples", short_name(&sf2));
+            }
+            Err(e) => self.status = format!("Couldn't open {}: {e}", short_name(&sf2)),
         }
     }
 
@@ -4881,6 +4921,12 @@ impl PixelView {
                     } else {
                         None
                     };
+                    // SoundFont: preset / instrument / sample counts (cached).
+                    let sf = if crate::soundfont::is_soundfont(&entry.path) {
+                        self.sf_info(&entry.path)
+                    } else {
+                        None
+                    };
                     // Plain thumbnail (the recolored preview lives in the Recolor pane).
                     if let Some(tex) = self.thumb_tex.get(&entry.path) {
                         let tsz = tex.size_vec2();
@@ -4974,6 +5020,25 @@ impl PixelView {
                                 }
                                 ui.weak("Codec");
                                 ui.label(&a.codec);
+                                ui.end_row();
+                            } else if let Some(sf) = &sf {
+                                // SoundFont directory: what's inside (double-click to browse).
+                                ui.weak("Type");
+                                ui.label("SoundFont");
+                                ui.end_row();
+                                if !sf.name.trim().is_empty() {
+                                    ui.weak("Bank");
+                                    ui.label(sf.name.trim());
+                                    ui.end_row();
+                                }
+                                ui.weak("Presets");
+                                ui.label(sf.presets.to_string());
+                                ui.end_row();
+                                ui.weak("Instruments");
+                                ui.label(sf.instruments.to_string());
+                                ui.end_row();
+                                ui.weak("Samples");
+                                ui.label(sf.samples.to_string());
                                 ui.end_row();
                             } else if is_audio {
                                 // A tracker/voc/au/midi we can't decode — still label it audio.
@@ -12533,7 +12598,10 @@ fn make_entry(path: PathBuf, is_dir: bool) -> Entry {
     let size = md.as_ref().map(|m| m.len()).unwrap_or(0);
     let mtime = md.as_ref().and_then(|m| m.modified().ok());
     let ctime = md.as_ref().and_then(|m| m.created().ok());
-    let is_archive = !is_dir && crate::archive::is_archive(&path);
+    // A `.sf2` is browsed like an archive (a virtual folder of its samples), so it shares
+    // the `is_archive` flag — folder glyph + badge, click-to-enter, prev/next skipping.
+    let is_archive = !is_dir
+        && (crate::archive::is_archive(&path) || crate::soundfont::is_soundfont(&path));
     Entry {
         path,
         is_dir,
