@@ -116,7 +116,7 @@ down to the extensions a decoder claims.
 | **Source code / text** *(plugin)* | ~90 exts — `rs` `c/cpp/h` `py` `js/ts` `css` `html` `php` `lua` `asm` `gd` `json` `yaml` `md` `log` `ipynb` … | CP437-rasterized with a hand-rolled syntax highlighter |
 | **PDF** *(plugin)* | `.pdf` | Real first-page tile + in-app 1-/2-page viewer (needs poppler) |
 | **Audio** *(plugin)* | `mp3` `wav` `ogg` `flac` + trackers `mod` `xm` `s3m` `it` + **MIDI** `mid` `midi` `rmi` + **RAD** `.rad` | Waveform + play/loop/seek/sampler/MIDI-in. MIDI = SoundFont synthesis; RAD = OPL3 FM synthesis |
-| **Sample banks** *(plugin)* | `.sf2` (SoundFont) · `.sfz` · `.dls` | Browsed as a folder of their samples |
+| **Sample banks** *(plugin)* | `.sf2` (SoundFont) · `.sfz` · `.dls` · `.xi` (FastTracker II) · `.xrns`/`.xrni` (Renoise) | Browsed as a folder of their samples |
 
 Scene-art formats are decoded with **SAUCE** metadata awareness (the standard
 trailer ANSI artists use to record title/author/group/dimensions), shown in the
@@ -396,11 +396,14 @@ The audio player goes further than playback:
   and every individual sample is listed below the keyboard. Click one to load it — the
   waveform, transport and keyboard all follow it — or **export it as a WAV**. A *Full song*
   row jumps back to the whole module.
-- **Browse a sample bank as a folder.** A **SoundFont (`.sf2`)**, **SFZ (`.sfz`)**, or **DLS
-  (`.dls`)** shows as an enterable "folder"; its Details pane reports what's inside (presets /
-  instruments / regions / **sample count** + key range), and entering it lists every sample as a
-  WAV you can play, audition on the keyboard/MIDI, rate, and export. (SFZ references external
-  samples, so they're linked in place — no copy; SF2/DLS embed their PCM, so those are extracted.)
+- **Browse a sample bank as a folder.** A **SoundFont (`.sf2`)**, **SFZ (`.sfz`)**, **DLS
+  (`.dls`)**, **FastTracker II instrument (`.xi`)**, or **Renoise song/instrument
+  (`.xrns`/`.xrni`)** shows as an enterable "folder"; its Details pane reports what's inside
+  (presets / instruments / regions / **sample count** + key range), and entering it lists every
+  sample as a file you can play, audition on the keyboard/MIDI, rate, and export. (SFZ references
+  external samples, so they're linked in place; SF2/DLS/XI embed their PCM, so those are extracted;
+  `.xrns`/`.xrni` are ZIP containers whose `SampleData/` you browse directly. Full Renoise *song*
+  playback is out of scope — this exposes the samples.)
 
 ![A SoundFont opened as a folder — every sample shown as a named WAV tile with its waveform](docs/screenshots/soundfont-folder.png)
 

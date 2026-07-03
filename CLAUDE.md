@@ -81,6 +81,9 @@ src/
                      into a temp dir; region/sample/key-range info
   dls.rs             .dls as a virtual folder: walk the RIFF wave pool → rewrap each
                      embedded wave into a standalone WAV; instrument/sample counts
+  xi.rs              .xi (FastTracker II instrument) as a virtual folder: xmrs parse →
+                     each sample extracted to a WAV; name/sample count
+                     (.xrns/.xrni are ZIPs → handled by archive.rs's force-zip path)
   decode/
     opl3.rs          OPL3 FM-synth chip emulator (public-domain "Opal" port) — for .rad
     rad.rs           Reality Adlib Tracker replayer (public-domain RADPlayer port) — .rad
@@ -848,6 +851,15 @@ breadcrumb and every sample opens/plays/rates/exports like a real file. A cached
 - **DLS** (`dls::extract_to_cache`): each `LIST:wave` in the RIFF `wvpl` is an embedded WAV, so it
   rewraps each `fmt `+`data` (+ INFO/INAM name) into a standalone WAV bit-for-bit (no re-encode).
   Details: Instruments / Samples.
+- **XI** (`xi::extract_to_cache`): a FastTracker II instrument — `xmrs` parses it
+  (`XiInstrument::load` → `to_instrument()` → a core `Instrument`), then each sample's PCM is
+  written to a WAV at its C-4-derived native rate (`8363·2^(relative_pitch/12)`). Details: Name /
+  Samples. (Reachable because xmrs's `tracker::import::xm::xi_instrument` chain is all `pub`.)
+- **XRNS / XRNI** (Renoise song / instrument): **ZIP containers**, so they go through the *archive*
+  path, not `is_sample_bank` — `is_archive` includes them and `archive::extract_all` opens `.xrns`/
+  `.xrni` **explicitly as ZIP** (`extract_zip` via unarc's `ZipArchive`, since unarc detects format
+  by extension and would reject the suffix). You browse the extracted tree; the `SampleData/`
+  FLAC/OGG/WAV samples play. Full Renoise song *playback* is out of scope (a DAW engine).
 
 Extraction is synchronous on the UI thread (a huge multi-hundred-MB SF2 can hitch on first open;
 it's cached after). **REX/RX2** aren't supported: the format is proprietary (RX2 audio is DWOP-
