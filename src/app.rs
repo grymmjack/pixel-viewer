@@ -2305,6 +2305,37 @@ impl PixelView {
         }
     }
 
+    /// Load a tracker sample (`Some(i)`) or the full song (`None`) into the player so the
+    /// waveform + transport + keyboard all follow it, and audition it.
+    fn select_audio_sample(&mut self, idx: Option<usize>) {
+        if let Some(ap) = &mut self.audio_player {
+            ap.select_sample(idx);
+        }
+    }
+
+    /// Export tracker sample `idx` to a user-chosen `.wav` (16-bit PCM at its native rate).
+    fn export_audio_sample(&mut self, idx: usize) {
+        let Some((name, samples, ch, rate)) = self.audio_player.as_ref().and_then(|ap| {
+            ap.tracker_samples.get(idx).map(|s| {
+                (
+                    s.name.clone(),
+                    s.buf.samples.clone(),
+                    s.buf.channels.get(),
+                    s.buf.sample_rate.get(),
+                )
+            })
+        }) else {
+            return;
+        };
+        let default = format!("{}.wav", sanitize_filename(&name));
+        if let Some(path) = rfd::FileDialog::new().set_file_name(default).save_file() {
+            match write_wav_16(&path, &samples, ch, rate) {
+                Ok(()) => self.status = format!("Exported {}", short_name(&path)),
+                Err(e) => self.status = format!("Export failed: {e}"),
+            }
+        }
+    }
+
     /// Is `path` the file currently loaded in the preview player?
     fn is_audio_loaded(&self, path: &Path) -> bool {
         self.audio_player.as_ref().is_some_and(|ap| ap.path == path)
@@ -2362,6 +2393,8 @@ impl PixelView {
         let mut want_seek: Option<f32> = None;
         let mut want_note: Option<i32> = None;
         let mut want_octave: Option<i32> = None;
+        let mut want_sample: Option<Option<usize>> = None; // Some(Some(i))=pick sample; Some(None)=full song
+        let mut want_export: Option<usize> = None; // export tracker sample i to WAV
 
         // Transport row.
         ui.horizontal(|ui| {
@@ -2490,6 +2523,72 @@ impl PixelView {
             ui.weak("Press ▶ to load the waveform + keyboard.");
         }
 
+        // Sample explorer: a tracker module carries a bank of individual samples. List them
+        // below the keyboard — click one to load it (the waveform/keyboard follow it), or ⬇
+        // export it as WAV. Snapshot the list first so the row loop doesn't borrow the player.
+        let sample_list: Vec<(String, f32)> = self
+            .audio_player
+            .as_ref()
+            .filter(|_| loaded)
+            .map(|ap| {
+                ap.tracker_samples
+                    .iter()
+                    .map(|s| (s.name.clone(), s.buf.duration))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !sample_list.is_empty() {
+            let active = self
+                .audio_player
+                .as_ref()
+                .and_then(|ap| ap.active_sample);
+            ui.add_space(8.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.strong(format!("Samples ({})", sample_list.len()));
+                ui.weak("· click to load · ⬇ export WAV");
+            });
+            ui.add_space(2.0);
+            // "Full song" row (revert the keyboard/waveform to the whole module).
+            if ui
+                .selectable_label(active.is_none(), "🎵  Full song")
+                .clicked()
+            {
+                want_sample = Some(None);
+            }
+            let row_h = if big { 22.0 } else { 18.0 };
+            let list_h = if big { 260.0 } else { 130.0 };
+            egui::ScrollArea::vertical()
+                .id_salt("tracker_samples")
+                .max_height(list_h)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (i, (name, dur)) in sample_list.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.set_min_height(row_h);
+                            if ui
+                                .add(egui::Button::new("⬇").small().frame(false))
+                                .on_hover_text("Export this sample as WAV")
+                                .clicked()
+                            {
+                                want_export = Some(i);
+                            }
+                            let mm = format!("{:.2}s", dur);
+                            let label = format!("{:>2}. {}", i + 1, name);
+                            let sel = active == Some(i);
+                            let resp = ui.selectable_label(sel, label);
+                            if resp.clicked() {
+                                want_sample = Some(Some(i));
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| ui.weak(mm),
+                            );
+                        });
+                    }
+                });
+        }
+
         // Apply the collected actions (order: adjust the region/loop before (re)starting).
         if let Some(b) = want_autoplay {
             self.audio_autoplay = b;
@@ -2534,6 +2633,12 @@ impl PixelView {
                 let rel = (secs - ap.region_start).clamp(0.0, ap.region_len);
                 let _ = ap.player.try_seek(std::time::Duration::from_secs_f32(rel));
             }
+        }
+        if let Some(idx) = want_sample {
+            self.select_audio_sample(idx);
+        }
+        if let Some(i) = want_export {
+            self.export_audio_sample(i);
         }
         if self.audio_player.as_ref().is_some_and(|ap| ap.is_playing()) {
             self.want_repaint = true;
@@ -10760,6 +10865,28 @@ fn short_name(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
+/// Make a string safe to use as a filename stem (for sample-export default names): keep
+/// alphanumerics / `-_.` / spaces, replace the rest with `_`, and fall back to "sample".
+fn sanitize_filename(s: &str) -> String {
+    let out: String = s
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ' ') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let out = out.trim().to_string();
+    if out.is_empty() {
+        "sample".to_string()
+    } else {
+        out
+    }
+}
+
 /// Recursively copy a file or directory tree from `src` to the exact path `dst`.
 /// Written by hand (rather than via a crate) so paste-into-the-same-folder can
 /// choose a non-colliding `dst` like "sprite (copy).png".
@@ -12305,6 +12432,25 @@ struct PdfView {
     two_page: bool,
 }
 
+/// A decoded audio buffer + its precomputed waveform peaks — the *swappable* playback unit:
+/// the whole file/song, or one individual sample pulled out of a tracker module. Selecting a
+/// tracker sample stashes the song buffer and loads the sample's here, so the transport,
+/// waveform, and keyboard all operate on it; picking "Full song" restores the stash.
+#[derive(Clone)]
+struct SampleBuf {
+    samples: Vec<rodio::Sample>,
+    channels: rodio::ChannelCount,
+    sample_rate: rodio::SampleRate,
+    duration: f32,
+    peaks: Vec<f32>,
+}
+
+/// One explorable, named sample extracted from a tracker module (later: a SoundFont).
+struct NamedSample {
+    name: String,
+    buf: SampleBuf,
+}
+
 /// The in-app audio preview player (rodio). Decodes the file to interleaved samples ONCE so
 /// it can freely (re)start, loop, play a drag-selected region, and draw a moving playhead —
 /// each play appends a fresh `SamplesBuffer` of the region to a new `Player` on the held
@@ -12327,6 +12473,9 @@ struct AudioPlayer {
     play_speed: f32,   // playback speed of the current source (>1 = pitched up, for auditioning)
     volume: f32,       // master volume 0..1 (from the menu-bar control)
     muted: bool,       // master mute (silences without losing the volume value)
+    tracker_samples: Vec<NamedSample>, // samples inside a tracker module (empty for PCM files)
+    active_sample: Option<usize>,      // which tracker sample is loaded (None = the whole song)
+    song_backup: Option<SampleBuf>,    // the song buffer, stashed while a sample is auditioned
 }
 
 impl AudioPlayer {
@@ -12341,15 +12490,18 @@ impl AudioPlayer {
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
             .unwrap_or_default();
-        let (samples, channels, sample_rate) = if is_tracker_ext(&ext) {
-            render_tracker(&bytes)?
+        let (samples, channels, sample_rate, tracker_samples) = if is_tracker_ext(&ext) {
+            // A tracker module: synthesize the whole song for the transport, and separately
+            // pull out its individual samples for the explorer/keyboard/export.
+            let (s, c, r) = render_tracker(&bytes)?;
+            (s, c, r, extract_tracker_samples(&bytes))
         } else {
             let decoder = rodio::Decoder::new(std::io::Cursor::new(bytes))
                 .map_err(|_| "can't decode this audio format in-app".to_string())?;
             let channels = decoder.channels();
             let sample_rate = decoder.sample_rate();
             let samples: Vec<rodio::Sample> = decoder.collect();
-            (samples, channels, sample_rate)
+            (samples, channels, sample_rate, Vec::new())
         };
         let ch = channels.get() as usize;
         let sr = sample_rate.get() as f32;
@@ -12376,7 +12528,60 @@ impl AudioPlayer {
             play_speed: 1.0,
             volume: 1.0,
             muted: false,
+            tracker_samples,
+            active_sample: None,
+            song_backup: None,
         })
+    }
+
+    /// Move the current live buffer (song or sample) out into a `SampleBuf`, leaving the
+    /// player's sample/peak vecs empty — the caller immediately loads a replacement.
+    fn take_buffer(&mut self) -> SampleBuf {
+        SampleBuf {
+            samples: std::mem::take(&mut self.samples),
+            channels: self.channels,
+            sample_rate: self.sample_rate,
+            duration: self.duration,
+            peaks: std::mem::take(&mut self.peaks),
+        }
+    }
+
+    /// Install `b` as the live buffer and reset the selection/region to cover all of it.
+    fn put_buffer(&mut self, b: SampleBuf) {
+        self.samples = b.samples;
+        self.channels = b.channels;
+        self.sample_rate = b.sample_rate;
+        self.duration = b.duration;
+        self.peaks = b.peaks;
+        self.sel_start = 0.0;
+        self.sel_end = b.duration;
+        self.region_start = 0.0;
+        self.region_len = b.duration.max(0.0001);
+        self.started = false;
+    }
+
+    /// Load a tracker sample (`Some(i)`) or restore the full song (`None`) as the live buffer,
+    /// then audition it. Swapping keeps only one song copy: the song is stashed in `song_backup`
+    /// on the first sample select and moved back when you return to it.
+    fn select_sample(&mut self, idx: Option<usize>) {
+        self.stop();
+        match idx {
+            Some(i) if i < self.tracker_samples.len() => {
+                if self.active_sample.is_none() {
+                    self.song_backup = Some(self.take_buffer());
+                }
+                let b = self.tracker_samples[i].buf.clone();
+                self.put_buffer(b);
+                self.active_sample = Some(i);
+            }
+            _ => {
+                if let Some(b) = self.song_backup.take() {
+                    self.put_buffer(b);
+                }
+                self.active_sample = None;
+            }
+        }
+        self.play_region();
     }
 
     /// The gain to hand rodio: 0 when muted, else the master volume.
@@ -12513,6 +12718,111 @@ fn render_tracker(
     let ch = std::num::NonZeroU16::new(2).unwrap();
     let rate = std::num::NonZeroU32::new(sr).unwrap();
     Ok((samples, ch, rate))
+}
+
+/// Pull every non-empty PCM sample out of a tracker module (its instruments' sample lists),
+/// as mono `f32` buffers at a derived native rate — so each can be auditioned/exported. The
+/// tracker world has no absolute sample rate: pitch is relative to C-4, whose canonical rate
+/// is 8363 Hz (`relative_pitch` is semitones from C-4), so that's the base we render at.
+fn extract_tracker_samples(bytes: &[u8]) -> Vec<NamedSample> {
+    use xmrs::core::instrument::InstrumentType;
+    let Ok(module) = xmrs::core::module::Module::load(bytes) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for instr in &module.instrument {
+        let InstrumentType::Default(def) = &instr.instr_type else {
+            continue;
+        };
+        for (si, opt) in def.sample.iter().enumerate() {
+            let Some(smp) = opt else { continue };
+            if smp.is_empty() {
+                continue;
+            }
+            let pcm = sample_pcm_mono(smp);
+            if pcm.is_empty() {
+                continue;
+            }
+            let base = 8363.0 * 2f32.powf(smp.relative_pitch as f32 / 12.0);
+            let rate = (base.round() as u32).clamp(1000, 192_000);
+            let dur = pcm.len() as f32 / rate as f32;
+            let peaks = compute_peaks(&pcm, 1, 1200);
+            let name = if smp.name.trim().is_empty() {
+                let iname = instr.name.trim();
+                if iname.is_empty() {
+                    format!("sample {}", out.len() + 1)
+                } else {
+                    format!("{iname} [{si}]")
+                }
+            } else {
+                smp.name.trim().to_string()
+            };
+            out.push(NamedSample {
+                name,
+                buf: SampleBuf {
+                    samples: pcm,
+                    channels: std::num::NonZeroU16::new(1).unwrap(),
+                    sample_rate: std::num::NonZeroU32::new(rate).unwrap(),
+                    duration: dur,
+                    peaks,
+                },
+            });
+        }
+    }
+    out
+}
+
+/// Convert one xmrs `Sample`'s PCM to mono `f32` in `[-1, 1]` (stereo is averaged).
+fn sample_pcm_mono(smp: &xmrs::core::sample::Sample) -> Vec<f32> {
+    use xmrs::core::sample::SampleDataType as D;
+    match &smp.data {
+        Some(D::Mono8(v)) => v.iter().map(|&x| x as f32 / 128.0).collect(),
+        Some(D::Mono16(v)) => v.iter().map(|&x| x as f32 / 32768.0).collect(),
+        Some(D::Stereo8(v)) => v
+            .chunks_exact(2)
+            .map(|p| (p[0] as f32 + p[1] as f32) / 256.0)
+            .collect(),
+        Some(D::Stereo16(v)) => v
+            .chunks_exact(2)
+            .map(|p| (p[0] as f32 + p[1] as f32) / 65536.0)
+            .collect(),
+        Some(D::StereoFloat(v)) => v.chunks_exact(2).map(|p| (p[0] + p[1]) * 0.5).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Write interleaved `f32` samples to a 16-bit PCM WAV file (no external crate) — used to
+/// export tracker / SoundFont samples. `channels`/`sample_rate` describe the interleaving.
+fn write_wav_16(
+    path: &Path,
+    samples: &[f32],
+    channels: u16,
+    sample_rate: u32,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let bits = 16u16;
+    let block_align = channels * bits / 8;
+    let byte_rate = sample_rate * block_align as u32;
+    let data_bytes = samples.len() * 2;
+    let mut buf = Vec::with_capacity(44 + data_bytes);
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&((36 + data_bytes) as u32).to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes()); // PCM fmt chunk size
+    buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    buf.extend_from_slice(&channels.to_le_bytes());
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    buf.extend_from_slice(&byte_rate.to_le_bytes());
+    buf.extend_from_slice(&block_align.to_le_bytes());
+    buf.extend_from_slice(&bits.to_le_bytes());
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&(data_bytes as u32).to_le_bytes());
+    for &s in samples {
+        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::File::create(path)?.write_all(&buf)
 }
 
 /// Lay two rendered pages side by side (a small gutter between), each top-aligned on a white
@@ -15740,5 +16050,33 @@ mod hold_test {
         h.event(down(c, false));
         h.run();
         assert_eq!(h.state().flash, None, "released -> normal");
+    }
+
+    #[test]
+    fn write_wav_16_produces_a_valid_header() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("pixelview_test_export.wav");
+        // A tiny mono ramp: 4 frames at 8000 Hz.
+        let samples = [0.0f32, 0.5, -0.5, 1.0];
+        super::write_wav_16(&path, &samples, 1, 8000).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        assert_eq!(&bytes[36..40], b"data");
+        // fmt: PCM(1), 1 channel, 8000 Hz, 16-bit.
+        assert_eq!(u16::from_le_bytes([bytes[20], bytes[21]]), 1);
+        assert_eq!(u16::from_le_bytes([bytes[22], bytes[23]]), 1);
+        assert_eq!(u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]), 8000);
+        assert_eq!(u16::from_le_bytes([bytes[34], bytes[35]]), 16);
+        // data chunk = 4 samples * 2 bytes, and the whole file is 44 + data.
+        assert_eq!(
+            u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]),
+            8
+        );
+        assert_eq!(bytes.len(), 44 + 8);
+        // First sample 0.0 -> 0; the +1.0 clamps to 32767 (not overflow).
+        assert_eq!(i16::from_le_bytes([bytes[44], bytes[45]]), 0);
+        assert_eq!(i16::from_le_bytes([bytes[50], bytes[51]]), 32767);
     }
 }
