@@ -790,6 +790,7 @@ pub struct PixelView {
     sauce_cache: HashMap<PathBuf, Option<crate::sauce::Sauce>>, // parsed SAUCE per path
     pdf_cache: HashMap<PathBuf, Option<crate::decode::PdfMeta>>, // lazy PDF metadata for Details
     audio_cache: HashMap<PathBuf, Option<crate::decode::AudioInfo>>, // lazy audio metadata
+    audio_player: Option<AudioPlayer>, // in-app play/pause/seek preview (rodio), None = idle
     palettes: HashMap<PathBuf, Option<Vec<[u8; 4]>>>, // details swatches; None = too many colors
     thumb_rgba: HashMap<PathBuf, (usize, usize, Vec<u8>)>, // thumb CPU pixels (for grid recolor)
     grid_recolor: HashMap<PathBuf, (String, egui::TextureHandle)>, // recolored grid tiles, per recolor key
@@ -1474,6 +1475,7 @@ impl PixelView {
             sauce_cache: HashMap::new(),
             pdf_cache: HashMap::new(),
             audio_cache: HashMap::new(),
+            audio_player: None,
             palettes: HashMap::new(),
             thumb_rgba: HashMap::new(),
             grid_recolor: HashMap::new(),
@@ -2222,6 +2224,70 @@ impl PixelView {
     fn open_in_default_app(&mut self, path: &Path) {
         let o = os_file_manager();
         self.launch_external(&o.exec, &o.args, &o.env, path);
+    }
+
+    /// Play/pause the in-app audio preview for `path`. Same file → toggle pause; a new file →
+    /// (re)open the default output device lazily and start it. The device init is fallible:
+    /// a headless box (no sound card) just reports it in the status bar instead of panicking.
+    fn toggle_audio(&mut self, path: &Path) {
+        if let Some(ap) = &self.audio_player {
+            if ap.path == path {
+                if ap.player.is_paused() {
+                    ap.player.play();
+                } else {
+                    ap.player.pause();
+                }
+                return;
+            }
+        }
+        let real = self.resolve_local(path);
+        let Ok(bytes) = std::fs::read(&real) else {
+            self.status = "Couldn't read the audio file".into();
+            return;
+        };
+        let stream = match rodio::DeviceSinkBuilder::open_default_sink() {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = format!("No audio output: {e}");
+                return;
+            }
+        };
+        let player = rodio::Player::connect_new(stream.mixer());
+        let src = match rodio::Decoder::new(std::io::Cursor::new(bytes)) {
+            Ok(s) => s,
+            Err(_) => {
+                self.status = "Can't decode this audio format in-app".into();
+                return;
+            }
+        };
+        player.append(src);
+        player.play();
+        let duration = self
+            .audio_info(path)
+            .map(|a| a.duration_secs)
+            .unwrap_or(0.0);
+        self.audio_player = Some(AudioPlayer {
+            _stream: stream,
+            player,
+            path: path.to_path_buf(),
+            duration,
+        });
+        self.status = format!("Playing {}", short_name(path));
+    }
+
+    /// The in-app player's `(position_secs, playing, duration_secs)` for `path`, if it's the
+    /// file currently loaded in the player. Read for the Details play/seek controls.
+    fn audio_state(&self, path: &Path) -> Option<(f32, bool, f32)> {
+        self.audio_player
+            .as_ref()
+            .filter(|ap| ap.path == path)
+            .map(|ap| {
+                (
+                    ap.player.get_pos().as_secs_f32(),
+                    !ap.player.is_paused() && !ap.player.empty(),
+                    ap.duration,
+                )
+            })
     }
 
     /// A downloaded 16colo.rs pack zip finished: extract + mount it (with the
@@ -4183,6 +4249,8 @@ impl PixelView {
         let mut want_download = false;
         let mut want_pack: Option<PathBuf> = None;
         let mut want_open_default = false; // "Open in default app" (PDF)
+        let mut want_audio_toggle: Option<PathBuf> = None; // play/pause the audio preview
+        let mut want_audio_seek: Option<f32> = None; // seek the audio preview to N seconds
         let disp = self.to_display(&entry.path);
         // Inspecting a downloadable pack folder (it has a fetched zip URL). Keyed off
         // `remote_urls`, not path depth, so `groups/<g>` / `artists/<a>` listing folders
@@ -4262,6 +4330,8 @@ impl PixelView {
                     } else {
                         None
                     };
+                    // In-app player state (pos / playing / duration) for the seek controls.
+                    let audio_st = self.audio_state(&entry.path);
                     // Plain thumbnail (the recolored preview lives in the Recolor pane).
                     if let Some(tex) = self.thumb_tex.get(&entry.path) {
                         let tsz = tex.size_vec2();
@@ -4398,6 +4468,34 @@ impl PixelView {
                             }
                         });
                     ui.add_space(8.0);
+                    // Audio preview: play/pause + a seek bar (decodable formats only, i.e.
+                    // when `audio` metadata parsed — trackers/midi have no in-app playback).
+                    if is_audio && audio.is_some() {
+                        let dur = audio
+                            .as_ref()
+                            .map(|a| a.duration_secs)
+                            .unwrap_or(0.0)
+                            .max(0.1);
+                        let (pos, playing) =
+                            audio_st.map(|(p, pl, _)| (p, pl)).unwrap_or((0.0, false));
+                        ui.horizontal(|ui| {
+                            if ui.button(if playing { "⏸" } else { "▶" }).clicked() {
+                                want_audio_toggle = Some(entry.path.clone());
+                            }
+                            let mut p = pos.min(dur);
+                            let slider = ui.add(
+                                egui::Slider::new(&mut p, 0.0..=dur)
+                                    .show_value(false)
+                                    .trailing_fill(true),
+                            );
+                            if slider.dragged() || slider.changed() {
+                                want_audio_seek = Some(p);
+                            }
+                            let mm = |s: f32| format!("{}:{:02}", (s as u64) / 60, (s as u64) % 60);
+                            ui.weak(format!("{} / {}", mm(pos), mm(dur)));
+                        });
+                        ui.add_space(4.0);
+                    }
                     ui.horizontal(|ui| {
                         want_download = ui
                             .button("⬇ Download…")
@@ -4496,6 +4594,24 @@ impl PixelView {
         }
         if want_open_default {
             self.open_in_default_app(&entry.path);
+        }
+        if let Some(p) = want_audio_toggle {
+            self.toggle_audio(&p);
+        }
+        if let Some(secs) = want_audio_seek {
+            if let Some(ap) = &self.audio_player {
+                let _ = ap
+                    .player
+                    .try_seek(std::time::Duration::from_secs_f32(secs.max(0.0)));
+            }
+        }
+        // Keep repainting while a preview is playing so the seek bar tracks the playhead.
+        if self
+            .audio_player
+            .as_ref()
+            .is_some_and(|ap| !ap.player.is_paused() && !ap.player.empty())
+        {
+            self.want_repaint = true;
         }
     }
 
@@ -11739,6 +11855,15 @@ fn make_entry(path: PathBuf, is_dir: bool) -> Entry {
 /// Hover-tooltip contents for a grid tile.
 /// A deferred right-click-menu choice for a grid tile / table row — applied by the
 /// caller (which holds `&mut self`), so the menu closure needn't borrow `self`.
+/// The in-app audio preview player (rodio). Holds the open output device alive (`_stream`
+/// must outlive `player`) plus which file is loaded and its duration for the seek bar.
+struct AudioPlayer {
+    _stream: rodio::MixerDeviceSink,
+    player: rodio::Player,
+    path: PathBuf,
+    duration: f32,
+}
+
 enum TilePick {
     Pin,
     PinFolder, // pin the *current* folder (e.g. the 16colo artist/group/search) to Places

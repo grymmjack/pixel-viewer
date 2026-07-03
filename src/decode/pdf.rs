@@ -1,9 +1,8 @@
-//! PDF support (MVP): pure-Rust metadata via `lopdf` (page count, first-page size,
-//! /Info title + author) plus a recognizable placeholder "page" tile so PDFs appear in
-//! the grid, carry real dimensions, and get the right-click "Open in…" menu. Actual
-//! page rasterization + an in-app multi-page viewer are a deferred, feature-gated
-//! fast-follow (pdfium); for now double-click shows this tile and the user opens the
-//! file in their associated PDF editor.
+//! PDF support: the tile is the REAL first page, rendered by poppler's `pdftoppm`
+//! (`render_first_page`: PDF on stdin → PNG on stdout, no bundled lib) — falling back to a
+//! labeled placeholder "page" tile when poppler isn't installed. Metadata (page count,
+//! first-page size, /Info title + author) comes from pure-Rust `lopdf` and drives the
+//! Details pane. Enter / "Open in default app" launches the associated PDF editor.
 
 use super::cp437_font::CP437_8X16;
 use super::{DecodeError, Decoder};
@@ -293,7 +292,17 @@ fn render_first_page(bytes: &[u8]) -> Option<PixImage> {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let mut child = Command::new("pdftoppm")
-        .args(["-png", "-f", "1", "-l", "1", "-singlefile", "-scale-to", "1100", "-"])
+        .args([
+            "-png",
+            "-f",
+            "1",
+            "-l",
+            "1",
+            "-singlefile",
+            "-scale-to",
+            "1100",
+            "-",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

@@ -45,6 +45,13 @@ xcf = "0.4.0"
 # build script uses the still-unstable `cfg_select!` and fails to compile on stable
 # rustc 1.92. `bundled` builds SQLite from source — no system libsqlite dependency.
 rusqlite = { version = "0.37", features = ["bundled"] }
+# In-app audio preview (play/pause/seek). `playback` pulls cpal → alsa-sys, so a Linux
+# BUILD needs libasound2-dev (see CLAUDE.md + CI); the device is opened lazily + fallibly at
+# first Play, so a headless box (CI) builds + tests fine without an audio device. Only the
+# four codecs we decode elsewhere — keeps mp4/aac/recording/noise out of the tree.
+rodio = { version = "0.22", default-features = false, features = [
+    "playback", "mp3", "wav", "vorbis", "flac",
+] }
 
 [profile.release]
 opt-level = 3
