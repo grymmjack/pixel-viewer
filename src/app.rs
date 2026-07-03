@@ -8442,7 +8442,7 @@ impl PixelView {
                         &self.opener_icons,
                         true,
                         &opener_presets(),
-                        "Register external programs to open files by type. Right-click a file → \
+                        "Register external programs to open files by type. Right-click a file › \
                          Open in… to launch one.",
                         "No associations yet. Click Add (or pick a preset) and set its program \
                          path + extensions.",
@@ -11939,6 +11939,16 @@ fn openers_editor(
             });
         }
     });
+    // Apply Add / preset *now*, before the empty-list early return below — otherwise the
+    // very first Add on an empty list (the common first-use case) is dropped on the floor.
+    if add_blank {
+        openers.push(Opener::default());
+        *selected = openers.len() - 1;
+    }
+    if let Some(p) = add_preset {
+        openers.push(p);
+        *selected = openers.len() - 1;
+    }
     ui.separator();
     if openers.is_empty() {
         ui.weak(empty_hint);
@@ -12061,16 +12071,7 @@ fn openers_editor(
     if let Some(i) = select {
         *selected = i;
     }
-
-    // Apply deferred structural edits.
-    if add_blank {
-        openers.push(Opener::default());
-        *selected = openers.len() - 1;
-    }
-    if let Some(p) = add_preset {
-        openers.push(p);
-        *selected = openers.len() - 1;
-    }
+    // Removal is deferred to here (it's only set once the editor pane has rendered).
     if let Some(i) = remove {
         openers.remove(i);
         *selected = (*selected).min(openers.len().saturating_sub(1));
