@@ -828,10 +828,15 @@ pub struct PixelView {
     show_hotkeys: bool,
     show_prefs: bool,
     show_associations: bool, // the View → Associations editor window is open
+    assoc_tab: u8,           // Associations window tab: 0 = Files, 1 = Folders
     // User-defined external "Open in…" programs by file type (persisted).
     openers: Vec<Opener>,
-    assoc_selected: usize, // selected opener row in the Associations editor
-    // Decoded icon textures for openers (keyed by icon path; `None` = decode failed/cached).
+    assoc_selected: usize, // selected opener row in the Associations editor (Files tab)
+    // User-defined "Open folder in…" programs (persisted). Same shape as `openers` but the
+    // `exts` field is unused — a folder action runs on a directory, not a file type.
+    folder_actions: Vec<Opener>,
+    folder_act_selected: usize, // selected row in the Associations editor's Folders tab
+    // Decoded icon textures for openers + folder actions (keyed by icon path; `None` = failed).
     opener_icons: HashMap<PathBuf, Option<egui::TextureHandle>>,
 
     // preferences (round 2 #10)
@@ -903,22 +908,22 @@ pub struct PixelView {
     glow_amt: f32,          // phosphor-glow intensity (persisted)
     black_bg: bool,         // fill the viewer background black instead of dark grey (persisted)
     // Metadata OSD: a fading info overlay shown on each newly opened image.
-    osd_enabled: bool,  // show the OSD at all (persisted)
-    osd_position: u8,   // anchor 0..=7: TL,T,TR,L,R,BL,B,BR (3×3 grid, no center) (persisted)
-    osd_secs: f32,      // how long it holds at full opacity before fading (persisted)
-    osd_t: f32,         // animation clock since the current image opened (runtime)
-    osd_rect: Option<egui::Rect>,        // last-painted OSD bounds (for hover-to-pin)
+    osd_enabled: bool,                         // show the OSD at all (persisted)
+    osd_position: u8, // anchor 0..=7: TL,T,TR,L,R,BL,B,BR (3×3 grid, no center) (persisted)
+    osd_secs: f32,    // how long it holds at full opacity before fading (persisted)
+    osd_t: f32,       // animation clock since the current image opened (runtime)
+    osd_rect: Option<egui::Rect>, // last-painted OSD bounds (for hover-to-pin)
     osd_links: Vec<(egui::Rect, PathBuf)>, // clickable field rects → open_folder target
-    osd_close: Option<egui::Rect>,       // the [×] dismiss button's last-painted rect
+    osd_close: Option<egui::Rect>, // the [×] dismiss button's last-painted rect
     osd_dismissed: bool, // [×] clicked → hide the OSD for *this* image (reset on next load)
     scanline_tex: Option<egui::TextureHandle>, // lazily-built 1×3 scanline pattern
-    auto_next: bool,        // slideshow: auto-advance to the next file after a delay (persisted)
-    auto_next_secs: u8,     // slideshow delay in seconds: 1/3/5/10 (persisted)
-    auto_next_dwell: f32,   // slideshow: seconds the current (settled) file has been shown
-    auto_paused: bool,      // slideshow paused by a user interaction (scroll/key/drag); not persisted
-    immersive: bool,        // F11 fullscreen: hide all bars/UI, show only the art
-    idle_t: f32,            // seconds of mouse stillness (immersive cursor auto-hide)
-    shuffle: bool,          // screensaver: at a pack's end, load another random pack (persisted)
+    auto_next: bool,  // slideshow: auto-advance to the next file after a delay (persisted)
+    auto_next_secs: u8, // slideshow delay in seconds: 1/3/5/10 (persisted)
+    auto_next_dwell: f32, // slideshow: seconds the current (settled) file has been shown
+    auto_paused: bool, // slideshow paused by a user interaction (scroll/key/drag); not persisted
+    immersive: bool,  // F11 fullscreen: hide all bars/UI, show only the art
+    idle_t: f32,      // seconds of mouse stillness (immersive cursor auto-hide)
+    shuffle: bool,    // screensaver: at a pack's end, load another random pack (persisted)
     // screensaver: a worker picking a random 16colo.rs pack → (year, name, download URL)
     random_rx: Option<std::sync::mpsc::Receiver<RandomPick>>,
     pending_autoplay: bool, // open the first art file once a (random) pack finishes mounting
@@ -931,6 +936,11 @@ pub struct PixelView {
     // Optional color tag per favorite/pin (the favorite path → RGB), for organizing
     // Places. Assigned from the favorite's right-click ANSI32 palette. Persisted.
     fav_colors: HashMap<PathBuf, [u8; 3]>,
+    // Optional custom display label per pin (path → name); renames the *label* only, not
+    // where it points. Falls back to `short_name` when unset. Persisted (`fav_label`).
+    fav_names: HashMap<PathBuf, String>,
+    // Pin-rename dialog state: (pin path, edit buffer). None = closed. Not persisted.
+    fav_rename: Option<(PathBuf, String)>,
     // Top Favorites bar shows only color-tagged favorites (declutter; the rest stay in the
     // Places dock). Falls back to showing all when none are colored. Persisted.
     fav_bar_colored_only: bool,
@@ -951,7 +961,7 @@ pub struct PixelView {
     // the offset to apply *once* on the next grid frame (set on every folder switch).
     grid_scroll: HashMap<PathBuf, f32>,
     grid_scroll_pending: Option<f32>,
-    search: Option<String>,       // grid: live filename filter (vim-style '/')
+    search: Option<String>, // grid: live filename filter (vim-style '/')
     focus_search: bool,
     // advanced recursive search → a "Search results" grid
     show_search: bool,      // the advanced-search panel is open
@@ -1008,8 +1018,9 @@ pub struct PixelView {
     colo_files: HashMap<PathBuf, PathBuf>,
     // A piece whose `raw` file is downloading so we can open it in the viewer once ready.
     #[allow(clippy::type_complexity)]
-    colo_open_rx:
-        Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf, Option<crate::sauce::Sauce>), String>>>,
+    colo_open_rx: Option<
+        std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf, Option<crate::sauce::Sauce>), String>>,
+    >,
     // When set, the in-flight `colo_open_rx` download is for an external "Open in…" launch
     // `(exec, args, env)` — `poll_colo_open` runs the program instead of opening the viewer.
     pending_external: Option<(String, String, String)>,
@@ -1039,6 +1050,8 @@ impl PixelView {
     /// Storage key for the persisted favorite folders.
     const FAV_KEY: &'static str = "favorites";
     const FAV_COLORS_KEY: &'static str = "fav_colors";
+    /// Custom pin labels (rename): flattened `Vec<(PathBuf, String)>`.
+    const FAV_NAMES_KEY: &'static str = "fav_names";
     /// Whether the top Favorites bar shows only color-tagged favorites.
     const FAV_BAR_COLORED_KEY: &'static str = "fav_bar_colored_only";
     /// Storage key for saved searches ("smart filters"): `Vec<Vec<String>>`, each
@@ -1046,6 +1059,8 @@ impl PixelView {
     const SAVED_FILTERS_KEY: &'static str = "saved_filters";
     /// External "Open in…" program associations (flattened `Vec<Vec<String>>`).
     const OPENERS_KEY: &'static str = "openers";
+    /// "Open folder in…" folder actions (flattened `Vec<Vec<String>>`, like openers).
+    const FOLDER_ACTIONS_KEY: &'static str = "folder_actions";
     /// Storage key for the last-opened folder (reopened on launch).
     const FOLDER_KEY: &'static str = "last_folder";
     /// Storage keys for sort & filter state.
@@ -1163,6 +1178,20 @@ impl PixelView {
             .iter()
             .map(|row| Opener::from_record(row))
             .collect();
+        // "Open folder in…" actions: same flattened shape as openers (exts unused).
+        let folder_actions: Vec<Opener> = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Vec<Vec<String>>>(s, Self::FOLDER_ACTIONS_KEY))
+            .unwrap_or_default()
+            .iter()
+            .map(|row| Opener::from_record(row))
+            .collect();
+        // Custom pin labels (rename affects the label only, not the target).
+        let fav_names: HashMap<PathBuf, String> = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Vec<(PathBuf, String)>>(s, Self::FAV_NAMES_KEY))
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default();
 
         let last_folder = cc
             .storage
@@ -1450,8 +1479,11 @@ impl PixelView {
             show_hotkeys: false,
             show_prefs: false,
             show_associations: false,
+            assoc_tab: 0,
             openers,
             assoc_selected: 0,
+            folder_actions,
+            folder_act_selected: 0,
             opener_icons: HashMap::new(),
             theme,
             grid_gap,
@@ -1526,6 +1558,8 @@ impl PixelView {
             adjust_drag: None,
             favorites,
             fav_colors,
+            fav_names,
+            fav_rename: None,
             fav_bar_colored_only,
             path_edit: None,
             focus_path: false,
@@ -1954,10 +1988,14 @@ impl PixelView {
         // 16colo strips SAUCE from the single `raw` file and the artist endpoint omits
         // it, so when a piece has no SAUCE yet (artist/search view) fetch its *pack's*
         // SAUCE (`?sauce=true`) to fill the Details panel. Keyed by (group, year, pack).
-        let want_sauce = piece
-            .sauce
-            .is_none()
-            .then(|| (piece.group.clone(), piece.year, piece.pack.clone(), fname.clone()));
+        let want_sauce = piece.sauce.is_none().then(|| {
+            (
+                piece.group.clone(),
+                piece.year,
+                piece.pack.clone(),
+                fname.clone(),
+            )
+        });
         self.status = format!("Opening {fname}…");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -2292,7 +2330,9 @@ impl PixelView {
 
     /// Full view record (count + first/last) for `path`, if tracked.
     fn view_record(&self, path: &Path) -> Option<crate::viewdb::ViewRecord> {
-        self.viewdb.as_ref().and_then(|db| db.get(&self.view_key(path)))
+        self.viewdb
+            .as_ref()
+            .and_then(|db| db.get(&self.view_key(path)))
     }
 
     /// Pin the current folder to Places (used inside a 16colo flat listing, whose rows
@@ -2955,8 +2995,8 @@ impl PixelView {
         self.osd_t = 0.0; // restart the metadata OSD fade-in for the new image
         self.osd_dismissed = false; // a fresh image un-hides the OSD ([×] is per-view only)
         let _ = self.cached_sauce(&path); // populate SAUCE (columns/lines/font/comment) for the OSD
-        // `path` is the display identity (kept for stepping/ratings/full_tex keys); a
-        // downloaded 16colo piece reads its bytes from the local cache file instead.
+                                          // `path` is the display identity (kept for stepping/ratings/full_tex keys); a
+                                          // downloaded 16colo piece reads its bytes from the local cache file instead.
         let src = self.resolve_local(&path);
         // Pick the remembered zoom for this image's kind: text-mode art (tiny 8×16
         // cells) opens at its own larger default, raster art at its own. Sticky fit,
@@ -3041,8 +3081,7 @@ impl PixelView {
                         // the end, fully revealed). The baud picker + ▶/Replay controls
                         // then let you watch it "type out" on demand — unlike ANSI, which
                         // auto-plays, these always rendered instantly, so keep that.
-                        self.player =
-                            Some(Player::new(path.clone(), Stream::Cells(reveal), false));
+                        self.player = Some(Player::new(path.clone(), Stream::Cells(reveal), false));
                     }
                 }
                 // Keep the CPU pixels so the optional palette reduction can remap
@@ -3225,7 +3264,10 @@ impl PixelView {
                 // favorites (the rest stay in the Places dock). Fall back to showing all
                 // when none are colored yet, so the bar is never confusingly empty.
                 let colored_only = self.fav_bar_colored_only
-                    && self.favorites.iter().any(|f| self.fav_colors.contains_key(f));
+                    && self
+                        .favorites
+                        .iter()
+                        .any(|f| self.fav_colors.contains_key(f));
                 let colored: std::collections::HashSet<PathBuf> = if colored_only {
                     self.fav_colors.keys().cloned().collect()
                 } else {
@@ -3236,8 +3278,8 @@ impl PixelView {
                 } else {
                     0
                 };
-                if let Some(p) =
-                    self.favorites_buttons(ui, "📁", |path| !colored_only || colored.contains(path))
+                if let Some(p) = self
+                    .favorites_buttons(ui, "📁", |path| !colored_only || colored.contains(path))
                 {
                     self.open_folder(p);
                 }
@@ -3355,18 +3397,33 @@ impl PixelView {
         let mut remove: Option<usize> = None;
         let mut reorder: Option<(usize, usize)> = None;
         let mut set_color: Option<(usize, Option<[u8; 3]>)> = None;
-        for (i, fav) in self.favorites.iter().enumerate() {
-            if !filter(fav) {
-                continue;
-            }
-            let label = format!("{icon} {}", short_name(fav));
-            let color = self.fav_colors.get(fav).copied();
+        let mut rename: Option<usize> = None; // open the rename dialog for this pin
+        let mut swap: Option<(usize, usize)> = None; // move up/down (swap two global indices)
+        let mut folder_act: Option<(usize, FolderActPick)> = None; // "Open folder in…"
+                                                                   // Folder-action snapshot (owned) so the menu closure needn't borrow `self`.
+        let facts = self.folder_action_items();
+        // The *global* indices of the favorites this filter shows, so Move up/down can swap
+        // with the adjacent *visible* pin (skipping hidden ones from the other sub-tab).
+        let visible: Vec<usize> = self
+            .favorites
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| filter(f))
+            .map(|(i, _)| i)
+            .collect();
+        for (vis_pos, &i) in visible.iter().enumerate() {
+            let fav = self.favorites[i].clone();
+            let label = format!("{icon} {}", self.fav_label(&fav));
+            let color = self.fav_colors.get(&fav).copied();
+            let local = Self::is_local_path(&fav);
             // ONE widget that senses click *and* drag, so egui can tell a click
             // (jump there) from a drag (reorder). A separate drag sensor over the
             // button — the previous approach — swallowed the click. Note: NOT
             // dnd_drag_source, whose scope breaks horizontal_wrapped's wrapping.
             let text: egui::WidgetText = match color {
-                Some(c) => egui::RichText::new(label.as_str()).color(contrast_text(c)).into(),
+                Some(c) => egui::RichText::new(label.as_str())
+                    .color(contrast_text(c))
+                    .into(),
                 None => label.as_str().into(),
             };
             let mut btn = egui::Button::new(text).sense(egui::Sense::click_and_drag());
@@ -3382,12 +3439,43 @@ impl PixelView {
                 nav = Some(fav.clone());
             }
             resp.context_menu(|ui| {
-                if ui.button("✕ Remove from favorites").clicked() {
+                // Open this pinned folder externally (local pins only).
+                if local {
+                    if let Some(fp) = folder_actions_submenu(ui, &facts) {
+                        folder_act = Some((i, fp));
+                    }
+                    ui.separator();
+                }
+                if ui.button("✏ Rename…").clicked() {
+                    rename = Some(i);
+                    ui.close();
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(vis_pos > 0, egui::Button::new("⬆ Move up"))
+                        .clicked()
+                    {
+                        swap = Some((i, visible[vis_pos - 1]));
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            vis_pos + 1 < visible.len(),
+                            egui::Button::new("⬇ Move down"),
+                        )
+                        .clicked()
+                    {
+                        swap = Some((i, visible[vis_pos + 1]));
+                        ui.close();
+                    }
+                });
+                ui.separator();
+                if ui.button("× Remove from favorites").clicked() {
                     remove = Some(i);
                     ui.close();
                 }
                 ui.separator();
-                if ui.button("✕ Clear color").clicked() {
+                if ui.button("× Clear color").clicked() {
                     set_color = Some((i, None));
                     ui.close();
                 }
@@ -3424,6 +3512,25 @@ impl PixelView {
                 reorder = Some((*src, i));
             }
         }
+        // Apply deferred edits. At most one fires per frame (a menu click closes the menu),
+        // so these are independent rather than mutually-exclusive branches.
+        if let Some((i, fp)) = folder_act {
+            if let Some(p) = self.favorites.get(i).cloned() {
+                self.run_folder_action(p, fp);
+            }
+        }
+        if let Some(i) = rename {
+            if let Some(p) = self.favorites.get(i).cloned() {
+                let cur = self.fav_label(&p);
+                self.fav_rename = Some((p, cur));
+                self.focus_rename = true;
+            }
+        }
+        if let Some((a, b)) = swap {
+            if a < self.favorites.len() && b < self.favorites.len() {
+                self.favorites.swap(a, b);
+            }
+        }
         if let Some((i, c)) = set_color {
             if let Some(p) = self.favorites.get(i).cloned() {
                 match c {
@@ -3439,11 +3546,28 @@ impl PixelView {
             if i < self.favorites.len() {
                 let p = self.favorites.remove(i);
                 self.fav_colors.remove(&p); // drop its color tag too
+                self.fav_names.remove(&p); // …and its custom label
             }
         } else if let Some((from, to)) = reorder {
             reorder_favorites(&mut self.favorites, from, to);
         }
         nav
+    }
+
+    /// A pinned-place button styled like the Places pins: filled with its color tag (text
+    /// flipped for contrast) when set, plain otherwise. Returns whether it was clicked.
+    /// Shared by the Go menu so its entries match the Places dock. A method (not free fn) so
+    /// callers pass just the label + color; kept `&self`-free of the favorites list.
+    fn colored_place_button(ui: &mut egui::Ui, label: &str, color: Option<[u8; 3]>) -> bool {
+        let text: egui::WidgetText = match color {
+            Some(c) => egui::RichText::new(label).color(contrast_text(c)).into(),
+            None => label.into(),
+        };
+        let mut btn = egui::Button::new(text);
+        if let Some(c) = color {
+            btn = btn.fill(egui::Color32::from_rgb(c[0], c[1], c[2]));
+        }
+        ui.add(btn).clicked()
     }
 
     /// Sort & filter toolbar (Phase 5). Edits locals, then applies + rebuilds once
@@ -3916,13 +4040,7 @@ impl PixelView {
         let (w, h) = (size[0], size[1]);
         let aux = self.pipe_aux(palette);
         apply_pipeline(&mut rgba, w, h, &self.adjust, &aux);
-        let tt = TiledTexture::from_rgba(
-            ctx,
-            "pv_full_reduced",
-            size,
-            &rgba,
-            view_tex_opts(),
-        );
+        let tt = TiledTexture::from_rgba(ctx, "pv_full_reduced", size, &rgba, view_tex_opts());
         self.full_reduced = Some((path.to_path_buf(), key.to_string(), tt.clone()));
         Some(tt)
     }
@@ -5219,6 +5337,12 @@ impl PixelView {
         if self.entries.is_empty() {
             // A 16colo listing / pack download in flight → spinner, else the empty hint.
             let loading = self.remote_rx.is_some() || self.colo_rx.is_some();
+            // Still allow the empty-area menu (paste / new folder) in an empty local folder.
+            // The sensor must be registered *after* the centered label — that label is
+            // justified to fill the whole rect, so a sensor placed *before* it is fully
+            // occluded (the populated path puts the sensor under the tiles instead). Here
+            // nothing else needs the clicks, so an on-top full-rect sensor is what we want.
+            let full = ui.available_rect_before_wrap();
             ui.centered_and_justified(|ui| {
                 if loading {
                     ui.add(egui::Spinner::new().size(40.0));
@@ -5226,6 +5350,9 @@ impl PixelView {
                     ui.label("Nothing here. Open a folder.");
                 }
             });
+            let empty_bg = (!loading && self.is_local_dir())
+                .then(|| ui.interact(full, ui.id().with("grid_empty_bg"), egui::Sense::click()));
+            self.empty_area_menu(empty_bg);
             return;
         }
         // Ctrl + mouse-wheel resizes the thumbnails. egui's `zoom_modifier` defaults
@@ -5312,6 +5439,7 @@ impl PixelView {
         let mut rate_to: Option<(usize, u8)> = None; // "Rating ▸ N" context-menu choice
         let mut open_with: Option<(usize, usize)> = None; // (entry idx, opener idx)
         let mut open_other: Option<usize> = None; // "Open in… → Other" on this entry
+        let mut folder_act: Option<(usize, FolderActPick)> = None; // "Open folder in…" on a dir
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // 16colo download (idx, want_pack)
         let can_paste = self.clipboard.is_some();
@@ -5327,6 +5455,15 @@ impl PixelView {
             .is_some_and(|f| self.favorites.contains(f));
         // When "Apply to grid" is on, tiles render with the active recolor.
         let grid_key = self.grid_recolor_key();
+
+        // Background sensor for the empty-area right-click menu. Registered *before* the
+        // tiles so they occlude it (a right-click on a tile hits the tile; one on empty
+        // space falls through to this). Only in a real local folder (paste/new-folder/folder
+        // actions make sense there). `ui.interact` senses without advancing the layout.
+        let empty_bg = self.is_local_dir().then(|| {
+            let r = ui.available_rect_before_wrap();
+            ui.interact(r, ui.id().with("grid_empty_bg"), egui::Sense::click())
+        });
 
         // A stable, unique id so egui persists the grid's scroll offset across grid →
         // single → grid (a bare ScrollArea's auto-id can shift or collide with the
@@ -5591,13 +5728,14 @@ impl PixelView {
                         }
                         resp.context_menu(|ui| {
                             let pinned = self.favorites.iter().any(|f| f == &entry.path);
-                            let colo_pin =
-                                colo_pin_label.as_deref().map(|l| (l, colo_pin_pinned));
+                            let colo_pin = colo_pin_label.as_deref().map(|l| (l, colo_pin_pinned));
                             let colo_piece = self.colo_pieces.contains_key(&entry.path);
                             let openers = self.opener_items();
+                            let facts = self.folder_action_items();
+                            let local_dir = Self::is_local_path(&entry.path);
                             if let Some(pick) = entry_context_menu(
                                 ui, &entry, can_paste, pinned, viewed, colo_pin, colo_piece,
-                                &openers,
+                                &openers, &facts, local_dir,
                             ) {
                                 match pick {
                                     TilePick::Pin => pin_dir = Some(idx),
@@ -5609,6 +5747,7 @@ impl PixelView {
                                     TilePick::Rate(stars) => rate_to = Some((idx, stars)),
                                     TilePick::OpenWith(oi) => open_with = Some((idx, oi)),
                                     TilePick::OpenWithOther => open_other = Some(idx),
+                                    TilePick::Folder(fp) => folder_act = Some((idx, fp)),
                                 }
                             }
                         });
@@ -5676,6 +5815,11 @@ impl PixelView {
         if let Some(idx) = open_other {
             self.open_with_other(idx);
         }
+        if let Some((idx, fp)) = folder_act {
+            if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
+                self.run_folder_action(p, fp);
+            }
+        }
         if pin_current {
             self.pin_current_folder();
         }
@@ -5683,6 +5827,29 @@ impl PixelView {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
                 self.download_piece(&p, want_pack);
             }
+        }
+        self.empty_area_menu(empty_bg);
+    }
+
+    /// Attach the empty-area right-click menu to a background sensor (from `ui_grid` /
+    /// `ui_table`) and apply the pick. `bg` is `None` when not in a local folder.
+    fn empty_area_menu(&mut self, bg: Option<egui::Response>) {
+        let Some(bg) = bg else { return };
+        let can_paste = self.clipboard.is_some();
+        let facts = self.folder_action_items();
+        let mut pick = None;
+        bg.context_menu(|ui| {
+            pick = empty_area_context_menu(ui, can_paste, &facts);
+        });
+        match pick {
+            Some(EmptyPick::Paste) => self.paste(),
+            Some(EmptyPick::NewFolder) => self.new_folder(),
+            Some(EmptyPick::Folder(fp)) => {
+                if let Some(dir) = self.folder.clone() {
+                    self.run_folder_action(dir, fp);
+                }
+            }
+            None => {}
         }
     }
 
@@ -5696,6 +5863,9 @@ impl PixelView {
         if self.entries.is_empty() {
             // A 16colo listing in flight (artist/group/search streams in) → spinner.
             let loading = self.remote_rx.is_some() || self.colo_rx.is_some();
+            // Sensor registered *after* the justified full-rect label so it isn't occluded
+            // (see the matching note in `ui_grid`'s empty path).
+            let full = ui.available_rect_before_wrap();
             ui.centered_and_justified(|ui| {
                 if loading {
                     ui.add(egui::Spinner::new().size(40.0));
@@ -5703,15 +5873,21 @@ impl PixelView {
                     ui.label("Nothing here. Open a folder.");
                 }
             });
+            let empty_bg = (!loading && self.is_local_dir())
+                .then(|| ui.interact(full, ui.id().with("table_empty_bg"), egui::Sense::click()));
+            self.empty_area_menu(empty_bg);
             return;
         }
         let scene = self.colo_flat;
         let row_h = 46.0_f32;
         let cell_pad = 12.0_f32; // horizontal breathing room inside every cell
-        // Optional subtle row/column dividers (zebra striping is always on). A faint,
-        // theme-agnostic translucent grey so it reads on both light and dark.
+                                 // Optional subtle row/column dividers (zebra striping is always on). A faint,
+                                 // theme-agnostic translucent grey so it reads on both light and dark.
         let grid_lines = self.table_grid;
-        let divider = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(128, 128, 128, 46));
+        let divider = egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(128, 128, 128, 46),
+        );
 
         // Column set + widths. The name/filename (and scene artist) columns flex to
         // absorb leftover width so the table always spans the panel; the rest are fixed.
@@ -5757,19 +5933,54 @@ impl PixelView {
                 ));
             }
             if cs & CS_TYPE != 0 {
-                cols.push(col(ColKind::Type, "Type", Some(SortKey::Type), 56.0, false, false));
+                cols.push(col(
+                    ColKind::Type,
+                    "Type",
+                    Some(SortKey::Type),
+                    56.0,
+                    false,
+                    false,
+                ));
             }
             if cs & CS_YEAR != 0 {
-                cols.push(col(ColKind::Year, "Year", Some(SortKey::Year), 52.0, false, true));
+                cols.push(col(
+                    ColKind::Year,
+                    "Year",
+                    Some(SortKey::Year),
+                    52.0,
+                    false,
+                    true,
+                ));
             }
             if cs & CS_GROUP != 0 {
-                cols.push(col(ColKind::Group, "Group", Some(SortKey::Group), 130.0, false, false));
+                cols.push(col(
+                    ColKind::Group,
+                    "Group",
+                    Some(SortKey::Group),
+                    130.0,
+                    false,
+                    false,
+                ));
             }
             if cs & CS_PACK != 0 {
-                cols.push(col(ColKind::Pack, "Pack", Some(SortKey::Pack), 130.0, false, false));
+                cols.push(col(
+                    ColKind::Pack,
+                    "Pack",
+                    Some(SortKey::Pack),
+                    130.0,
+                    false,
+                    false,
+                ));
             }
             if cs & CS_RATING != 0 {
-                cols.push(col(ColKind::Rating, "Rating", Some(SortKey::Rating), 72.0, false, false));
+                cols.push(col(
+                    ColKind::Rating,
+                    "Rating",
+                    Some(SortKey::Rating),
+                    72.0,
+                    false,
+                    false,
+                ));
             }
             cols.push(col(ColKind::Download, "", None, 96.0, false, false));
         } else {
@@ -5857,7 +6068,11 @@ impl PixelView {
         // Apply the user's drag-to-reorder column order (data columns only — the
         // thumbnail stays first, the scene Download menu stays last). Unknown / newly
         // shown kinds keep their default relative position (sorted to the end).
-        let order = if scene { &self.colo_order } else { &self.table_order };
+        let order = if scene {
+            &self.colo_order
+        } else {
+            &self.table_order
+        };
         if !order.is_empty() {
             let head = 1; // after the thumbnail
             let tail = usize::from(cols.last().map(|c| c.kind) == Some(ColKind::Download));
@@ -5910,6 +6125,7 @@ impl PixelView {
         let mut rate_to: Option<(usize, u8)> = None; // "Rating ▸ N" context-menu choice
         let mut open_with: Option<(usize, usize)> = None; // (entry idx, opener idx)
         let mut open_other: Option<usize> = None; // "Open in… → Other" on this entry
+        let mut folder_act: Option<(usize, FolderActPick)> = None; // "Open folder in…" on a dir
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // (idx, want_pack)
         let mut colo_link: Option<(usize, ColKind)> = None; // pack/year/group link click
@@ -6077,6 +6293,14 @@ impl PixelView {
             }
         });
         ui.separator();
+
+        // Empty-area right-click sensor for the table body (below the header). Registered
+        // before the rows so they occlude it; its rect starts below the header so header
+        // right-clicks (sort / columns) keep their own menu. Local folders only.
+        let empty_bg = self.is_local_dir().then(|| {
+            let r = ui.available_rect_before_wrap();
+            ui.interact(r, ui.id().with("table_empty_bg"), egui::Sense::click())
+        });
 
         let dark = ui.visuals().dark_mode;
         let mut scroll = egui::ScrollArea::vertical()
@@ -6328,9 +6552,11 @@ impl PixelView {
                     let colo_piece = piece.is_some();
                     resp.context_menu(|ui| {
                         let openers = self.opener_items();
+                        let facts = self.folder_action_items();
+                        let local_dir = Self::is_local_path(&entry.path);
                         if let Some(pick) = entry_context_menu(
-                            ui, &entry, can_paste, pinned, viewed, colo_pin, colo_piece,
-                            &openers,
+                            ui, &entry, can_paste, pinned, viewed, colo_pin, colo_piece, &openers,
+                            &facts, local_dir,
                         ) {
                             match pick {
                                 TilePick::Pin => pin_dir = Some(idx),
@@ -6342,6 +6568,7 @@ impl PixelView {
                                 TilePick::Rate(stars) => rate_to = Some((idx, stars)),
                                 TilePick::OpenWith(oi) => open_with = Some((idx, oi)),
                                 TilePick::OpenWithOther => open_other = Some(idx),
+                                TilePick::Folder(fp) => folder_act = Some((idx, fp)),
                             }
                         }
                     });
@@ -6457,6 +6684,11 @@ impl PixelView {
         if let Some(idx) = open_other {
             self.open_with_other(idx);
         }
+        if let Some((idx, fp)) = folder_act {
+            if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
+                self.run_folder_action(p, fp);
+            }
+        }
         if pin_current {
             self.pin_current_folder();
         }
@@ -6465,6 +6697,7 @@ impl PixelView {
                 self.download_piece(&p, want_pack);
             }
         }
+        self.empty_area_menu(empty_bg);
     }
 
     /// "Download file/pack" from a 16colo.rs flat-listing row: ask the user where to
@@ -6580,7 +6813,11 @@ impl PixelView {
         // Slideshow: auto-advance to the next file after it has "settled" (a baud
         // transmission, if any, finished typing) plus the chosen delay — great for
         // flipping through a whole pack hands-free.
-        if self.auto_next && !self.auto_paused && self.path_edit.is_none() && self.rebinding.is_none() {
+        if self.auto_next
+            && !self.auto_paused
+            && self.path_edit.is_none()
+            && self.rebinding.is_none()
+        {
             let busy = self.player.as_ref().is_some_and(|p| p.playing);
             if busy {
                 self.auto_next_dwell = 0.0; // wait for the art to finish drawing
@@ -6822,7 +7059,11 @@ impl PixelView {
             1 - (1.0 / dev).round() as i32 // ½×→-1, ⅓×→-2, …
         };
         let s = (s + if up { 1 } else { -1 }).clamp(-15, 63); // 1/16× … 64×
-        let scale = if s >= 0 { (s + 1) as f32 } else { 1.0 / (1 - s) as f32 };
+        let scale = if s >= 0 {
+            (s + 1) as f32
+        } else {
+            1.0 / (1 - s) as f32
+        };
         self.zoom = (scale / ppp).clamp(0.01, 64.0);
     }
 
@@ -7022,14 +7263,18 @@ impl PixelView {
             // X snaps to the pixel-art ladder — integer N× up, 1/N× down — so a tall scene
             // can shrink below 1:1 to fit (no longer floored at 1×).
             let nx = pp_device_scale(self.zoom * ppp); // device px per source px, X (may be <1)
-            // Y is the CRT stretch off nx. When *upscaling*, rounding it to whole device
-            // pixels makes the ≈1.2× vanish at low zoom (round(2·1.2)=2, no change), so round
-            // only while that stays visibly taller than X, else use the exact ratio. When
-            // *downscaling* (nx<1) just keep the exact ratio — there's no integer to snap to.
-            // aspect_y == 1.0 → ny == nx, so a non-CRT image stays perfectly crisp.
+                                                       // Y is the CRT stretch off nx. When *upscaling*, rounding it to whole device
+                                                       // pixels makes the ≈1.2× vanish at low zoom (round(2·1.2)=2, no change), so round
+                                                       // only while that stays visibly taller than X, else use the exact ratio. When
+                                                       // *downscaling* (nx<1) just keep the exact ratio — there's no integer to snap to.
+                                                       // aspect_y == 1.0 → ny == nx, so a non-CRT image stays perfectly crisp.
             let ny = if nx >= 1.0 {
                 let ny_round = (nx * aspect_y).round();
-                if ny_round > nx { ny_round } else { nx * aspect_y }
+                if ny_round > nx {
+                    ny_round
+                } else {
+                    nx * aspect_y
+                }
             } else {
                 nx * aspect_y
             };
@@ -7291,7 +7536,10 @@ impl PixelView {
         const FADE_OUT: f32 = 0.7;
         if self.osd_enabled && !self.osd_dismissed {
             let pointer = ui.input(|i| i.pointer.hover_pos().or(i.pointer.interact_pos()));
-            let over = self.osd_rect.zip(pointer).is_some_and(|(r, p)| r.contains(p));
+            let over = self
+                .osd_rect
+                .zip(pointer)
+                .is_some_and(|(r, p)| r.contains(p));
             if over {
                 self.osd_t = FADE_IN; // pin at full opacity while hovered
                 self.want_repaint = true;
@@ -7302,7 +7550,12 @@ impl PixelView {
                 if let Some(p) = pointer {
                     let on_close = self.osd_close.is_some_and(|r| r.contains(p));
                     let link = (!on_close)
-                        .then(|| self.osd_links.iter().find(|(r, _)| r.contains(p)).map(|(_, t)| t.clone()))
+                        .then(|| {
+                            self.osd_links
+                                .iter()
+                                .find(|(r, _)| r.contains(p))
+                                .map(|(_, t)| t.clone())
+                        })
                         .flatten();
                     if on_close {
                         // [×] dismisses the OSD for this image only (load_full re-shows it).
@@ -7343,8 +7596,13 @@ impl PixelView {
                     .map(|(p, _)| p.clone())
                     .or_else(|| self.entries.get(self.selected).map(|e| e.path.clone()));
                 if let Some(p) = p {
-                    let (rect, links, close) =
-                        self.paint_osd(&painter, resp.rect, alpha, &p, over.then_some(pointer).flatten());
+                    let (rect, links, close) = self.paint_osd(
+                        &painter,
+                        resp.rect,
+                        alpha,
+                        &p,
+                        over.then_some(pointer).flatten(),
+                    );
                     self.osd_rect = Some(rect);
                     self.osd_links = links;
                     self.osd_close = Some(close);
@@ -7373,7 +7631,11 @@ impl PixelView {
     fn osd_content(
         &self,
         path: &Path,
-    ) -> (String, [u8; 3], Vec<(f32, Vec<(&'static str, String, [u8; 3], Option<PathBuf>)>)>) {
+    ) -> (
+        String,
+        [u8; 3],
+        Vec<(f32, Vec<(&'static str, String, [u8; 3], Option<PathBuf>)>)>,
+    ) {
         use crate::sixteen::{ARTISTS, GROUPS, ROOT};
         type Field = (&'static str, String, [u8; 3], Option<PathBuf>);
         let name = path
@@ -7403,7 +7665,14 @@ impl PixelView {
                 .split(',')
                 .map(|a| a.trim())
                 .filter(|a| !a.is_empty())
-                .map(|a| ("", a.to_string(), [150, 222, 255], Some(root.join(ARTISTS).join(a))))
+                .map(|a| {
+                    (
+                        "",
+                        a.to_string(),
+                        [150, 222, 255],
+                        Some(root.join(ARTISTS).join(a)),
+                    )
+                })
                 .collect();
             if !artists.is_empty() {
                 rows.push((7.0, artists));
@@ -7416,7 +7685,11 @@ impl PixelView {
             if title != name {
                 attrs.push(("File", name.clone(), [228, 228, 234], None));
             }
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_uppercase();
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_uppercase();
             if !ext.is_empty() {
                 attrs.push(("Type", ext, [210, 236, 255], None));
             }
@@ -7432,12 +7705,27 @@ impl PixelView {
                 }
             }
             if !piece.group.is_empty() {
-                attrs.push(("Group", piece.group.clone(), [240, 222, 255], Some(root.join(GROUPS).join(&piece.group))));
+                attrs.push((
+                    "Group",
+                    piece.group.clone(),
+                    [240, 222, 255],
+                    Some(root.join(GROUPS).join(&piece.group)),
+                ));
             }
             if !piece.pack.is_empty() {
-                attrs.push(("Pack", piece.pack.clone(), [218, 255, 224], Some(root.join(piece.year.to_string()).join(&piece.pack))));
+                attrs.push((
+                    "Pack",
+                    piece.pack.clone(),
+                    [218, 255, 224],
+                    Some(root.join(piece.year.to_string()).join(&piece.pack)),
+                ));
             }
-            attrs.push(("Year", piece.year.to_string(), [255, 250, 210], Some(root.join(piece.year.to_string()))));
+            attrs.push((
+                "Year",
+                piece.year.to_string(),
+                [255, 250, 210],
+                Some(root.join(piece.year.to_string())),
+            ));
             if rating > 0 {
                 attrs.push(("Rating", "★".repeat(rating as usize), [255, 210, 96], None));
             }
@@ -7445,18 +7733,25 @@ impl PixelView {
             (title, [255, 246, 232], rows)
         } else {
             if let Some(parent) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-                rows.push((7.0, vec![(
-                    "",
-                    elide(&parent.display().to_string(), 64),
-                    [205, 205, 214],
-                    Some(parent.to_path_buf()),
-                )]));
+                rows.push((
+                    7.0,
+                    vec![(
+                        "",
+                        elide(&parent.display().to_string(), 64),
+                        [205, 205, 214],
+                        Some(parent.to_path_buf()),
+                    )],
+                ));
             }
             if let Some(c) = &comment {
                 rows.push((9.0, vec![("", c.clone(), [205, 205, 214], None)]));
             }
             let mut attrs: Vec<Field> = Vec::new();
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_uppercase();
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_uppercase();
             if !ext.is_empty() {
                 attrs.push(("Type", ext, [210, 236, 255], None));
             }
@@ -7534,8 +7829,9 @@ impl PixelView {
             y += gap;
             let mut x = 0.0_f32;
             for (label, value, c, link) in fields {
-                let lg = (!label.is_empty())
-                    .then(|| painter.layout_no_wrap(label.to_string(), body_font.clone(), label_col));
+                let lg = (!label.is_empty()).then(|| {
+                    painter.layout_no_wrap(label.to_string(), body_font.clone(), label_col)
+                });
                 let vg = painter.layout_no_wrap(value.clone(), body_font.clone(), hue(*c));
                 let group_w = lg.as_ref().map_or(0.0, |g| g.size().x + lv_gap) + vg.size().x;
                 if x > 0.0 {
@@ -7552,7 +7848,10 @@ impl PixelView {
                     x += lg.size().x + lv_gap;
                 }
                 if let Some(t) = link {
-                    let r = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(vg.size().x, line_h));
+                    let r = egui::Rect::from_min_size(
+                        egui::pos2(x, y),
+                        egui::vec2(vg.size().x, line_h),
+                    );
                     links_rel.push((r, t.clone()));
                 }
                 placed.push((egui::pos2(x, y), vg.clone()));
@@ -7596,7 +7895,11 @@ impl PixelView {
         let left = left.max(viewport.left() + margin);
         let top = top.max(viewport.top() + margin);
         let rect = egui::Rect::from_min_size(egui::pos2(left, top), egui::vec2(box_w, box_h));
-        painter.rect_filled(rect, 8.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, av(190.0)));
+        painter.rect_filled(
+            rect,
+            8.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, av(190.0)),
+        );
         painter.rect_stroke(
             rect,
             8.0,
@@ -7621,7 +7924,11 @@ impl PixelView {
                 continue;
             }
             if pointer.is_some_and(|p| abs.contains(p)) {
-                tp.hline(abs.x_range(), abs.bottom() - 2.0, egui::Stroke::new(1.0, white(220.0)));
+                tp.hline(
+                    abs.x_range(),
+                    abs.bottom() - 2.0,
+                    egui::Stroke::new(1.0, white(220.0)),
+                );
             }
             links.push((abs, t));
         }
@@ -7827,7 +8134,10 @@ impl PixelView {
         let Some(path) = self.entries.get(entry_idx).map(|e| e.path.clone()) else {
             return;
         };
-        if let Some(exec) = rfd::FileDialog::new().set_title("Choose a program").pick_file() {
+        if let Some(exec) = rfd::FileDialog::new()
+            .set_title("Choose a program")
+            .pick_file()
+        {
             let exec = exec.to_string_lossy().to_string();
             self.open_external_for(path, exec, String::new(), String::new());
         }
@@ -7835,10 +8145,12 @@ impl PixelView {
 
     /// Decode any not-yet-cached opener icons into small textures (cheap: cached by path,
     /// `None` on failure so we don't re-decode every frame). Drives the menu + editor icons.
+    /// Covers both file "Open in…" openers and folder actions (they share `opener_icons`).
     fn ensure_opener_icons(&mut self, ctx: &egui::Context) {
         let paths: Vec<PathBuf> = self
             .openers
             .iter()
+            .chain(self.folder_actions.iter())
             .filter(|o| !o.icon.trim().is_empty())
             .map(|o| PathBuf::from(o.icon.trim()))
             .filter(|p| !self.opener_icons.contains_key(p))
@@ -7880,6 +8192,73 @@ impl PixelView {
             .collect()
     }
 
+    /// One owned snapshot of every folder action for the "Open folder in…" submenu (global
+    /// index, name, loaded icon id — `exts` unused for folders). Built once per frame so the
+    /// free `entry_context_menu` / `folder_actions_submenu` needn't borrow `self`.
+    fn folder_action_items(&self) -> Vec<OpenerItem> {
+        self.folder_actions
+            .iter()
+            .enumerate()
+            .map(|(idx, o)| OpenerItem {
+                idx,
+                name: o.name.clone(),
+                icon: self
+                    .opener_icons
+                    .get(Path::new(o.icon.trim()))
+                    .and_then(|t| t.as_ref())
+                    .map(|t| t.id()),
+                exts: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// Whether the current folder is a real, writable on-disk directory — i.e. file ops
+    /// (paste / new folder) and folder actions make sense here. Excludes 16colo.rs virtual
+    /// listings, mounted archives (a disposable temp dir), and flat-piece listings.
+    fn is_local_dir(&self) -> bool {
+        match &self.folder {
+            Some(f) => {
+                self.archive_mount.is_none() && !self.colo_flat && !crate::sixteen::is_remote(f)
+            }
+            None => false,
+        }
+    }
+
+    /// A path points at a real local folder we can run a folder action on (local pins /
+    /// grid folder tiles). Virtual 16colo paths have nothing to reveal in a file manager.
+    fn is_local_path(path: &Path) -> bool {
+        !crate::sixteen::is_remote(path)
+    }
+
+    /// The display label for a pin: the user's custom rename if set, else `short_name`.
+    fn fav_label(&self, path: &Path) -> String {
+        self.fav_names
+            .get(path)
+            .filter(|n| !n.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| short_name(path))
+    }
+
+    /// Run a chosen "Open folder in…" action on `dir`: the OS file manager, a user folder
+    /// action, or open the editor. `dir` is a real local directory (checked by callers).
+    fn run_folder_action(&mut self, dir: PathBuf, pick: FolderActPick) {
+        match pick {
+            FolderActPick::Os => {
+                let o = os_file_manager();
+                self.launch_external(&o.exec, &o.args, &o.env, &dir);
+            }
+            FolderActPick::Custom(idx) => {
+                if let Some(o) = self.folder_actions.get(idx).cloned() {
+                    self.launch_external(&o.exec, &o.args, &o.env, &dir);
+                }
+            }
+            FolderActPick::Manage => {
+                self.show_associations = true;
+                self.assoc_tab = 1; // jump to the Folders tab
+            }
+        }
+    }
+
     /// The File-type associations editor (View → Associations…): a left list of openers +
     /// a right field editor for the selected one, with add/preset/remove. Structural edits
     /// are deferred so the closures needn't mutate `self.openers` while borrowing it.
@@ -7887,197 +8266,60 @@ impl PixelView {
         if !self.show_associations {
             return;
         }
-        // Owned name+icon snapshot so the list pane doesn't borrow `self.openers` while we
-        // also `get_mut` the selected one for the editor pane.
-        let list: Vec<(String, Option<egui::TextureId>)> = self
-            .openers
-            .iter()
-            .map(|o| {
-                let name = if o.name.trim().is_empty() {
-                    "(unnamed)".to_string()
-                } else {
-                    o.name.clone()
-                };
-                let icon = self
-                    .opener_icons
-                    .get(Path::new(o.icon.trim()))
-                    .and_then(|t| t.as_ref())
-                    .map(|t| t.id());
-                (name, icon)
-            })
-            .collect();
-        if self.assoc_selected >= self.openers.len() {
-            self.assoc_selected = self.openers.len().saturating_sub(1);
-        }
-
         let mut open = true;
-        let mut add_blank = false;
-        let mut add_preset: Option<Opener> = None;
-        let mut remove: Option<usize> = None;
-        egui::Window::new("File-type associations")
+        egui::Window::new("Associations")
             .open(&mut open)
             .collapsible(false)
             .default_width(580.0)
             .show(ctx, |ui| {
-                ui.label(
-                    "Register external programs to open files by type. Right-click a file → \
-                     Open in… to launch one.",
-                );
-                ui.add_space(6.0);
+                // Tabs: file "Open in…" programs vs "Open folder in…" folder actions. The two
+                // share one editor (`openers_editor`) — folders just hide the Extensions field.
                 ui.horizontal(|ui| {
-                    if ui.button("➕ Add").clicked() {
-                        add_blank = true;
+                    if ui.selectable_label(self.assoc_tab == 0, "Files").clicked() {
+                        self.assoc_tab = 0;
                     }
-                    ui.menu_button("Add preset ▾", |ui| {
-                        for p in opener_presets() {
-                            if ui.button(&p.name).clicked() {
-                                add_preset = Some(p);
-                                ui.close();
-                            }
-                        }
-                    });
+                    if ui
+                        .selectable_label(self.assoc_tab == 1, "Folders")
+                        .clicked()
+                    {
+                        self.assoc_tab = 1;
+                    }
                 });
                 ui.separator();
-                if self.openers.is_empty() {
-                    ui.weak(
-                        "No associations yet. Click Add (or pick a preset) and set its \
-                         program path + extensions.",
+                if self.assoc_tab == 1 {
+                    openers_editor(
+                        ui,
+                        &mut self.folder_actions,
+                        &mut self.folder_act_selected,
+                        &self.opener_icons,
+                        false,
+                        &folder_action_presets(),
+                        "Run a program on a folder. Right-click a folder, a Places pin, or the \
+                         empty grid › Open folder in… to launch one. The OS file manager is \
+                         always offered; add your own below.",
+                        "No folder actions yet. Click Add (or a preset) and set the program. \
+                         {} = the folder path.",
+                        "optional; {} = folder path, else appended",
+                        "assoc_folders",
                     );
-                    return;
-                }
-
-                let mut select: Option<usize> = None;
-                ui.columns(2, |cols| {
-                    // Left: the opener list.
-                    egui::ScrollArea::vertical()
-                        .id_salt("assoc_list")
-                        .max_height(320.0)
-                        .show(&mut cols[0], |ui| {
-                            for (i, (name, icon)) in list.iter().enumerate() {
-                                let sel = i == self.assoc_selected;
-                                let resp = match icon {
-                                    Some(id) => {
-                                        let img = egui::Image::new(egui::load::SizedTexture::new(
-                                            *id,
-                                            egui::vec2(16.0, 16.0),
-                                        ));
-                                        ui.add(
-                                            egui::Button::image_and_text(img, name).selected(sel),
-                                        )
-                                    }
-                                    None => ui.selectable_label(sel, name),
-                                };
-                                if resp.clicked() {
-                                    select = Some(i);
-                                }
-                            }
-                        });
-
-                    // Right: edit the selected opener's fields.
-                    let rui = &mut cols[1];
-                    let sel = self.assoc_selected;
-                    let icon_id = list.get(sel).and_then(|(_, ic)| *ic);
-                    if let Some(o) = self.openers.get_mut(sel) {
-                        egui::Grid::new("assoc_edit")
-                            .num_columns(2)
-                            .spacing([8.0, 6.0])
-                            .show(rui, |ui| {
-                                ui.label("Name");
-                                ui.text_edit_singleline(&mut o.name);
-                                ui.end_row();
-
-                                ui.label("Program");
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut o.exec)
-                                            .desired_width(200.0)
-                                            .hint_text("gimp, /usr/bin/inkscape, …"),
-                                    );
-                                    if ui.button("Browse…").clicked() {
-                                        if let Some(p) = rfd::FileDialog::new()
-                                            .set_title("Choose program")
-                                            .pick_file()
-                                        {
-                                            o.exec = p.to_string_lossy().into_owned();
-                                        }
-                                    }
-                                });
-                                ui.end_row();
-
-                                ui.label("Extensions");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut o.exts)
-                                        .desired_width(260.0)
-                                        .hint_text("png, jpg, ans, xb …"),
-                                );
-                                ui.end_row();
-
-                                ui.label("Arguments");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut o.args)
-                                        .desired_width(260.0)
-                                        .hint_text("optional; {} = file path, else appended"),
-                                );
-                                ui.end_row();
-
-                                ui.label("Icon");
-                                ui.horizontal(|ui| {
-                                    if let Some(id) = icon_id {
-                                        ui.add(egui::Image::new(egui::load::SizedTexture::new(
-                                            id,
-                                            egui::vec2(20.0, 20.0),
-                                        )));
-                                    }
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut o.icon)
-                                            .desired_width(170.0)
-                                            .hint_text("optional image"),
-                                    );
-                                    if ui.button("Browse…").clicked() {
-                                        if let Some(p) = rfd::FileDialog::new()
-                                            .set_title("Choose an icon image")
-                                            .pick_file()
-                                        {
-                                            o.icon = p.to_string_lossy().into_owned();
-                                        }
-                                    }
-                                });
-                                ui.end_row();
-
-                                ui.label("Environment");
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut o.env)
-                                        .desired_width(260.0)
-                                        .desired_rows(2)
-                                        .hint_text("KEY=VALUE per line (optional)"),
-                                );
-                                ui.end_row();
-                            });
-                        rui.add_space(6.0);
-                        if rui.button("🗑 Remove this association").clicked() {
-                            remove = Some(sel);
-                        }
-                    }
-                });
-                if let Some(i) = select {
-                    self.assoc_selected = i;
+                } else {
+                    openers_editor(
+                        ui,
+                        &mut self.openers,
+                        &mut self.assoc_selected,
+                        &self.opener_icons,
+                        true,
+                        &opener_presets(),
+                        "Register external programs to open files by type. Right-click a file → \
+                         Open in… to launch one.",
+                        "No associations yet. Click Add (or pick a preset) and set its program \
+                         path + extensions.",
+                        "optional; {} = file path, else appended",
+                        "assoc_files",
+                    );
                 }
             });
         self.show_associations = open;
-
-        // Apply deferred structural edits.
-        if add_blank {
-            self.openers.push(Opener::default());
-            self.assoc_selected = self.openers.len() - 1;
-        }
-        if let Some(p) = add_preset {
-            self.openers.push(p);
-            self.assoc_selected = self.openers.len() - 1;
-        }
-        if let Some(i) = remove {
-            self.openers.remove(i);
-            self.assoc_selected = self.assoc_selected.min(self.openers.len().saturating_sub(1));
-        }
     }
 
     /// Bottom status bar: counts + total size, and the current selection.
@@ -8613,10 +8855,36 @@ impl PixelView {
                     action = Some(MenuAction::Home);
                     ui.close();
                 }
-                if !self.favorites.is_empty() {
+                // Pinned places, in favorites order (so a Places reorder is honored here),
+                // styled like the Places pins — custom label + color tag — and split into
+                // Local vs 16colo.rs groups by a divider, mirroring the Places sub-tabs.
+                let has_local = self.favorites.iter().any(|f| !crate::sixteen::is_remote(f));
+                let has_remote = self.favorites.iter().any(|f| crate::sixteen::is_remote(f));
+                if has_local {
                     ui.separator();
-                    for fav in &self.favorites {
-                        if ui.button(format!("📁 {}", short_name(fav))).clicked() {
+                    for fav in self
+                        .favorites
+                        .iter()
+                        .filter(|f| !crate::sixteen::is_remote(f))
+                    {
+                        let label = format!("📁 {}", self.fav_label(fav));
+                        let color = self.fav_colors.get(fav).copied();
+                        if Self::colored_place_button(ui, &label, color) {
+                            action = Some(MenuAction::Nav(fav.clone()));
+                            ui.close();
+                        }
+                    }
+                }
+                if has_remote {
+                    ui.separator();
+                    for fav in self
+                        .favorites
+                        .iter()
+                        .filter(|f| crate::sixteen::is_remote(f))
+                    {
+                        let label = format!("🌐 {}", self.fav_label(fav));
+                        let color = self.fav_colors.get(fav).copied();
+                        if Self::colored_place_button(ui, &label, color) {
                             action = Some(MenuAction::Nav(fav.clone()));
                             ui.close();
                         }
@@ -8720,10 +8988,7 @@ impl PixelView {
                 if self.explorer_tab == 0 {
                     // Sub-tabs split favorites/pins by kind: Local folders vs 16colo.rs.
                     ui.horizontal(|ui| {
-                        if ui
-                            .selectable_label(self.places_tab == 0, "Local")
-                            .clicked()
-                        {
+                        if ui.selectable_label(self.places_tab == 0, "Local").clicked() {
                             self.places_tab = 0;
                         }
                         if ui
@@ -8749,9 +9014,9 @@ impl PixelView {
                             ui.separator();
                             ui.weak("Smart filters");
                             for (i, (name, _)) in self.saved_filters.iter().enumerate() {
-                                let r = ui.button(format!("🔍 {name}")).on_hover_text(
-                                    "Run this saved search · right-click to remove",
-                                );
+                                let r = ui
+                                    .button(format!("🔍 {name}"))
+                                    .on_hover_text("Run this saved search · right-click to remove");
                                 if r.clicked() {
                                     recall = Some(i);
                                 }
@@ -8772,8 +9037,7 @@ impl PixelView {
                         {
                             nav = Some(PathBuf::from(crate::sixteen::ROOT));
                         }
-                        if let Some(p) =
-                            self.favorites_buttons(ui, "🌐", crate::sixteen::is_remote)
+                        if let Some(p) = self.favorites_buttons(ui, "🌐", crate::sixteen::is_remote)
                         {
                             nav = Some(p);
                         }
@@ -8838,6 +9102,7 @@ impl eframe::App for PixelView {
         // (held across frames), so it's reliable even though this runs before the panels.
         let typing = self.path_edit.is_some()
             || self.renaming.is_some()
+            || self.fav_rename.is_some()
             || self.rebinding.is_some()
             || ctx.egui_wants_keyboard_input();
         if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
@@ -8985,9 +9250,7 @@ impl eframe::App for PixelView {
         // Keyboard: ratings (1-5 / 0) + rebindable nav (defaults: Esc->grid,
         // Backspace->parent). Suppressed while typing into any text field (path /
         // search / rename) or capturing a rebind — else a typed digit rates an image.
-        if !typing
-            && self.search.is_none()
-            && !self.show_search
+        if !typing && self.search.is_none() && !self.show_search
         // typing into any field (path, rename, search box, criteria) must not rate
         // images or trigger nav keys — `typing` now also covers focused text fields.
         {
@@ -9095,11 +9358,7 @@ impl eframe::App for PixelView {
                 i.pointer.button_pressed(egui::PointerButton::Extra2),
             )
         });
-        if self.mode == Mode::Grid
-            && !typing
-            && self.search.is_none()
-            && !self.entries.is_empty()
-        {
+        if self.mode == Mode::Grid && !typing && self.search.is_none() && !self.entries.is_empty() {
             if home {
                 self.select_index(0);
             }
@@ -9540,6 +9799,56 @@ impl eframe::App for PixelView {
             }
         }
 
+        // Pin-rename dialog (right-click a Places pin → Rename…). Renames only the *label*
+        // (`fav_names`), never where the pin points. Clearing the field reverts to the folder
+        // name. Mirrors the file-rename dialog above but writes `fav_names`, not the disk.
+        if let Some((path, mut name)) = self.fav_rename.take() {
+            let mut open = true;
+            let mut commit = false;
+            let mut cancel = false;
+            egui::Window::new("Rename pin")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(&ctx, |ui| {
+                    ui.label(format!("Label for “{}”", short_name(&path)));
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut name)
+                            .desired_width(280.0)
+                            .hint_text(short_name(&path)),
+                    );
+                    if self.focus_rename {
+                        resp.request_focus();
+                        self.focus_rename = false;
+                    }
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        commit = true;
+                    }
+                    ui.weak("Renames the label only, not where it points.");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Rename").clicked() {
+                            commit = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if commit {
+                let trimmed = name.trim();
+                // Empty (or same as the folder name) → clear the custom label.
+                if trimmed.is_empty() || trimmed == short_name(&path) {
+                    self.fav_names.remove(&path);
+                } else {
+                    self.fav_names.insert(path, trimmed.to_string());
+                }
+            } else if !cancel && open {
+                self.fav_rename = Some((path, name)); // keep editing next frame
+            }
+        }
+
         // Auto-hide the mouse cursor in immersive mode after a still moment (set last so
         // it overrides any widget's cursor request for this frame).
         if hide_cursor {
@@ -9555,10 +9864,23 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::ZOOM_KEY, &self.ui_zoom);
         eframe::set_value(storage, Self::THUMB_KEY, &self.thumb_size);
         eframe::set_value(storage, Self::FAV_KEY, &self.favorites);
-        let fav_colors: Vec<(PathBuf, [u8; 3])> =
-            self.fav_colors.iter().map(|(p, &c)| (p.clone(), c)).collect();
+        let fav_colors: Vec<(PathBuf, [u8; 3])> = self
+            .fav_colors
+            .iter()
+            .map(|(p, &c)| (p.clone(), c))
+            .collect();
         eframe::set_value(storage, Self::FAV_COLORS_KEY, &fav_colors);
-        eframe::set_value(storage, Self::FAV_BAR_COLORED_KEY, &self.fav_bar_colored_only);
+        let fav_names: Vec<(PathBuf, String)> = self
+            .fav_names
+            .iter()
+            .map(|(p, n)| (p.clone(), n.clone()))
+            .collect();
+        eframe::set_value(storage, Self::FAV_NAMES_KEY, &fav_names);
+        eframe::set_value(
+            storage,
+            Self::FAV_BAR_COLORED_KEY,
+            &self.fav_bar_colored_only,
+        );
         let filters: Vec<Vec<String>> = self
             .saved_filters
             .iter()
@@ -9571,6 +9893,9 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::SAVED_FILTERS_KEY, &filters);
         let openers: Vec<Vec<String>> = self.openers.iter().map(|o| o.record()).collect();
         eframe::set_value(storage, Self::OPENERS_KEY, &openers);
+        let folder_actions: Vec<Vec<String>> =
+            self.folder_actions.iter().map(|o| o.record()).collect();
+        eframe::set_value(storage, Self::FOLDER_ACTIONS_KEY, &folder_actions);
         // Remember where we were. Save the *display* path, not `self.folder`: inside an
         // archive / downloaded 16colo pack, `self.folder` is a temp dir that's gone next
         // launch, whereas the display path (`pack.zip/…`, `<16colo.rs>/year/pack`) is
@@ -11202,11 +11527,12 @@ enum TilePick {
     PinFolder, // pin the *current* folder (e.g. the 16colo artist/group/search) to Places
     Smart(SmartCriterion),
     File(FileAction),
-    ToggleViewed(bool),     // mark this entry viewed (true) / not viewed (false)
-    Download(bool),         // save a 16colo piece (false) or its whole pack .zip (true)
-    Rate(u8),               // set this entry's star rating (0 = clear), via the context menu
-    OpenWith(usize),        // "Open in…" → launch the external opener at this index
-    OpenWithOther,          // "Open in…" → pick an arbitrary program (one-off, rfd)
+    ToggleViewed(bool),    // mark this entry viewed (true) / not viewed (false)
+    Download(bool),        // save a 16colo piece (false) or its whole pack .zip (true)
+    Rate(u8),              // set this entry's star rating (0 = clear), via the context menu
+    OpenWith(usize),       // "Open in…" → launch the external opener at this index
+    OpenWithOther,         // "Open in…" → pick an arbitrary program (one-off, rfd)
+    Folder(FolderActPick), // "Open folder in…" → run a folder action on this dir
 }
 
 /// A user-defined external program registered to open files of certain types ("open in
@@ -11288,6 +11614,325 @@ fn opener_presets() -> Vec<Opener> {
     ]
 }
 
+/// Which entry in the "Open folder in…" submenu was chosen.
+#[derive(Clone, Copy)]
+enum FolderActPick {
+    Os,            // the OS file-manager default (Finder / xdg-open / Explorer)
+    Custom(usize), // the user folder action at this index
+    Manage,        // open the folder-actions editor (Associations → Folders tab)
+}
+
+/// The OS-default "folder action": open a directory in the native file browser. `launch_external`
+/// substitutes the `{}` token in `args` with the folder path, so this works uniformly per-OS —
+/// `open <dir>` (Finder), `xdg-open <dir>` (the Linux default file manager), `explorer <dir>`.
+fn os_file_manager() -> Opener {
+    let (name, exec) = if cfg!(target_os = "macos") {
+        ("Reveal in Finder", "open")
+    } else if cfg!(target_os = "windows") {
+        ("Open in Explorer", "explorer")
+    } else {
+        ("Open in File Manager", "xdg-open")
+    };
+    Opener {
+        name: name.to_string(),
+        exec: exec.to_string(),
+        args: "{}".to_string(),
+        ..Default::default()
+    }
+}
+
+/// Starter folder actions offered in the editor's "Add preset" menu. The user adjusts the
+/// exec/args to match their setup (e.g. the terminal that ships with their desktop).
+fn folder_action_presets() -> Vec<Opener> {
+    let mk = |name: &str, exec: &str, args: &str| Opener {
+        name: name.to_string(),
+        exec: exec.to_string(),
+        args: args.to_string(),
+        ..Default::default()
+    };
+    vec![
+        mk("VS Code", "code", "{}"),
+        mk(
+            "Open terminal here",
+            "x-terminal-emulator",
+            "--working-directory={}",
+        ),
+        mk("Files (Nautilus)", "nautilus", "{}"),
+        mk("Dolphin", "dolphin", "{}"),
+    ]
+}
+
+/// The shared "Open folder in…" submenu body, used by folder tiles, pins, and the empty-grid
+/// menu. Lists the OS file-manager default, then the user's folder actions (with icons), then
+/// a "Manage folder actions…" entry. Returns the pick, or `None` while still open. A free fn
+/// (like `entry_context_menu`) so it needn't borrow `self` — it takes an owned `actions` snapshot.
+fn folder_actions_submenu(ui: &mut egui::Ui, actions: &[OpenerItem]) -> Option<FolderActPick> {
+    let mut pick = None;
+    ui.menu_button("Open folder in…", |ui| {
+        // OS default file browser (Finder / xdg-open / Explorer).
+        if ui.button(os_file_manager().name).clicked() {
+            pick = Some(FolderActPick::Os);
+            ui.close();
+        }
+        if !actions.is_empty() {
+            ui.separator();
+            for a in actions {
+                let clicked = match a.icon {
+                    Some(id) => {
+                        let img = egui::Image::new(egui::load::SizedTexture::new(
+                            id,
+                            egui::vec2(16.0, 16.0),
+                        ));
+                        ui.add(egui::Button::image_and_text(img, &a.name)).clicked()
+                    }
+                    None => ui.button(&a.name).clicked(),
+                };
+                if clicked {
+                    pick = Some(FolderActPick::Custom(a.idx));
+                    ui.close();
+                }
+            }
+        }
+        ui.separator();
+        if ui.button("⚙ Manage folder actions…").clicked() {
+            pick = Some(FolderActPick::Manage);
+            ui.close();
+        }
+    });
+    pick
+}
+
+/// A deferred choice from the empty-area (background) right-click menu of the grid / table.
+enum EmptyPick {
+    Paste,
+    NewFolder,
+    Folder(FolderActPick), // "Open folder in…" acting on the *current* folder
+}
+
+/// The right-click menu for the empty part of the grid / table body (local folders only):
+/// edit actions on the current folder + an "Open folder in…" submenu. A free fn so it needn't
+/// borrow `self`; `can_paste` and the folder-action snapshot are passed in.
+fn empty_area_context_menu(
+    ui: &mut egui::Ui,
+    can_paste: bool,
+    folder_actions: &[OpenerItem],
+) -> Option<EmptyPick> {
+    let mut pick = None;
+    if ui
+        .add_enabled(can_paste, egui::Button::new("Paste"))
+        .clicked()
+    {
+        pick = Some(EmptyPick::Paste);
+        ui.close();
+    }
+    if ui.button("New folder").clicked() {
+        pick = Some(EmptyPick::NewFolder);
+        ui.close();
+    }
+    ui.separator();
+    if let Some(fp) = folder_actions_submenu(ui, folder_actions) {
+        pick = Some(EmptyPick::Folder(fp));
+    }
+    pick
+}
+
+/// The shared editor body for a list of external programs — used for both the file "Open in…"
+/// associations (`show_exts` = true) and the "Open folder in…" folder actions (`show_exts` =
+/// false, so the Extensions field is hidden). A free fn taking the pieces as disjoint borrows
+/// (`openers` mut, `selected` mut, `icons` shared) so one `PixelView` can host both tabs.
+/// Renders the Add / preset row, a left list + right field editor, and applies add/remove.
+#[allow(clippy::too_many_arguments)]
+fn openers_editor(
+    ui: &mut egui::Ui,
+    openers: &mut Vec<Opener>,
+    selected: &mut usize,
+    icons: &HashMap<PathBuf, Option<egui::TextureHandle>>,
+    show_exts: bool,
+    presets: &[Opener],
+    intro: &str,
+    empty_hint: &str,
+    args_hint: &str,
+    id_salt: &str,
+) {
+    if *selected >= openers.len() {
+        *selected = openers.len().saturating_sub(1);
+    }
+    // Owned name+icon snapshot so the list pane doesn't borrow `openers` while we also
+    // `get_mut` the selected one for the editor pane.
+    let list: Vec<(String, Option<egui::TextureId>)> = openers
+        .iter()
+        .map(|o| {
+            let name = if o.name.trim().is_empty() {
+                "(unnamed)".to_string()
+            } else {
+                o.name.clone()
+            };
+            let icon = icons
+                .get(Path::new(o.icon.trim()))
+                .and_then(|t| t.as_ref())
+                .map(|t| t.id());
+            (name, icon)
+        })
+        .collect();
+
+    ui.label(intro);
+    ui.add_space(6.0);
+    let mut add_blank = false;
+    let mut add_preset: Option<Opener> = None;
+    let mut remove: Option<usize> = None;
+    ui.horizontal(|ui| {
+        if ui.button("➕ Add").clicked() {
+            add_blank = true;
+        }
+        if !presets.is_empty() {
+            ui.menu_button("Add preset", |ui| {
+                for p in presets {
+                    if ui.button(&p.name).clicked() {
+                        add_preset = Some(p.clone());
+                        ui.close();
+                    }
+                }
+            });
+        }
+    });
+    ui.separator();
+    if openers.is_empty() {
+        ui.weak(empty_hint);
+        return;
+    }
+
+    let mut select: Option<usize> = None;
+    ui.columns(2, |cols| {
+        // Left: the program list.
+        egui::ScrollArea::vertical()
+            .id_salt(format!("{id_salt}_list"))
+            .max_height(320.0)
+            .show(&mut cols[0], |ui| {
+                for (i, (name, icon)) in list.iter().enumerate() {
+                    let sel = i == *selected;
+                    let resp = match icon {
+                        Some(id) => {
+                            let img = egui::Image::new(egui::load::SizedTexture::new(
+                                *id,
+                                egui::vec2(16.0, 16.0),
+                            ));
+                            ui.add(egui::Button::image_and_text(img, name).selected(sel))
+                        }
+                        None => ui.selectable_label(sel, name),
+                    };
+                    if resp.clicked() {
+                        select = Some(i);
+                    }
+                }
+            });
+
+        // Right: edit the selected program's fields.
+        let rui = &mut cols[1];
+        let sel = *selected;
+        let icon_id = list.get(sel).and_then(|(_, ic)| *ic);
+        if let Some(o) = openers.get_mut(sel) {
+            egui::Grid::new(format!("{id_salt}_edit"))
+                .num_columns(2)
+                .spacing([8.0, 6.0])
+                .show(rui, |ui| {
+                    ui.label("Name");
+                    ui.text_edit_singleline(&mut o.name);
+                    ui.end_row();
+
+                    ui.label("Program");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut o.exec)
+                                .desired_width(200.0)
+                                .hint_text("gimp, /usr/bin/inkscape, code, …"),
+                        );
+                        if ui.button("Browse…").clicked() {
+                            if let Some(p) = rfd::FileDialog::new()
+                                .set_title("Choose program")
+                                .pick_file()
+                            {
+                                o.exec = p.to_string_lossy().into_owned();
+                            }
+                        }
+                    });
+                    ui.end_row();
+
+                    if show_exts {
+                        ui.label("Extensions");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut o.exts)
+                                .desired_width(260.0)
+                                .hint_text("png, jpg, ans, xb …"),
+                        );
+                        ui.end_row();
+                    }
+
+                    ui.label("Arguments");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut o.args)
+                            .desired_width(260.0)
+                            .hint_text(args_hint),
+                    );
+                    ui.end_row();
+
+                    ui.label("Icon");
+                    ui.horizontal(|ui| {
+                        if let Some(id) = icon_id {
+                            ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                                id,
+                                egui::vec2(20.0, 20.0),
+                            )));
+                        }
+                        ui.add(
+                            egui::TextEdit::singleline(&mut o.icon)
+                                .desired_width(170.0)
+                                .hint_text("optional image"),
+                        );
+                        if ui.button("Browse…").clicked() {
+                            if let Some(p) = rfd::FileDialog::new()
+                                .set_title("Choose an icon image")
+                                .pick_file()
+                            {
+                                o.icon = p.to_string_lossy().into_owned();
+                            }
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label("Environment");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut o.env)
+                            .desired_width(260.0)
+                            .desired_rows(2)
+                            .hint_text("KEY=VALUE per line (optional)"),
+                    );
+                    ui.end_row();
+                });
+            rui.add_space(6.0);
+            if rui.button("🗑 Remove this entry").clicked() {
+                remove = Some(sel);
+            }
+        }
+    });
+    if let Some(i) = select {
+        *selected = i;
+    }
+
+    // Apply deferred structural edits.
+    if add_blank {
+        openers.push(Opener::default());
+        *selected = openers.len() - 1;
+    }
+    if let Some(p) = add_preset {
+        openers.push(p);
+        *selected = openers.len() - 1;
+    }
+    if let Some(i) = remove {
+        openers.remove(i);
+        *selected = (*selected).min(openers.len().saturating_sub(1));
+    }
+}
+
 /// The shared right-click context menu for a browse entry (used by both the grid tile
 /// and the table row). Returns the chosen action, or `None` while the menu is still
 /// open. `pinned` (already-a-favorite) and `can_paste` are passed in so this needn't
@@ -11303,6 +11948,8 @@ fn entry_context_menu(
     colo_pin: Option<(&str, bool)>, // (label, already-pinned)
     colo_piece: bool,               // a 16colo.rs piece → offer Download
     openers: &[OpenerItem],         // user "Open in…" programs (filtered here by extension)
+    folder_actions: &[OpenerItem],  // "Open folder in…" actions (shown for local dirs)
+    local_dir: bool,                // this entry is a real on-disk folder (offer folder actions)
 ) -> Option<TilePick> {
     let mut pick = None;
     // Open in… an external program registered for this file's type (View → Associations).
@@ -11386,6 +12033,13 @@ fn entry_context_menu(
         ui.separator();
     }
     if entry.is_dir {
+        // Open this folder in the OS file browser or a user folder action (local dirs only —
+        // a virtual 16colo path has nothing to reveal on disk).
+        if local_dir {
+            if let Some(fp) = folder_actions_submenu(ui, folder_actions) {
+                pick = Some(TilePick::Folder(fp));
+            }
+        }
         if ui
             .add_enabled(!pinned, egui::Button::new("📌 Pin to Places"))
             .clicked()
@@ -11994,7 +12648,11 @@ fn paint_spinner(p: &egui::Painter, c: egui::Pos2, r: f32, t: f64, color: egui::
 /// bundled font lacks a reliable check mark (see the font gotcha in CLAUDE.md).
 fn paint_check_badge(p: &egui::Painter, c: egui::Pos2, r: f32) {
     p.circle_filled(c, r, egui::Color32::from_rgb(70, 175, 90));
-    p.circle_stroke(c, r, egui::Stroke::new(1.0, egui::Color32::from_black_alpha(130)));
+    p.circle_stroke(
+        c,
+        r,
+        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(130)),
+    );
     let s = egui::Stroke::new((r * 0.30).max(1.5), egui::Color32::WHITE);
     let a = c + egui::vec2(-r * 0.42, r * 0.02);
     let b = c + egui::vec2(-r * 0.08, r * 0.38);
@@ -12186,8 +12844,14 @@ const HOTKEYS: &[(&str, &str)] = &[
         "Mouse Back / Fwd",
         "Grid: folder history · Viewer: prev / next image",
     ),
-    ("Home / End", "Grid: first / last · Viewer: scroll to top / bottom"),
-    ("PageUp / PageDown", "Viewer: scroll 25 lines (a screen of scene art)"),
+    (
+        "Home / End",
+        "Grid: first / last · Viewer: scroll to top / bottom",
+    ),
+    (
+        "PageUp / PageDown",
+        "Viewer: scroll 25 lines (a screen of scene art)",
+    ),
     ("Arrow Up / Down", "Viewer: scroll a long image"),
     ("/", "Grid: filter by filename"),
     ("Drag", "Pan the image"),

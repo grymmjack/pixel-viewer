@@ -16,8 +16,8 @@ pub struct Sauce {
     pub tinfo1: u16, // character art: canvas width
     pub tinfo2: u16, // character art: number of lines
     pub comments: u8,
-    pub ice: bool,    // TFlags bit 0 — non-blink / iCE colors
-    pub font: String, // TInfoS — font name
+    pub ice: bool,       // TFlags bit 0 — non-blink / iCE colors
+    pub font: String,    // TInfoS — font name
     pub comment: String, // SAUCE comment text (the COMNT block / API `Comments`), if any
 }
 

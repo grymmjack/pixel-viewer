@@ -186,7 +186,9 @@ fn touch(url: &str) {
 /// Delete least-recently-used blobs while the total exceeds [`MAX_BYTES`].
 fn evict(dir: &Path, db: &rusqlite::Connection) {
     let total: i64 = db
-        .query_row("SELECT COALESCE(SUM(bytes), 0) FROM cache", [], |r| r.get(0))
+        .query_row("SELECT COALESCE(SUM(bytes), 0) FROM cache", [], |r| {
+            r.get(0)
+        })
         .unwrap_or(0);
     if total <= MAX_BYTES {
         return;
@@ -273,6 +275,9 @@ mod live {
         assert_eq!(a, b, "cached bytes match");
         assert!(!a.is_empty());
         let (bytes, count) = stats();
-        assert!(bytes >= a.len() as i64 && count >= 1, "stats reflect the entry");
+        assert!(
+            bytes >= a.len() as i64 && count >= 1,
+            "stats reflect the entry"
+        );
     }
 }

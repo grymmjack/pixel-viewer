@@ -426,8 +426,11 @@ fn parse(data: &[u8], wrap: usize, ice: bool) -> (Vec<Vec<Cell>>, usize) {
                     // (the file also emits a 16-color SGR fallback we'd otherwise show).
                     b't' => {
                         if nums.len() >= 4 {
-                            let rgb =
-                                [nums[1].min(255) as u8, nums[2].min(255) as u8, nums[3].min(255) as u8];
+                            let rgb = [
+                                nums[1].min(255) as u8,
+                                nums[2].min(255) as u8,
+                                nums[3].min(255) as u8,
+                            ];
                             match nums[0] {
                                 0 => bg_rgb = Some(rgb),
                                 1 => fg_rgb = Some(rgb),
@@ -504,9 +507,11 @@ fn parse(data: &[u8], wrap: usize, ice: bool) -> (Vec<Vec<Cell>>, usize) {
                     // Resolve to RGB. A 24-bit override (`*_rgb`) wins; otherwise the
                     // 16-color index, with bold brightening fg and (iCE) blink brightening
                     // bg. Reverse swaps the two resolved colors.
-                    let efg = fg_rgb.unwrap_or(PALETTE[(if bold { fg | 8 } else { fg } & 0x0f) as usize]);
-                    let ebg =
-                        bg_rgb.unwrap_or(PALETTE[(if ice && blink { bg | 8 } else { bg } & 0x0f) as usize]);
+                    let efg =
+                        fg_rgb.unwrap_or(PALETTE[(if bold { fg | 8 } else { fg } & 0x0f) as usize]);
+                    let ebg = bg_rgb.unwrap_or(
+                        PALETTE[(if ice && blink { bg | 8 } else { bg } & 0x0f) as usize],
+                    );
                     let (cfg, cbg) = if reverse { (ebg, efg) } else { (efg, ebg) };
                     ensure(&mut grid, y, x);
                     grid[y][x] = Cell {
@@ -880,5 +885,3 @@ mod tests {
         eprintln!("wrote /tmp/ansi_out.png {}x{}", img.width, img.height);
     }
 }
-
-

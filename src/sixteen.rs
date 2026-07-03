@@ -180,7 +180,6 @@ pub fn download_file(url: &str, filename: &str) -> Result<PathBuf, String> {
     crate::cache::get_file(url, filename)
 }
 
-
 /// The virtual sub-roots the nav bar exposes besides the year list.
 pub const GROUPS: &str = "groups";
 pub const ARTISTS: &str = "artists";
@@ -665,7 +664,10 @@ mod tests {
         let p = &pieces_from_pack_json("fire", "fire", 0, &pv)[0];
         assert_eq!(p.filename, "#44_FIRE.ANS"); // identity keeps the real name
         assert_eq!(p.raw_url, "https://16colo.rs/pack/fire/raw/%2344_FIRE.ANS");
-        assert_eq!(p.tn_url, "https://16colo.rs/pack/fire/x1/%2344_FIRE.ANS.png");
+        assert_eq!(
+            p.tn_url,
+            "https://16colo.rs/pack/fire/x1/%2344_FIRE.ANS.png"
+        );
 
         let av: serde_json::Value = serde_json::from_str(
             r##"{ "results": { "2025": { "fire": {
@@ -677,7 +679,10 @@ mod tests {
         .unwrap();
         let p = &pieces_from_artist_json("tainted", &av)[0];
         assert_eq!(p.raw_url, "https://16colo.rs/pack/fire/raw/%2344_FIRE.ANS");
-        assert_eq!(p.tn_url, "https://16colo.rs/pack/fire/x1/%2344_FIRE.ANS.png");
+        assert_eq!(
+            p.tn_url,
+            "https://16colo.rs/pack/fire/x1/%2344_FIRE.ANS.png"
+        );
     }
 
     #[test]

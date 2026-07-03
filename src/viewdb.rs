@@ -160,7 +160,8 @@ mod tests {
 
     #[test]
     fn persists_across_reopen() {
-        let dir = std::env::temp_dir().join(format!("pixelview_viewdb_test_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("pixelview_viewdb_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         {
             let mut db = ViewDb::open(&dir).expect("open");
