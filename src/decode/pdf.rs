@@ -275,10 +275,52 @@ impl Decoder for PdfDecoder {
     }
 
     fn decode(&self, bytes: &[u8]) -> Result<PixImage, DecodeError> {
+        // Prefer a REAL first-page render via poppler's `pdftoppm` (renders the actual page,
+        // no bundled library). Fall back to the labeled placeholder tile when poppler isn't
+        // installed or the render fails, so PDFs always show *something*.
+        if let Some(page) = render_first_page(bytes) {
+            return Ok(page);
+        }
         let meta =
             pdf_meta(bytes).ok_or_else(|| DecodeError::Malformed("not a readable PDF".into()))?;
         Ok(render_placeholder(&meta))
     }
+}
+
+/// Render page 1 to a raster via `pdftoppm` (poppler), reading the PDF on stdin and the PNG
+/// on stdout — no temp file, no bundled lib. `None` if pdftoppm is absent or errors.
+fn render_first_page(bytes: &[u8]) -> Option<PixImage> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("pdftoppm")
+        .args(["-png", "-f", "1", "-l", "1", "-singlefile", "-scale-to", "1100", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // Feed stdin from a thread so a large PDF can't deadlock against stdout backpressure.
+    let mut stdin = child.stdin.take()?;
+    let owned = bytes.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&owned);
+    });
+    let out = child.wait_with_output().ok()?;
+    let _ = writer.join();
+    if !out.status.success() || out.stdout.is_empty() {
+        return None;
+    }
+    let img = image::load_from_memory(&out.stdout).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    let px: Vec<[u8; 4]> = img
+        .into_raw()
+        .chunks_exact(4)
+        .map(|c| [c[0], c[1], c[2], c[3]])
+        .collect();
+    if px.len() != (w * h) as usize {
+        return None;
+    }
+    Some(PixImage::from_rgba(w, h, px))
 }
 
 #[cfg(test)]
