@@ -741,15 +741,29 @@ extension loop, calling `CodeDecoder::decode_ext(bytes, ext)` / `SoundDecoder::d
 inside `caught(||…)` (the same panic guard as `decode_caught`). Both always return *some* image
 (highlighted text / plain / waveform / icon), never an error, so a weird file still shows a tile.
 
-**Audio playback + PDF render — shipped (not feature-gated).** Real PDF page rasterization is
-done at decode time by shelling out to poppler's `pdftoppm` (no bundled lib; placeholder
-fallback if absent). In-app audio **playback** (play/pause/seek) is `rodio` (`AudioPlayer` in
-app.rs): the default output device is opened **lazily + fallibly on first Play** — a headless
-box reports "no audio output" in the status bar and `cargo test` never touches a device — so
-`rodio` is a normal (non-feature-gated) dep. `rodio → cpal → alsa-sys` does need
-**`libasound2-dev` at BUILD time** on Linux (added to CI + the first-time-deps list above).
-Still deferred: an in-app multi-page PDF *viewer* (1/2-page mode) and in-app **tracker**
-playback (xmrs / libopenmpt) — trackers/voc/au/midi keep their icon tile + external open.
+**Audio player + PDF viewer + trackers — all shipped (not feature-gated).**
+- **PDF**: the tile is a real `pdftoppm`-rendered first page (placeholder fallback if poppler
+  is absent). Opening a PDF enters an in-app **multi-page viewer** (`PdfView` in app.rs):
+  Prev/Next + "Page N/M" + a 1-page vs 2-page spread toggle; Left/Right turn pages (not step
+  images); each page renders on demand via `render_pdf_page` into `full_tex` (reusing zoom/pan/
+  fit); two-page mode composes facing pages side by side.
+- **Audio** (`AudioPlayer` in app.rs, `rodio`): decodes the file to a sample buffer ONCE, then
+  each play appends a fresh `SamplesBuffer` of the selected region to a new `Player` — so it
+  restarts cleanly (the old "play once" bug), loops (`repeat_infinite`), and plays a drag-
+  selected region. The Details pane draws an **interactive waveform** (hi-res peaks + a moving
+  loop-aware playhead + shaded region): drag = set loop region, click = seek; plus a loop
+  toggle, an **Autoplay** checkbox (persisted: play on select + loop until Stop), a Stop button,
+  and **Spacebar** play/pause. The device opens **lazily + fallibly on first Play** — a headless
+  box reports "no audio output" and `cargo test` never touches a device.
+- **Trackers** (MOD/XM/S3M/IT): `AudioPlayer::open` routes tracker extensions to **`xmrs`**
+  (pure Rust — parses + synthesizes to interleaved-stereo i16 → f32) into the same sample
+  buffer, so loop/region/playhead/waveform all work for modules too. voc/au/midi (no in-app
+  decoder) keep the icon tile + external open.
+
+`rodio → cpal → alsa-sys` needs **`libasound2-dev` at BUILD time** on Linux (added to CI + the
+first-time-deps list above), so `rodio`/`xmrs` are normal (non-feature-gated) deps. Still
+deferred: a MIDI-key "audition the sample" keyboard (octaves/notes) — optional, user-requested
+for later.
 
 **The icy ecosystem (Mike Krüger's scene-art formats), the lean way.** Mike's
 `icy_engine` *renders* but hard-depends on `icy_net` → **tokio "full"** — too heavy for
