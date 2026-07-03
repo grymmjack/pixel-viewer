@@ -12496,7 +12496,11 @@ fn is_image_ext(p: &std::path::Path) -> bool {
         "petscii", "petmate", "rip",
     ];
     match p.extension().and_then(|x| x.to_str()) {
-        Some(x) => EXTS.contains(&x.to_ascii_lowercase().as_str()),
+        Some(x) => {
+            let x = x.to_ascii_lowercase();
+            // Raster/scene formats above, plus every source-code/text type (shared list).
+            EXTS.contains(&x.as_str()) || crate::decode::CODE_EXTS.contains(&x.as_str())
+        }
         // Extensionless scene/BBS art (rendered as CP437 text). Dirs are filtered
         // out by an `is_dir()` check at every call site before reaching here.
         None => true,
@@ -13372,7 +13376,9 @@ mod tests {
         assert!(is_image_ext(Path::new("y.aseprite")));
         assert!(is_image_ext(Path::new("z.txt"))); // ASCII/ANSI art
         assert!(is_image_ext(Path::new("noext"))); // extensionless scene/BBS art
-        assert!(!is_image_ext(Path::new("z.cpp"))); // genuinely non-art stays hidden
+        assert!(is_image_ext(Path::new("z.cpp"))); // source code now renders too
+        assert!(is_image_ext(Path::new("main.rs")));
+        assert!(!is_image_ext(Path::new("z.exe"))); // genuinely non-viewable stays hidden
     }
 
     #[test]
@@ -13382,10 +13388,10 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(base.join("a.png"), b"").unwrap();
         std::fs::write(base.join("b.gif"), b"").unwrap();
-        std::fs::write(base.join("source.cpp"), b"").unwrap(); // genuinely non-art
+        std::fs::write(base.join("notes.exe"), b"").unwrap(); // genuinely non-viewable
         std::fs::write(sub.join("c.png"), b"").unwrap(); // image one level down
         let info = scan_folder_info(&base);
-        assert_eq!(info.images, 2, "non-art .cpp excluded");
+        assert_eq!(info.images, 2, "non-viewable .exe excluded");
         assert_eq!(info.subdirs, 1);
         // Fewer than 4 direct images → previews borrow from the subdir (request #4).
         assert!(info.previews.iter().any(|p| p.ends_with("c.png")));

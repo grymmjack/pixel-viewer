@@ -13,11 +13,12 @@ pub struct AnsiDecoder;
 const FONT_W: usize = 8;
 const FONT_H: usize = 16;
 const WRAP: usize = 80; // classic ANSI terminal width
-// Hard cap for cursor-addressed / SAUCE-declared columns. Real scene art is usually 80,
-// but "wide" ANSI (e.g. Mistigris party pieces) declares hundreds of columns via SAUCE
-// TInfo1 — this file's THE_BIG_PIRANHA is 800. The cap only exists so a runaway cursor
-// (ESC[99999C) can't grow an unbounded canvas; it must sit well above any real width or
-// the art auto-wraps at the cap and scrambles (800 clamped to 300 → reflowed to noise).
+
+// Hard cap for cursor-addressed / SAUCE-declared columns. Real scene art is usually 80, but
+// "wide" ANSI (e.g. Mistigris party pieces) declares hundreds of columns via SAUCE TInfo1 —
+// THE_BIG_PIRANHA is 800. The cap only exists so a runaway cursor (ESC[99999C) can't grow an
+// unbounded canvas; it must sit well above any real width, or the art auto-wraps at the cap
+// and scrambles (800 clamped to 300 → reflowed to noise).
 const MAX_COLS: usize = 20000;
 const MAX_ROWS: usize = 10000; // safety cap for very long files (canvas sizes to the
                                // *actual* content rows; this is only the upper bound)
@@ -692,7 +693,11 @@ mod tests {
         s[97] = 0x03; // TInfo1 high byte → 0x0320 = 800 columns
         file.extend_from_slice(&s);
         let img = AnsiDecoder.decode(&file).unwrap();
-        assert_eq!(img.width, 800 * 8, "800-col SAUCE width renders full, not clamped to 300");
+        assert_eq!(
+            img.width,
+            800 * 8,
+            "800-col SAUCE width renders full, not clamped to 300"
+        );
     }
 
     #[test]

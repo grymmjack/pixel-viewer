@@ -10,6 +10,7 @@ mod aseprite;
 mod bin;
 mod builtin;
 mod c64_font;
+mod code;
 mod cp437_font;
 mod cp437_font_8x8;
 mod idf;
@@ -34,6 +35,10 @@ pub use ansi::set_font_9px;
 /// Progressive (byte-prefix) renderers for baud-rate playback — "watch it type/draw".
 pub use ansi::TextStream;
 pub use rip::RipStream;
+
+/// Every source-code / text extension the [`code::CodeDecoder`] handles — re-exported so
+/// `app.rs`'s viewer predicates (`is_image_ext`) can share the one list, not duplicate it.
+pub use code::CODE_EXTS;
 
 #[derive(Debug)]
 pub enum DecodeError {
@@ -86,6 +91,7 @@ impl Registry {
                 Box::new(petmate::PetmateDecoder), // .petmate (nurpax/petmate JSON PETSCII)
                 Box::new(rip::RipDecoder),         // .rip (RIPscript vector; icy_parser_core)
                 Box::new(bin::BinDecoder),         // .bin (raw char/attr pairs, SAUCE width)
+                Box::new(code::CodeDecoder), // source code / text (CP437 + hand-rolled highlight)
                 Box::new(builtin::ImageCrateDecoder), // png/gif/bmp/jpeg/webp/tga/tiff/pnm/qoi
             ],
         }
@@ -118,6 +124,11 @@ impl Registry {
         // 2) Fall back to file extension.
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             let ext = ext.to_ascii_lowercase();
+            // Source-code / text needs the *extension* to pick the language spec, which the
+            // generic `decode(bytes)` call can't pass — route it here (still panic-guarded).
+            if code::CODE_EXTS.contains(&ext.as_str()) {
+                return caught(|| code::CodeDecoder::decode_ext(bytes, &ext));
+            }
             for d in &self.decoders {
                 if d.extensions().iter().any(|e| *e == ext) {
                     return decode_caught(d.as_ref(), bytes);
@@ -161,16 +172,24 @@ pub fn install_panic_filter() {
     });
 }
 
-/// Call a decoder, catching any panic so one bad file fails gracefully.
-fn decode_caught(d: &dyn Decoder, bytes: &[u8]) -> Result<PixImage, DecodeError> {
+/// Run a decode closure with the panic filter armed, so one bad file fails gracefully.
+fn caught<F>(f: F) -> Result<PixImage, DecodeError>
+where
+    F: FnOnce() -> Result<PixImage, DecodeError>,
+{
     DECODING.with(|f| f.set(true));
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.decode(bytes)));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     DECODING.with(|f| f.set(false));
     r.unwrap_or_else(|_| {
         Err(DecodeError::Malformed(
             "decoder panicked on this file".into(),
         ))
     })
+}
+
+/// Call a decoder, catching any panic so one bad file fails gracefully.
+fn decode_caught(d: &dyn Decoder, bytes: &[u8]) -> Result<PixImage, DecodeError> {
+    caught(|| d.decode(bytes))
 }
 
 #[cfg(test)]
