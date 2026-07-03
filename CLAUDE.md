@@ -82,6 +82,8 @@ src/
   dls.rs             .dls as a virtual folder: walk the RIFF wave pool → rewrap each
                      embedded wave into a standalone WAV; instrument/sample counts
   decode/
+    opl3.rs          OPL3 FM-synth chip emulator (public-domain "Opal" port) — for .rad
+    rad.rs           Reality Adlib Tracker replayer (public-domain RADPlayer port) — .rad
     mod.rs           Decoder trait + Registry (sniff-then-extension dispatch)
     builtin.rs       image-crate decoder: png/gif/bmp/jpeg/webp/tga/tiff/pnm/qoi/ico/draw
     pcx.rs           hand-written, palette-preserving PCX decoder
@@ -775,13 +777,22 @@ inside `caught(||…)` (the same panic guard as `decode_caught`). Both always re
   (pure Rust — parses + synthesizes to interleaved-stereo i16 → f32) into the same sample
   buffer, so loop/region/playhead/waveform all work for modules too. voc/au (no in-app
   decoder) keep the icon tile + external open.
-- **MIDI** (`.mid`/`.midi`/`.kar`): a MIDI file is only note events, so `render_midi` synthesizes
-  it to PCM through a **General MIDI SoundFont** via `rustysynth` (`MidiFileSequencer::render`) —
-  then it feeds the same player path as any audio. The SoundFont is a persisted preference
-  (`midi_soundfont` / Preferences → "MIDI SoundFont"), else auto-detected from common system paths
-  (**preferring a small ~6 MB TimGM6mb over a 100+ MB FluidR3** — the load is synchronous). The
-  loaded font is cached in `midi_sf_cache` (an `Arc`, parsed once per session, not per MIDI);
-  changing it clears that + the decode cache. `None` available → the player shows a "set one" note.
+- **MIDI** (`.mid`/`.midi`/`.kar`/`.rmi`): a MIDI file is only note events, so `render_midi`
+  synthesizes it to PCM through a **General MIDI SoundFont** via `rustysynth`
+  (`MidiFileSequencer::render`) — then it feeds the same player path as any audio. The SoundFont is
+  a persisted preference (`midi_soundfont` / Preferences → "MIDI SoundFont"), else auto-detected
+  from common system paths (**preferring a small ~6 MB TimGM6mb over a 100+ MB FluidR3** — the load
+  is synchronous). The loaded font is cached in `midi_sf_cache` (an `Arc`, parsed once per session,
+  not per MIDI); changing it clears that + the decode cache. `None` available → a "set one" note.
+  `.rmi` is RIFF-wrapped MIDI; `rmid_inner` strips the wrapper before synthesis.
+- **RAD** (`.rad`, Reality Adlib Tracker): **OPL2/OPL3 FM synthesis**, not PCM — so neither `xmrs`
+  nor rodio can play it. `render_rad` drives two **public-domain C→Rust ports**: `decode/rad.rs`
+  (the RADPlayer replayer — `new()` parses v1/v2, `update()` emits OPL register writes per tick,
+  `hz()` the tick rate, end-of-song via the `RAD_DETECT_REPEATS` order map) feeds `(reg,val)` writes
+  into `decode/opl3.rs` (the "Opal" OPL3 chip emulator — `write_reg` + `sample()` with an internal
+  49716→44100 resampler), pulling `sr/hz` samples per tick. Both are faithful ports (tables verbatim,
+  wrapping arithmetic, bounds-guarded so a malformed file returns `None`/never panics). Ported (not
+  the GPL `opl-emu` crate) so pixelview stays MIT.
 
 Both player surfaces also have an **onscreen piano keyboard** (`piano_keyboard(ui, octave, h)`
 — `h` sizes it big vs compact) + Oct −/+ to audition the sample as a one-shot instrument — a

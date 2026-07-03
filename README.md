@@ -115,7 +115,7 @@ down to the extensions a decoder claims.
 | **Archives (virtual folders)** | `.zip` `.lha` `.arj` `.arc` `.zoo` `.7z` `.rar` … | Browsed read-only; contents extracted on demand |
 | **Source code / text** *(plugin)* | ~90 exts — `rs` `c/cpp/h` `py` `js/ts` `css` `html` `php` `lua` `asm` `gd` `json` `yaml` `md` `log` `ipynb` … | CP437-rasterized with a hand-rolled syntax highlighter |
 | **PDF** *(plugin)* | `.pdf` | Real first-page tile + in-app 1-/2-page viewer (needs poppler) |
-| **Audio** *(plugin)* | `mp3` `wav` `ogg` `flac` + trackers `mod` `xm` `s3m` `it` + **MIDI** `mid` `midi` | Waveform + in-app play/loop/seek/sampler/MIDI-in (MIDI synthesized via a SoundFont) |
+| **Audio** *(plugin)* | `mp3` `wav` `ogg` `flac` + trackers `mod` `xm` `s3m` `it` + **MIDI** `mid` `midi` `rmi` + **RAD** `.rad` | Waveform + play/loop/seek/sampler/MIDI-in. MIDI = SoundFont synthesis; RAD = OPL3 FM synthesis |
 | **Sample banks** *(plugin)* | `.sf2` (SoundFont) · `.sfz` · `.dls` | Browsed as a folder of their samples |
 
 Scene-art formats are decoded with **SAUCE** metadata awareness (the standard
@@ -404,9 +404,12 @@ The audio player goes further than playback:
 
 ![A SoundFont opened as a folder — every sample shown as a named WAV tile with its waveform](docs/screenshots/soundfont-folder.png)
 
-- **Play MIDI files.** A `.mid` / `.midi` is only note events, so it's **synthesized to audio
-  through a General MIDI SoundFont** (auto-detected from your system, or pick one in Preferences →
-  *MIDI SoundFont*) and plays in the full player — waveform, transport, keyboard and all.
+- **Play MIDI files.** A `.mid` / `.midi` / `.rmi` is only note events, so it's **synthesized to
+  audio through a General MIDI SoundFont** (auto-detected from your system, or pick one in
+  Preferences → *MIDI SoundFont*) and plays in the full player — waveform, transport, keyboard and all.
+- **Play RAD (Reality Adlib Tracker) modules.** `.rad` is **OPL2/OPL3 FM synthesis** (AdLib chip
+  music, not samples), rendered by a built-in OPL3 emulator + RAD replayer — so those chiptunes
+  play right in the app like any other audio.
 
 Opening or revisiting audio is **cached** — a tracker or MIDI file that takes a moment to
 synthesize is decoded once and cloned from memory on the next visit, so flipping back and forth is
