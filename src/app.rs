@@ -4391,14 +4391,11 @@ impl PixelView {
                         {
                             want_pack = mount_pack.clone();
                         }
-                        // Documents / audio: open in the OS default viewer/editor/player.
-                        if (is_pdf || is_audio)
-                            && ui
-                                .button("➡ Open in default app")
-                                .on_hover_text(
-                                    "Open this file in your OS default viewer/editor/player",
-                                )
-                                .clicked()
+                        // Any file: open in the OS default viewer/editor/player (xdg-open).
+                        if ui
+                            .button("➡ Open in default app")
+                            .on_hover_text("Open this file in your OS default viewer/editor/player")
+                            .clicked()
                         {
                             want_open_default = true;
                         }
@@ -5571,6 +5568,7 @@ impl PixelView {
         let mut rate_to: Option<(usize, u8)> = None; // "Rating ▸ N" context-menu choice
         let mut open_with: Option<(usize, usize)> = None; // (entry idx, opener idx)
         let mut open_other: Option<usize> = None; // "Open in… → Other" on this entry
+        let mut open_default: Option<usize> = None; // "Open in… → Default app" on this entry
         let mut folder_act: Option<(usize, FolderActPick)> = None; // "Open folder in…" on a dir
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // 16colo download (idx, want_pack)
@@ -5879,6 +5877,7 @@ impl PixelView {
                                     TilePick::Rate(stars) => rate_to = Some((idx, stars)),
                                     TilePick::OpenWith(oi) => open_with = Some((idx, oi)),
                                     TilePick::OpenWithOther => open_other = Some(idx),
+                                    TilePick::OpenDefault => open_default = Some(idx),
                                     TilePick::Folder(fp) => folder_act = Some((idx, fp)),
                                 }
                             }
@@ -5946,6 +5945,11 @@ impl PixelView {
         }
         if let Some(idx) = open_other {
             self.open_with_other(idx);
+        }
+        if let Some(idx) = open_default {
+            if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
+                self.open_in_default_app(&p);
+            }
         }
         if let Some((idx, fp)) = folder_act {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
@@ -6257,6 +6261,7 @@ impl PixelView {
         let mut rate_to: Option<(usize, u8)> = None; // "Rating ▸ N" context-menu choice
         let mut open_with: Option<(usize, usize)> = None; // (entry idx, opener idx)
         let mut open_other: Option<usize> = None; // "Open in… → Other" on this entry
+        let mut open_default: Option<usize> = None; // "Open in… → Default app" on this entry
         let mut folder_act: Option<(usize, FolderActPick)> = None; // "Open folder in…" on a dir
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // (idx, want_pack)
@@ -6700,6 +6705,7 @@ impl PixelView {
                                 TilePick::Rate(stars) => rate_to = Some((idx, stars)),
                                 TilePick::OpenWith(oi) => open_with = Some((idx, oi)),
                                 TilePick::OpenWithOther => open_other = Some(idx),
+                                TilePick::OpenDefault => open_default = Some(idx),
                                 TilePick::Folder(fp) => folder_act = Some((idx, fp)),
                             }
                         }
@@ -6816,6 +6822,11 @@ impl PixelView {
         if let Some(idx) = open_other {
             self.open_with_other(idx);
         }
+        if let Some(idx) = open_default {
+            if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
+                self.open_in_default_app(&p);
+            }
+        }
         if let Some((idx, fp)) = folder_act {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
                 self.run_folder_action(p, fp);
@@ -6874,12 +6885,13 @@ impl PixelView {
     fn ui_single(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let prev_key = self.key_for(Action::PrevImage);
         let next_key = self.key_for(Action::NextImage);
-        let (prev, next, fit, tile) = ui.input(|i| {
+        let (prev, next, fit, tile, edit) = ui.input(|i| {
             (
                 i.key_pressed(prev_key),
                 i.key_pressed(next_key),
                 i.key_pressed(egui::Key::F),
                 i.key_pressed(egui::Key::T),
+                i.key_pressed(egui::Key::Enter),
             )
         });
         // Any user input during baud playback finishes the animation *now* and hands
@@ -6938,6 +6950,13 @@ impl PixelView {
                 }
                 if tile {
                     self.tile_mode = !self.tile_mode;
+                }
+                // Enter → open the current file in its OS default app (edit a source file
+                // in the associated editor, etc.). Guarded by `!typing` upstream.
+                if edit {
+                    if let Some(p) = self.entries.get(self.selected).map(|e| e.path.clone()) {
+                        self.open_in_default_app(&p);
+                    }
                 }
             }
         }
@@ -11664,6 +11683,7 @@ enum TilePick {
     Rate(u8),              // set this entry's star rating (0 = clear), via the context menu
     OpenWith(usize),       // "Open in…" → launch the external opener at this index
     OpenWithOther,         // "Open in…" → pick an arbitrary program (one-off, rfd)
+    OpenDefault,           // "Open in…" → the OS default app (xdg-open / open / explorer)
     Folder(FolderActPick), // "Open folder in…" → run a folder action on this dir
 }
 
@@ -12106,6 +12126,17 @@ fn entry_context_menu(
             .map(|e| e.to_ascii_lowercase())
             .unwrap_or_default();
         ui.menu_button("Open in…", |ui| {
+            // The OS default app is always offered (xdg-open / open / explorer), so any
+            // file opens even without a custom association; the associations add special ones.
+            if ui
+                .button("🖥 Default app")
+                .on_hover_text("Open in your OS default application for this type")
+                .clicked()
+            {
+                pick = Some(TilePick::OpenDefault);
+                ui.close();
+            }
+            ui.separator();
             let mut shown = 0;
             for o in openers
                 .iter()
@@ -12128,10 +12159,6 @@ fn entry_context_menu(
                 shown += 1;
             }
             if shown > 0 {
-                ui.separator();
-            } else {
-                ui.weak("No program for this type");
-                ui.weak("(set one in View → Associations)");
                 ui.separator();
             }
             if ui.button("Other program…").clicked() {
