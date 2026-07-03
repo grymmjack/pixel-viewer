@@ -7399,8 +7399,19 @@ impl PixelView {
         if self.fit_width_on_open {
             self.fit_width_on_open = false;
             if sw > 0.0 && avail.x > 0.0 {
-                let fit_nx = (avail.x * ppp / sw).floor().max(1.0);
-                let cur_nx = (self.zoom * ppp).round().max(1.0);
+                // Largest pixel-perfect ladder step (N× up, 1/N× down) whose width still
+                // fits. Snapping *down* (floor / ceil-reciprocal) — not the round-to-nearest
+                // `pp_device_scale` — guarantees a very wide ANSI (e.g. 6400 px) actually
+                // fits instead of rounding UP a notch and clipping. The old `.max(1.0)`
+                // floored the scale at 1×, so wide art could never shrink below 1:1 to fit.
+                let raw = avail.x * ppp / sw; // device px per source px to fill the width
+                let fit_nx = if raw >= 1.0 {
+                    raw.floor()
+                } else {
+                    1.0 / (1.0 / raw).ceil().clamp(1.0, 16.0)
+                };
+                let cur_nx = self.zoom * ppp;
+                // Only shrink to fit; never enlarge art that already fits.
                 self.zoom = cur_nx.min(fit_nx) / ppp;
             }
         }
