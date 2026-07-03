@@ -794,6 +794,7 @@ pub struct PixelView {
     audio_player: Option<AudioPlayer>, // in-app play/pause/seek preview (rodio), None = idle
     audio_autoplay: bool,      // start playing on select + loop until stopped (persisted)
     audio_drag: Option<f32>,   // waveform drag-select anchor time (transient)
+    audio_octave: i32,         // onscreen-keyboard octave offset (transient)
     palettes: HashMap<PathBuf, Option<Vec<[u8; 4]>>>, // details swatches; None = too many colors
     thumb_rgba: HashMap<PathBuf, (usize, usize, Vec<u8>)>, // thumb CPU pixels (for grid recolor)
     grid_recolor: HashMap<PathBuf, (String, egui::TextureHandle)>, // recolored grid tiles, per recolor key
@@ -1485,6 +1486,7 @@ impl PixelView {
             audio_player: None,
             audio_autoplay,
             audio_drag: None,
+            audio_octave: 0,
             palettes: HashMap::new(),
             thumb_rgba: HashMap::new(),
             grid_recolor: HashMap::new(),
@@ -4308,6 +4310,8 @@ impl PixelView {
         let mut want_audio_loop: Option<bool> = None; // set the loop flag
         let mut want_autoplay: Option<bool> = None; // set the autoplay preference
         let mut want_audio_commit = false; // drag finished → (re)play the new region
+        let mut want_audio_note: Option<i32> = None; // onscreen-keyboard key → audition pitch
+        let mut want_octave: Option<i32> = None; // onscreen-keyboard octave shift
         let disp = self.to_display(&entry.path);
         // Inspecting a downloadable pack folder (it has a fetched zip URL). Keyed off
         // `remote_urls`, not path depth, so `groups/<g>` / `artists/<a>` listing folders
@@ -4659,6 +4663,27 @@ impl PixelView {
                             }
                             ui.weak("drag: set loop region · click: seek");
                         }
+                        // Onscreen keyboard: audition the sample as a one-shot instrument —
+                        // each key plays the (selected) region pitch-shifted to that note,
+                        // ± the octave offset. C = the sample's native pitch.
+                        if loaded {
+                            ui.add_space(4.0);
+                            let oct = self.audio_octave;
+                            ui.horizontal(|ui| {
+                                ui.weak("🎹");
+                                if ui.small_button("Oct −").clicked() {
+                                    want_octave = Some(oct - 1);
+                                }
+                                ui.weak(format!("{oct:+}"));
+                                if ui.small_button("Oct +").clicked() {
+                                    want_octave = Some(oct + 1);
+                                }
+                                ui.weak("click keys to pitch the sample");
+                            });
+                            if let Some(semi) = piano_keyboard(ui, oct) {
+                                want_audio_note = Some(semi);
+                            }
+                        }
                         ui.add_space(4.0);
                     }
                     ui.horizontal(|ui| {
@@ -4789,6 +4814,14 @@ impl PixelView {
         }
         if want_audio_stop {
             self.stop_audio();
+        }
+        if let Some(o) = want_octave {
+            self.audio_octave = o.clamp(-4, 4);
+        }
+        if let Some(semi) = want_audio_note {
+            if let Some(ap) = &mut self.audio_player {
+                ap.play_note(semi);
+            }
         }
         if let Some(secs) = want_audio_seek {
             if let Some(ap) = &self.audio_player {
@@ -12149,6 +12182,7 @@ struct AudioPlayer {
     region_start: f32, // start of the currently-appended source (for the playhead)
     region_len: f32,   // its length (for the loop-modulo playhead)
     started: bool,     // a source has been appended at least once
+    play_speed: f32,   // playback speed of the current source (>1 = pitched up, for auditioning)
 }
 
 impl AudioPlayer {
@@ -12195,12 +12229,28 @@ impl AudioPlayer {
             region_start: 0.0,
             region_len: duration.max(0.0001),
             started: false,
+            play_speed: 1.0,
         })
     }
 
     /// (Re)start playback of the selected region on a fresh player (so a finished/looping
-    /// source is cleanly replaced), respecting the loop flag.
+    /// source is cleanly replaced), respecting the loop flag. Normal pitch (speed 1×).
     fn play_region(&mut self) {
+        self.play_speed = 1.0;
+        self.play_source(false);
+    }
+
+    /// Audition the selected region at a musical pitch: `semitone` semitones from its native
+    /// pitch (0 = as-recorded), played once (a one-shot instrument key). rodio's `speed`
+    /// resamples, so it shifts pitch *and* tempo — the expected sampler behavior.
+    fn play_note(&mut self, semitone: i32) {
+        self.play_speed = 2.0f32.powf(semitone as f32 / 12.0);
+        self.play_source(true);
+    }
+
+    /// Build a fresh player for the current region at `self.play_speed`; `one_shot` overrides
+    /// the loop flag (auditioning never loops).
+    fn play_source(&mut self, one_shot: bool) {
         use rodio::Source;
         let ch = self.channels.get() as usize;
         let sr = self.sample_rate.get() as f32;
@@ -12210,9 +12260,10 @@ impl AudioPlayer {
         let s = (((start * sr) as usize) * ch).min(n);
         let e = (((end * sr) as usize) * ch).min(n).max(s);
         let region: Vec<rodio::Sample> = self.samples[s..e].to_vec();
-        let buf = rodio::buffer::SamplesBuffer::new(self.channels, self.sample_rate, region);
+        let buf = rodio::buffer::SamplesBuffer::new(self.channels, self.sample_rate, region)
+            .speed(self.play_speed);
         let player = rodio::Player::connect_new(self._stream.mixer());
-        if self.looping {
+        if self.looping && !one_shot {
             player.append(buf.repeat_infinite());
         } else {
             player.append(buf);
@@ -12244,12 +12295,13 @@ impl AudioPlayer {
         self.started && !self.player.is_paused() && !self.player.empty()
     }
 
-    /// The current playhead position in seconds (loop-aware).
+    /// The current playhead position in seconds (loop-aware). At a pitched speed the sample
+    /// advances `play_speed`× faster than wall-clock, so scale the elapsed time.
     fn pos(&self) -> f32 {
         if !self.started {
             return self.sel_start;
         }
-        let elapsed = self.player.get_pos().as_secs_f32();
+        let elapsed = self.player.get_pos().as_secs_f32() * self.play_speed;
         if self.looping {
             self.region_start + (elapsed % self.region_len)
         } else {
@@ -12320,6 +12372,69 @@ fn compose_side_by_side(
     blit(&mut px, a, 0);
     blit(&mut px, b, aw + GUT);
     crate::image_types::PixImage::from_rgba(w as u32, h as u32, px)
+}
+
+/// Draw one octave of piano keys and return the clicked semitone (0 = C … 11 = B, plus
+/// `octave`×12), or `None`. Black keys are drawn + hit-tested last so they win where they
+/// overlap the white keys beneath.
+fn piano_keyboard(ui: &mut egui::Ui, octave: i32) -> Option<i32> {
+    const H: f32 = 66.0;
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), H), egui::Sense::hover());
+    let p = ui.painter_at(rect);
+    let ww = rect.width() / 7.0;
+    let white = [0i32, 2, 4, 5, 7, 9, 11]; // C D E F G A B
+    let names = ["C", "D", "E", "F", "G", "A", "B"];
+    // (semitone, white-key boundary the black key centers on)
+    let black = [(1i32, 1.0f32), (3, 2.0), (6, 4.0), (8, 5.0), (10, 6.0)];
+    let base = octave * 12;
+    let border = egui::Stroke::new(1.0, egui::Color32::from_gray(60));
+    let mut picked = None;
+    for (i, &semi) in white.iter().enumerate() {
+        let kr = egui::Rect::from_min_size(
+            rect.left_top() + egui::vec2(i as f32 * ww, 0.0),
+            egui::vec2(ww, H),
+        );
+        let resp = ui.interact(
+            kr.shrink(1.0),
+            ui.id().with(("wk", i)),
+            egui::Sense::click(),
+        );
+        let fill = if resp.is_pointer_button_down_on() {
+            egui::Color32::from_rgb(150, 180, 235)
+        } else {
+            egui::Color32::from_rgb(238, 238, 244)
+        };
+        p.rect_filled(kr.shrink(1.0), 2.0, fill);
+        p.rect_stroke(kr.shrink(1.0), 2.0, border, egui::StrokeKind::Inside);
+        p.text(
+            kr.center_bottom() - egui::vec2(0.0, 3.0),
+            egui::Align2::CENTER_BOTTOM,
+            names[i],
+            egui::FontId::proportional(9.0),
+            egui::Color32::from_gray(95),
+        );
+        if resp.clicked() {
+            picked = Some(base + semi);
+        }
+    }
+    let (bw, bh) = (ww * 0.62, H * 0.6);
+    for &(semi, bnd) in &black {
+        let cx = rect.left() + bnd * ww;
+        let kr =
+            egui::Rect::from_min_size(egui::pos2(cx - bw / 2.0, rect.top()), egui::vec2(bw, bh));
+        let resp = ui.interact(kr, ui.id().with(("bk", semi)), egui::Sense::click());
+        let fill = if resp.is_pointer_button_down_on() {
+            egui::Color32::from_rgb(90, 110, 160)
+        } else {
+            egui::Color32::from_rgb(26, 26, 32)
+        };
+        p.rect_filled(kr, 2.0, fill);
+        if resp.clicked() {
+            picked = Some(base + semi);
+        }
+    }
+    picked
 }
 
 /// A mono peak envelope (0..1), `buckets` wide, from interleaved samples — for drawing the
