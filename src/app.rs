@@ -794,6 +794,7 @@ pub struct PixelView {
     sf_cache: HashMap<PathBuf, Option<crate::soundfont::SoundFontInfo>>, // lazy .sf2 directory info
     sfz_cache: HashMap<PathBuf, Option<crate::sfz::SfzInfo>>, // lazy .sfz directory info
     dls_cache: HashMap<PathBuf, Option<crate::dls::DlsInfo>>, // lazy .dls directory info
+    xi_cache: HashMap<PathBuf, Option<crate::xi::XiInfo>>, // lazy .xi instrument info
     audio_player: Option<AudioPlayer>, // in-app play/pause/seek preview (rodio), None = idle
     audio_decode_cache: Vec<(PathBuf, u64, DecodedAudio)>, // LRU of decoded audio (key: path+sig)
     audio_loading: Option<AudioLoading>, // a background audio decode in flight (spinner while pending)
@@ -1542,6 +1543,7 @@ impl PixelView {
             sf_cache: HashMap::new(),
             sfz_cache: HashMap::new(),
             dls_cache: HashMap::new(),
+            xi_cache: HashMap::new(),
             audio_player: None,
             audio_autoplay,
             audio_drag: None,
@@ -1767,6 +1769,10 @@ impl PixelView {
         }
         if dir.is_file() && crate::dls::is_dls(&dir) {
             self.enter_dls(dir);
+            return;
+        }
+        if dir.is_file() && crate::xi::is_xi(&dir) {
+            self.enter_xi(dir);
             return;
         }
         // Opening a real local folder. If we were inside a mounted archive / 16colo.rs
@@ -2340,6 +2346,16 @@ impl PixelView {
                 .insert(path.to_path_buf(), crate::dls::info(&real));
         }
         self.dls_cache.get(path).cloned().flatten()
+    }
+
+    /// Lazily parse + cache an XI instrument's name + sample count for Details.
+    fn xi_info(&mut self, path: &Path) -> Option<crate::xi::XiInfo> {
+        if !self.xi_cache.contains_key(path) {
+            let real = self.resolve_local(path);
+            self.xi_cache
+                .insert(path.to_path_buf(), crate::xi::info(&real));
+        }
+        self.xi_cache.get(path).cloned().flatten()
     }
 
     /// Open a file in the OS default application (xdg-open / open / explorer). Used by the
@@ -3193,6 +3209,22 @@ impl PixelView {
                 self.status = format!("Opened {} · {n} samples", short_name(&dls));
             }
             Err(e) => self.status = format!("Couldn't open {}: {e}", short_name(&dls)),
+        }
+    }
+
+    /// Enter an XI (FastTracker II instrument): extract its samples to WAVs and browse them.
+    fn enter_xi(&mut self, xi: PathBuf) {
+        match crate::xi::extract_to_cache(&xi) {
+            Ok(temp_root) => {
+                self.archive_mount = Some(ArchiveMount {
+                    archive: xi.clone(),
+                    temp_root: temp_root.clone(),
+                });
+                self.open_folder(temp_root);
+                let n = crate::xi::info(&xi).map(|i| i.samples).unwrap_or(0);
+                self.status = format!("Opened {} · {n} samples", short_name(&xi));
+            }
+            Err(e) => self.status = format!("Couldn't open {}: {e}", short_name(&xi)),
         }
     }
 
@@ -5219,6 +5251,11 @@ impl PixelView {
                     } else {
                         None
                     };
+                    let xi = if crate::xi::is_xi(&entry.path) {
+                        self.xi_info(&entry.path)
+                    } else {
+                        None
+                    };
                     // Plain thumbnail (the recolored preview lives in the Recolor pane).
                     if let Some(tex) = self.thumb_tex.get(&entry.path) {
                         let tsz = tex.size_vec2();
@@ -5358,6 +5395,19 @@ impl PixelView {
                                 ui.end_row();
                                 ui.weak("Samples");
                                 ui.label(d.samples.to_string());
+                                ui.end_row();
+                            } else if let Some(x) = &xi {
+                                // XI: FastTracker II instrument + its sample count.
+                                ui.weak("Type");
+                                ui.label("XI instrument");
+                                ui.end_row();
+                                if !x.name.trim().is_empty() {
+                                    ui.weak("Name");
+                                    ui.label(x.name.trim());
+                                    ui.end_row();
+                                }
+                                ui.weak("Samples");
+                                ui.label(x.samples.to_string());
                                 ui.end_row();
                             } else if is_audio {
                                 // A tracker/voc/au/midi we can't decode — still label it audio.
@@ -12967,10 +13017,13 @@ fn fit_centered(into: egui::Rect, content: egui::Vec2) -> egui::Rect {
 }
 
 /// A non-archive file we mount as a **virtual folder of samples**: SoundFont (`.sf2`), SFZ
-/// (`.sfz`), or DLS (`.dls`). Each has its own `enter_*` extractor but is otherwise treated
-/// like an archive throughout the listing/navigation.
+/// (`.sfz`), DLS (`.dls`), or FastTracker II instrument (`.xi`). Each has its own `enter_*`
+/// extractor but is otherwise treated like an archive throughout the listing/navigation.
 fn is_sample_bank(path: &Path) -> bool {
-    crate::soundfont::is_soundfont(path) || crate::sfz::is_sfz(path) || crate::dls::is_dls(path)
+    crate::soundfont::is_soundfont(path)
+        || crate::sfz::is_sfz(path)
+        || crate::dls::is_dls(path)
+        || crate::xi::is_xi(path)
 }
 
 /// Build an `Entry` with its cheap metadata (size, mtime) read up front. The rating

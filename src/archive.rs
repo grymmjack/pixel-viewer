@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 /// excluded — they decompress to one file, not a folder.
 const ARCHIVE_EXTS: &[&str] = &[
     "zip", "7z", "rar", "lha", "lzh", "tar", "ace", "arj", "arc", "zoo", "ha", "uc2", "sqz", "hyp",
-    "tgz", "tbz",
+    "tgz", "tbz", // Renoise song / instrument are ZIP containers (browse their SampleData/):
+    "xrns", "xrni",
 ];
 
 /// True if `path` looks like a browsable archive (by extension, case-insensitive).
@@ -83,6 +84,16 @@ fn hash_str(s: &str) -> u64 {
 
 /// Walk the archive sequentially, writing each file entry under `dest`.
 fn extract_all(archive: &Path, dest: &Path) -> io::Result<()> {
+    // Renoise `.xrns`/`.xrni` are ZIP containers, but unarc's format detection is by extension,
+    // so open them explicitly as ZIP rather than letting `open_path` reject the unknown suffix.
+    let ext = archive
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if matches!(ext.as_str(), "xrns" | "xrni") {
+        return extract_zip(archive, dest);
+    }
     use unarc_rs::unified::ArchiveFormat;
     let mut a = ArchiveFormat::open_path(archive).map_err(|e| {
         io::Error::new(
@@ -112,6 +123,35 @@ fn extract_all(archive: &Path, dest: &Path) -> io::Result<()> {
                 let _ = std::fs::write(&out, data);
             }
             Err(_) => continue,
+        }
+    }
+    Ok(())
+}
+
+/// Extract a file explicitly as a ZIP (via unarc's `ZipArchive`, bypassing extension-based
+/// format detection) — for containers like Renoise `.xrns`/`.xrni` that are zips under a
+/// different suffix. Same zip-slip guard + best-effort-per-entry policy as `extract_all`.
+fn extract_zip(archive: &Path, dest: &Path) -> io::Result<()> {
+    use unarc_rs::zip::zip_archive::ZipArchive;
+    let file = std::fs::File::open(archive)?;
+    let mut zip = ZipArchive::new(file)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("zip: {e}")))?;
+    while let Some(header) = zip
+        .get_next_entry()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("zip entry: {e}")))?
+    {
+        let Some(out) = safe_join(dest, &header.name) else {
+            continue;
+        };
+        if header.is_directory {
+            let _ = std::fs::create_dir_all(&out);
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if let Ok(data) = zip.read(&header) {
+            let _ = std::fs::write(&out, data);
         }
     }
     Ok(())
