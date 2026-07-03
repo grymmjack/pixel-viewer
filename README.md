@@ -73,8 +73,9 @@ and the rest of the demoscene / textmode art world — right down to baud-rate
 - **Beyond images** — view **source code** (~90 languages, syntax-highlighted), **PDFs**
   (real rendered pages + a 1-/2-page viewer), and **audio** (an in-app waveform player with
   looping, a piano-key sampler playable from a **hardware MIDI controller**, tracker-module
-  playback with a per-sample explorer/export, and **SoundFonts browsed as a folder** of their
-  samples). Each is a **toggleable plugin** you can switch off in Preferences.
+  playback with a per-sample explorer/export, and **sample banks — SoundFont / SFZ / DLS —
+  browsed as a folder** of their samples). Each is a **toggleable plugin** you can switch off in
+  Preferences.
 - **Star ratings** stored as KDE Baloo xattrs (interoperate with Gwenview), with a
   cross-platform sidecar so even art inside a zip or on 16colo.rs is ratable.
 - **A fading metadata OSD** in the viewer — title, artist(s), SAUCE comment and
@@ -115,7 +116,7 @@ down to the extensions a decoder claims.
 | **Source code / text** *(plugin)* | ~90 exts — `rs` `c/cpp/h` `py` `js/ts` `css` `html` `php` `lua` `asm` `gd` `json` `yaml` `md` `log` `ipynb` … | CP437-rasterized with a hand-rolled syntax highlighter |
 | **PDF** *(plugin)* | `.pdf` | Real first-page tile + in-app 1-/2-page viewer (needs poppler) |
 | **Audio** *(plugin)* | `mp3` `wav` `ogg` `flac` + trackers `mod` `xm` `s3m` `it` | Waveform tile + in-app play/loop/seek/sampler/MIDI |
-| **SoundFont** *(plugin)* | `.sf2` | Browsed as a folder of its samples (rustysynth) |
+| **Sample banks** *(plugin)* | `.sf2` (SoundFont) · `.sfz` · `.dls` | Browsed as a folder of their samples |
 
 Scene-art formats are decoded with **SAUCE** metadata awareness (the standard
 trailer ANSI artists use to record title/author/group/dimensions), shown in the
@@ -395,12 +396,16 @@ The audio player goes further than playback:
   and every individual sample is listed below the keyboard. Click one to load it — the
   waveform, transport and keyboard all follow it — or **export it as a WAV**. A *Full song*
   row jumps back to the whole module.
-- **Browse a SoundFont (`.sf2`) as a folder.** A soundfont shows as an enterable "folder";
-  its Details pane reports **how many presets, instruments and samples** it contains, and
-  double-clicking it lists every sample as a WAV you can play, audition on the keyboard/MIDI,
-  rate, and export — just like any other file.
+- **Browse a sample bank as a folder.** A **SoundFont (`.sf2`)**, **SFZ (`.sfz`)**, or **DLS
+  (`.dls`)** shows as an enterable "folder"; its Details pane reports what's inside (presets /
+  instruments / regions / **sample count** + key range), and entering it lists every sample as a
+  WAV you can play, audition on the keyboard/MIDI, rate, and export. (SFZ references external
+  samples, so they're linked in place — no copy; SF2/DLS embed their PCM, so those are extracted.)
 
 ![A SoundFont opened as a folder — every sample shown as a named WAV tile with its waveform](docs/screenshots/soundfont-folder.png)
+
+Opening or revisiting audio is **cached** — a tracker module that takes seconds to synthesize is
+decoded once and cloned from memory on the next visit, so flipping back and forth is instant.
 
 **They're plugins — turn off what you don't want.** Source code, PDF and audio are each a
 runtime **toggle** in **Preferences → Format plugins**. Switch one off and its file type

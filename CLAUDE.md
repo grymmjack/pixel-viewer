@@ -77,6 +77,10 @@ src/
   anim.rs            decode animated GIF frames + per-frame delays
   soundfont.rs       .sf2 as a virtual folder: rustysynth parse → each sample extracted
                      to a WAV in a temp dir (mounted like an archive) + preset/instr counts
+  sfz.rs             .sfz as a virtual folder: parse opcodes → symlink referenced samples
+                     into a temp dir; region/sample/key-range info
+  dls.rs             .dls as a virtual folder: walk the RIFF wave pool → rewrap each
+                     embedded wave into a standalone WAV; instrument/sample counts
   decode/
     mod.rs           Decoder trait + Registry (sniff-then-extension dispatch)
     builtin.rs       image-crate decoder: png/gif/bmp/jpeg/webp/tga/tiff/pnm/qoi/ico/draw
@@ -810,15 +814,35 @@ scales gain, Note Off ignored (monophonic one-shot "preview"). `midi_conn` **mus
 auto-reconnects on launch when still present. midir's ALSA-seq backend links the **same
 `libasound2`** rodio already needs — no new system dep.
 
-**SoundFont as a folder (`soundfont.rs`, `rustysynth`).** A `.sf2` is a **virtual folder** of its
-samples — it shares `Entry.is_archive` (📁 glyph + "SF2" badge, click-to-enter, prev/next skipping),
-and `enter_soundfont` mirrors `enter_archive`: `soundfont::extract_to_cache` parses with `rustysynth`
-and writes each `SampleHeader`'s slice of `get_wave_data()` (one shared `&[i16]`) to a numbered
-16-bit WAV in a per-file temp dir (cached by path+size+mtime), then mounts it via `ArchiveMount` so
-`to_display`/`real_path` give the `<file>.sf2/NNN_name.wav` breadcrumb and each sample opens/plays/
-rates/exports like any file. `soundfont::info` (cached in `sf_cache`, shown in Details) reports the
-**Presets / Instruments / Samples** counts + bank name. Extraction is synchronous on the UI thread
-(a huge multi-hundred-MB SF2 can hitch on first open; it's cached after).
+**Sample banks as folders (`soundfont.rs` / `sfz.rs` / `dls.rs`).** A `.sf2`, `.sfz`, or `.dls`
+is a **virtual folder** of its samples. `is_sample_bank(path)` folds all three into the
+`Entry.is_archive` path (📁 glyph + a per-format badge, click-to-enter, prev/next skipping), and
+each gets an `enter_*` that mirrors `enter_archive` — extract/mount to a per-file temp dir (cached
+by path+size+mtime) via `ArchiveMount`, so `to_display`/`real_path` give the `<file>/NNN_name.wav`
+breadcrumb and every sample opens/plays/rates/exports like a real file. A cached `*_info` (`sf_cache`
+/ `sfz_cache` / `dls_cache`) feeds the Details pane:
+- **SF2** (`soundfont::extract_to_cache`, `rustysynth`): writes each `SampleHeader`'s slice of
+  `get_wave_data()` (one shared `&[i16]`) to a 16-bit WAV. Details: Presets / Instruments / Samples.
+- **SFZ** (`sfz::mount_to_cache`): an `.sfz` is *text* referencing **external** samples (`sample=`
+  resolved against `default_path` + the file's dir), so it **symlinks** each unique sample into the
+  temp dir (copy fallback) — no data copy. Hand-rolled opcode parser handles spaces-in-paths, note
+  names (`c4`/`f#3`/`60`), and `//` + `/* */` comments. Details: Regions / Samples / Key range.
+- **DLS** (`dls::extract_to_cache`): each `LIST:wave` in the RIFF `wvpl` is an embedded WAV, so it
+  rewraps each `fmt `+`data` (+ INFO/INAM name) into a standalone WAV bit-for-bit (no re-encode).
+  Details: Instruments / Samples.
+
+Extraction is synchronous on the UI thread (a huge multi-hundred-MB SF2 can hitch on first open;
+it's cached after). **REX/RX2** aren't supported: the format is proprietary (RX2 audio is DWOP-
+compressed) — decodable only by porting a reverse-engineered codec; deferred, not shipped.
+
+**Decode cache (CPU-intense work).** A tracker module re-synthesizes seconds of audio via `xmrs`
+on every open. `AudioPlayer::open` is split into the device-free `decode_audio` → `DecodedAudio`
+(the costly step) and `AudioPlayer::from_decoded` (opens the rodio device). `ensure_audio_loaded`
+/ `toggle_audio` go through `decode_audio_cached`: a path+mtime-keyed LRU (`audio_decode_cache`,
+~192 MB budget) so **revisiting a file clones the cached decode instead of re-synthesizing**. Other
+CPU work is already cached (thumbnails `thumb_tex`, `img_meta`, archive/soundfont extraction dirs,
+recolor tiles, minimap, SAUCE); a *persistent on-disk* thumbnail cache (across restarts) is the
+remaining unbuilt win.
 
 `rodio → cpal → alsa-sys` needs **`libasound2-dev` at BUILD time** on Linux (added to CI + the
 first-time-deps list above), so `rodio`/`xmrs`/`midir` are normal (non-feature-gated) deps
