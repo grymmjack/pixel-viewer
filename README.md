@@ -72,8 +72,9 @@ and the rest of the demoscene / textmode art world — right down to baud-rate
   DawnBringer, Endesga, …) plus `.GPL` import/export.
 - **Beyond images** — view **source code** (~90 languages, syntax-highlighted), **PDFs**
   (real rendered pages + a 1-/2-page viewer), and **audio** (an in-app waveform player with
-  looping, a piano-key sampler, and tracker-module playback). Each is a **toggleable plugin**
-  you can switch off in Preferences.
+  looping, a piano-key sampler playable from a **hardware MIDI controller**, tracker-module
+  playback with a per-sample explorer/export, and **SoundFonts browsed as a folder** of their
+  samples). Each is a **toggleable plugin** you can switch off in Preferences.
 - **Star ratings** stored as KDE Baloo xattrs (interoperate with Gwenview), with a
   cross-platform sidecar so even art inside a zip or on 16colo.rs is ratable.
 - **A fading metadata OSD** in the viewer — title, artist(s), SAUCE comment and
@@ -113,7 +114,8 @@ down to the extensions a decoder claims.
 | **Archives (virtual folders)** | `.zip` `.lha` `.arj` `.arc` `.zoo` `.7z` `.rar` … | Browsed read-only; contents extracted on demand |
 | **Source code / text** *(plugin)* | ~90 exts — `rs` `c/cpp/h` `py` `js/ts` `css` `html` `php` `lua` `asm` `gd` `json` `yaml` `md` `log` `ipynb` … | CP437-rasterized with a hand-rolled syntax highlighter |
 | **PDF** *(plugin)* | `.pdf` | Real first-page tile + in-app 1-/2-page viewer (needs poppler) |
-| **Audio** *(plugin)* | `mp3` `wav` `ogg` `flac` + trackers `mod` `xm` `s3m` `it` | Waveform tile + in-app play/loop/seek/sampler |
+| **Audio** *(plugin)* | `mp3` `wav` `ogg` `flac` + trackers `mod` `xm` `s3m` `it` | Waveform tile + in-app play/loop/seek/sampler/MIDI |
+| **SoundFont** *(plugin)* | `.sf2` | Browsed as a folder of its samples (rustysynth) |
 
 Scene-art formats are decoded with **SAUCE** metadata awareness (the standard
 trailer ANSI artists use to record title/author/group/dimensions), shown in the
@@ -383,6 +385,22 @@ piano keyboard** that auditions the sample pitch-shifted across octaves. Master 
 stop / volume** controls also live at the far right of the menu bar.
 
 ![The in-app audio player with a large waveform, transport controls and a piano keyboard](docs/screenshots/audio-player.png)
+
+The audio player goes further than playback:
+
+- **Play from a hardware MIDI controller.** Pick a connected MIDI input device in the
+  player's **MIDI in:** menu and its keys audition the loaded sample — pitched by note, with
+  velocity as volume. The chosen device is remembered and auto-reconnects on launch.
+- **Explore the samples inside a tracker module.** Open a `.mod` / `.xm` / `.s3m` / `.it`
+  and every individual sample is listed below the keyboard. Click one to load it — the
+  waveform, transport and keyboard all follow it — or **export it as a WAV**. A *Full song*
+  row jumps back to the whole module.
+- **Browse a SoundFont (`.sf2`) as a folder.** A soundfont shows as an enterable "folder";
+  its Details pane reports **how many presets, instruments and samples** it contains, and
+  double-clicking it lists every sample as a WAV you can play, audition on the keyboard/MIDI,
+  rate, and export — just like any other file.
+
+![A SoundFont opened as a folder — every sample shown as a named WAV tile with its waveform](docs/screenshots/soundfont-folder.png)
 
 **They're plugins — turn off what you don't want.** Source code, PDF and audio are each a
 runtime **toggle** in **Preferences → Format plugins**. Switch one off and its file type

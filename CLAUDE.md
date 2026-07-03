@@ -75,6 +75,8 @@ src/
   rating.rs          read/write star ratings via the user.baloo.rating xattr
   ratings.rs         cross-platform ratings sidecar (ratings.json) for virtual art
   anim.rs            decode animated GIF frames + per-frame delays
+  soundfont.rs       .sf2 as a virtual folder: rustysynth parse → each sample extracted
+                     to a WAV in a temp dir (mounted like an archive) + preset/instr counts
   decode/
     mod.rs           Decoder trait + Registry (sniff-then-extension dispatch)
     builtin.rs       image-crate decoder: png/gif/bmp/jpeg/webp/tga/tiff/pnm/qoi/ico/draw
@@ -788,10 +790,40 @@ player is created — `ensure_audio_loaded` + `toggle_audio`). The menu-bar hand
 `audio_stop`/`audio_mute`/`audio_vol` locals applied after the `MenuBar` closure (it can't
 borrow `self` twice).
 
+**Sample explorer (a swappable-buffer model).** A tracker module carries a bank of individual
+samples; `AudioPlayer.tracker_samples: Vec<NamedSample>` holds them (`extract_tracker_samples`
+walks the xmrs module's `InstrDefault.sample` lists → mono `f32` at a C-4-derived rate:
+`8363 · 2^(relative_pitch/12)`, with precomputed peaks). Below the keyboard, `draw_audio_controls`
+lists them: click one to **load** it (the transport/waveform/keyboard all follow it) or ⬇ **export**
+it as WAV. The mechanism is a **swappable buffer**: `SampleBuf` bundles samples/channels/rate/
+duration/peaks; `select_sample(Some(i))` stashes the song via `take_buffer` → `song_backup` and
+`put_buffer`s the sample; `select_sample(None)` restores the stash — so **only one song copy is ever
+held** (the "Full song" row reverts). `write_wav_16` is a tiny dependency-free 16-bit PCM writer.
+
+**Hardware MIDI input (`midir`).** Pick a controller in the big player's "MIDI in:" combo
+(`midi_input_port_names` enumerates with a throwaway `MidiInput`; `open_midi_port` connects — the
+callback runs on **midir's own thread** and sends `(note, vel, on)` over an mpsc `Sender` passed as
+the callback's data). `poll_midi` (called each frame in `ui()`) drains the receiver and calls
+`AudioPlayer::play_note_vel(note − 60, vel)` — MIDI middle C = the sample's native pitch, velocity
+scales gain, Note Off ignored (monophonic one-shot "preview"). `midi_conn` **must be kept alive**
+(drop = close); `connect_midi(None)` closes it. The chosen device persists (`MIDI_PORT_KEY`) and
+auto-reconnects on launch when still present. midir's ALSA-seq backend links the **same
+`libasound2`** rodio already needs — no new system dep.
+
+**SoundFont as a folder (`soundfont.rs`, `rustysynth`).** A `.sf2` is a **virtual folder** of its
+samples — it shares `Entry.is_archive` (📁 glyph + "SF2" badge, click-to-enter, prev/next skipping),
+and `enter_soundfont` mirrors `enter_archive`: `soundfont::extract_to_cache` parses with `rustysynth`
+and writes each `SampleHeader`'s slice of `get_wave_data()` (one shared `&[i16]`) to a numbered
+16-bit WAV in a per-file temp dir (cached by path+size+mtime), then mounts it via `ArchiveMount` so
+`to_display`/`real_path` give the `<file>.sf2/NNN_name.wav` breadcrumb and each sample opens/plays/
+rates/exports like any file. `soundfont::info` (cached in `sf_cache`, shown in Details) reports the
+**Presets / Instruments / Samples** counts + bank name. Extraction is synchronous on the UI thread
+(a huge multi-hundred-MB SF2 can hitch on first open; it's cached after).
+
 `rodio → cpal → alsa-sys` needs **`libasound2-dev` at BUILD time** on Linux (added to CI + the
-first-time-deps list above), so `rodio`/`xmrs` are normal (non-feature-gated) deps. The
-slideshow **auto-advance skips PDFs / audio / source-text** (you'd lose your place / cut a
-track) — only images, text-mode art and RIP auto-advance.
+first-time-deps list above), so `rodio`/`xmrs`/`midir` are normal (non-feature-gated) deps
+(`rustysynth` is pure-Rust/std-only). The slideshow **auto-advance skips PDFs / audio / source-text**
+(you'd lose your place / cut a track) — only images, text-mode art and RIP auto-advance.
 
 **The icy ecosystem (Mike Krüger's scene-art formats), the lean way.** Mike's
 `icy_engine` *renders* but hard-depends on `icy_net` → **tokio "full"** — too heavy for
