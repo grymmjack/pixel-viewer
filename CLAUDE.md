@@ -775,6 +775,19 @@ Both player surfaces also have an **onscreen piano keyboard** (`piano_keyboard(u
 key plays the selected region pitch-shifted via rodio `speed()` (2^(semitone/12));
 `AudioPlayer::play_note` / `play_speed` keep the playhead correct at a pitched tempo.
 
+**Master audio controls** live flush-right in the **menu bar**, shown only while the audio
+plugin is on (`self.plugin_audio`): a **🔊/🔇 mute** speaker toggle, a **global ⏹ stop**, and a
+**volume slider** (reading left→right; added right-to-left in a `Layout::right_to_left` block).
+Volume/mute are `audio_volume` (0..1) + `audio_muted`, both persisted (`AUDIO_VOLUME_KEY`/
+`AUDIO_MUTED_KEY`) and pushed live to the player via `set_audio_volume`/`toggle_audio_mute`.
+Because `play_source` rebuilds a fresh rodio `Player` on every play (to cleanly replace a
+finished/looping source), the gain is re-applied there from `AudioPlayer::effective_volume()`
+(= 0 when muted, else `volume`) — not just once; `apply_volume()` handles a live slider drag.
+`AudioPlayer` mirrors the two values (seeded from `self.audio_volume`/`audio_muted` wherever a
+player is created — `ensure_audio_loaded` + `toggle_audio`). The menu-bar handlers defer through
+`audio_stop`/`audio_mute`/`audio_vol` locals applied after the `MenuBar` closure (it can't
+borrow `self` twice).
+
 `rodio → cpal → alsa-sys` needs **`libasound2-dev` at BUILD time** on Linux (added to CI + the
 first-time-deps list above), so `rodio`/`xmrs` are normal (non-feature-gated) deps. The
 slideshow **auto-advance skips PDFs / audio / source-text** (you'd lose your place / cut a

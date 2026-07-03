@@ -795,6 +795,8 @@ pub struct PixelView {
     audio_autoplay: bool,      // start playing on select + loop until stopped (persisted)
     audio_drag: Option<f32>,   // waveform drag-select anchor time (transient)
     audio_octave: i32,         // onscreen-keyboard octave offset (transient)
+    audio_volume: f32,         // master playback volume 0..1 (menu-bar slider, persisted)
+    audio_muted: bool,         // master mute (menu-bar speaker toggle, persisted)
     palettes: HashMap<PathBuf, Option<Vec<[u8; 4]>>>, // details swatches; None = too many colors
     thumb_rgba: HashMap<PathBuf, (usize, usize, Vec<u8>)>, // thumb CPU pixels (for grid recolor)
     grid_recolor: HashMap<PathBuf, (String, egui::TextureHandle)>, // recolored grid tiles, per recolor key
@@ -1079,6 +1081,9 @@ impl PixelView {
     const PLUGIN_CODE_KEY: &'static str = "plugin_code";
     /// Audio preview: start on select + loop until stopped.
     const AUDIO_AUTOPLAY_KEY: &'static str = "audio_autoplay";
+    /// Master audio volume (0..1) + mute — the menu-bar volume control.
+    const AUDIO_VOLUME_KEY: &'static str = "audio_volume";
+    const AUDIO_MUTED_KEY: &'static str = "audio_muted";
     /// Storage key for the last-opened folder (reopened on launch).
     const FOLDER_KEY: &'static str = "last_folder";
     /// Storage keys for sort & filter state.
@@ -1151,6 +1156,12 @@ impl PixelView {
         let plugin_audio = load_bool(Self::PLUGIN_AUDIO_KEY, true);
         let plugin_code = load_bool(Self::PLUGIN_CODE_KEY, true);
         let audio_autoplay = load_bool(Self::AUDIO_AUTOPLAY_KEY, false);
+        let audio_volume = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::AUDIO_VOLUME_KEY))
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        let audio_muted = load_bool(Self::AUDIO_MUTED_KEY, false);
         registry.set_plugin("pdf", plugin_pdf);
         registry.set_plugin("audio", plugin_audio);
         registry.set_plugin("code", plugin_code);
@@ -1487,6 +1498,8 @@ impl PixelView {
             audio_autoplay,
             audio_drag: None,
             audio_octave: 0,
+            audio_volume,
+            audio_muted,
             palettes: HashMap::new(),
             thumb_rgba: HashMap::new(),
             grid_recolor: HashMap::new(),
@@ -2256,6 +2269,8 @@ impl PixelView {
         };
         match AudioPlayer::open(path, bytes) {
             Ok(mut ap) => {
+                ap.volume = self.audio_volume;
+                ap.muted = self.audio_muted;
                 ap.looping = self.audio_autoplay; // autoplay = loop until stopped
                 ap.play_region();
                 self.audio_player = Some(ap);
@@ -2269,6 +2284,24 @@ impl PixelView {
     fn stop_audio(&mut self) {
         if let Some(ap) = &mut self.audio_player {
             ap.stop();
+        }
+    }
+
+    /// Set the master audio volume (0..1) and push it to the live player immediately.
+    fn set_audio_volume(&mut self, v: f32) {
+        self.audio_volume = v.clamp(0.0, 1.0);
+        if let Some(ap) = &mut self.audio_player {
+            ap.volume = self.audio_volume;
+            ap.apply_volume();
+        }
+    }
+
+    /// Toggle master mute and push it to the live player immediately.
+    fn toggle_audio_mute(&mut self) {
+        self.audio_muted = !self.audio_muted;
+        if let Some(ap) = &mut self.audio_player {
+            ap.muted = self.audio_muted;
+            ap.apply_volume();
         }
     }
 
@@ -2288,6 +2321,8 @@ impl PixelView {
         let real = self.resolve_local(path);
         let Ok(bytes) = std::fs::read(&real) else { return };
         if let Ok(mut ap) = AudioPlayer::open(path, bytes) {
+            ap.volume = self.audio_volume;
+            ap.muted = self.audio_muted;
             ap.looping = self.audio_autoplay;
             if self.audio_autoplay {
                 ap.play_region();
@@ -9355,6 +9390,10 @@ impl PixelView {
     /// deferred `MenuAction`, applied afterward — avoiding nested `&mut self`.
     fn ui_menubar(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let mut action: Option<MenuAction> = None;
+        // Deferred master-audio controls (the closure can't borrow `self` mutably).
+        let mut audio_stop = false;
+        let mut audio_mute = false;
+        let mut audio_vol: Option<f32> = None;
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui.button("Open folder…").clicked() {
@@ -9553,9 +9592,46 @@ impl PixelView {
                     ui.close();
                 }
             });
+            // Audio plugin on → master audio controls, flush to the far right of the menu
+            // bar: a mute speaker toggle, a global stop, and the volume slider. Added
+            // right-to-left, so reading left→right they are: speaker · stop · volume.
+            if self.plugin_audio {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(6.0);
+                    ui.spacing_mut().slider_width = 90.0;
+                    let mut vol = self.audio_volume;
+                    if ui
+                        .add(egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false))
+                        .on_hover_text(format!("Volume {:.0}%", vol * 100.0))
+                        .changed()
+                    {
+                        audio_vol = Some(vol);
+                    }
+                    if ui.button("⏹").on_hover_text("Stop audio").clicked() {
+                        audio_stop = true;
+                    }
+                    let (icon, tip) = if self.audio_muted {
+                        ("🔇", "Unmute audio")
+                    } else {
+                        ("🔊", "Mute audio")
+                    };
+                    if ui.button(icon).on_hover_text(tip).clicked() {
+                        audio_mute = true;
+                    }
+                });
+            }
         });
         if let Some(a) = action {
             self.do_menu(ctx, a);
+        }
+        if audio_mute {
+            self.toggle_audio_mute();
+        }
+        if audio_stop {
+            self.stop_audio();
+        }
+        if let Some(v) = audio_vol {
+            self.set_audio_volume(v);
         }
     }
 
@@ -10592,6 +10668,8 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::PLUGIN_AUDIO_KEY, &self.plugin_audio);
         eframe::set_value(storage, Self::PLUGIN_CODE_KEY, &self.plugin_code);
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
+        eframe::set_value(storage, Self::AUDIO_VOLUME_KEY, &self.audio_volume);
+        eframe::set_value(storage, Self::AUDIO_MUTED_KEY, &self.audio_muted);
         // Remember where we were. Save the *display* path, not `self.folder`: inside an
         // archive / downloaded 16colo pack, `self.folder` is a temp dir that's gone next
         // launch, whereas the display path (`pack.zip/…`, `<16colo.rs>/year/pack`) is
@@ -12247,6 +12325,8 @@ struct AudioPlayer {
     region_len: f32,   // its length (for the loop-modulo playhead)
     started: bool,     // a source has been appended at least once
     play_speed: f32,   // playback speed of the current source (>1 = pitched up, for auditioning)
+    volume: f32,       // master volume 0..1 (from the menu-bar control)
+    muted: bool,       // master mute (silences without losing the volume value)
 }
 
 impl AudioPlayer {
@@ -12294,7 +12374,23 @@ impl AudioPlayer {
             region_len: duration.max(0.0001),
             started: false,
             play_speed: 1.0,
+            volume: 1.0,
+            muted: false,
         })
+    }
+
+    /// The gain to hand rodio: 0 when muted, else the master volume.
+    fn effective_volume(&self) -> f32 {
+        if self.muted {
+            0.0
+        } else {
+            self.volume
+        }
+    }
+
+    /// Push the current master volume/mute to the live player (no restart).
+    fn apply_volume(&self) {
+        self.player.set_volume(self.effective_volume());
     }
 
     /// (Re)start playback of the selected region on a fresh player (so a finished/looping
@@ -12327,6 +12423,7 @@ impl AudioPlayer {
         let buf = rodio::buffer::SamplesBuffer::new(self.channels, self.sample_rate, region)
             .speed(self.play_speed);
         let player = rodio::Player::connect_new(self._stream.mixer());
+        player.set_volume(self.effective_volume()); // a fresh player defaults to full gain
         if self.looping && !one_shot {
             player.append(buf.repeat_infinite());
         } else {
