@@ -797,6 +797,12 @@ pub struct PixelView {
     audio_octave: i32,         // onscreen-keyboard octave offset (transient)
     audio_volume: f32,         // master playback volume 0..1 (menu-bar slider, persisted)
     audio_muted: bool,         // master mute (menu-bar speaker toggle, persisted)
+    // Hardware MIDI controller → play the loaded sample. The callback runs on midir's thread
+    // and sends note events over `midi_rx`; `midi_conn` must be kept alive (drop = close).
+    midi_rx: Option<std::sync::mpsc::Receiver<MidiNoteEvent>>,
+    midi_conn: Option<midir::MidiInputConnection<std::sync::mpsc::Sender<MidiNoteEvent>>>,
+    midi_port: Option<String>, // chosen MIDI input device name (persisted)
+    midi_ports: Vec<String>,   // last-enumerated device names (for the picker combo)
     palettes: HashMap<PathBuf, Option<Vec<[u8; 4]>>>, // details swatches; None = too many colors
     thumb_rgba: HashMap<PathBuf, (usize, usize, Vec<u8>)>, // thumb CPU pixels (for grid recolor)
     grid_recolor: HashMap<PathBuf, (String, egui::TextureHandle)>, // recolored grid tiles, per recolor key
@@ -1084,6 +1090,8 @@ impl PixelView {
     /// Master audio volume (0..1) + mute — the menu-bar volume control.
     const AUDIO_VOLUME_KEY: &'static str = "audio_volume";
     const AUDIO_MUTED_KEY: &'static str = "audio_muted";
+    /// Chosen MIDI input device (name; reconnected on launch if still present).
+    const MIDI_PORT_KEY: &'static str = "midi_port";
     /// Storage key for the last-opened folder (reopened on launch).
     const FOLDER_KEY: &'static str = "last_folder";
     /// Storage keys for sort & filter state.
@@ -1162,6 +1170,27 @@ impl PixelView {
             .unwrap_or(1.0)
             .clamp(0.0, 1.0);
         let audio_muted = load_bool(Self::AUDIO_MUTED_KEY, false);
+        // MIDI: enumerate controllers (only if the audio plugin is on) and auto-reconnect the
+        // remembered device when it's still plugged in.
+        let saved_midi = cc
+            .storage
+            .and_then(|s| eframe::get_value::<String>(s, Self::MIDI_PORT_KEY))
+            .filter(|s| !s.is_empty());
+        let midi_ports = if plugin_audio {
+            midi_input_port_names()
+        } else {
+            Vec::new()
+        };
+        let (midi_conn, midi_rx, midi_port) = match &saved_midi {
+            Some(name) if midi_ports.iter().any(|p| p == name) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                match open_midi_port(name, tx) {
+                    Some(conn) => (Some(conn), Some(rx), Some(name.clone())),
+                    None => (None, None, saved_midi.clone()),
+                }
+            }
+            _ => (None, None, saved_midi.clone()),
+        };
         registry.set_plugin("pdf", plugin_pdf);
         registry.set_plugin("audio", plugin_audio);
         registry.set_plugin("code", plugin_code);
@@ -1500,6 +1529,10 @@ impl PixelView {
             audio_octave: 0,
             audio_volume,
             audio_muted,
+            midi_rx,
+            midi_conn,
+            midi_port,
+            midi_ports,
             palettes: HashMap::new(),
             thumb_rgba: HashMap::new(),
             grid_recolor: HashMap::new(),
@@ -2313,6 +2346,47 @@ impl PixelView {
         }
     }
 
+    /// Re-scan the connected MIDI input devices (for the picker combo).
+    fn refresh_midi_ports(&mut self) {
+        self.midi_ports = midi_input_port_names();
+    }
+
+    /// (Dis)connect the chosen MIDI input device. `None` closes any open port. Dropping the
+    /// old connection closes it before a new one opens.
+    fn connect_midi(&mut self, port: Option<String>) {
+        self.midi_conn = None; // drop → close the old port
+        self.midi_rx = None;
+        self.midi_port = port.clone();
+        if let Some(name) = port {
+            let (tx, rx) = std::sync::mpsc::channel();
+            if let Some(conn) = open_midi_port(&name, tx) {
+                self.midi_conn = Some(conn);
+                self.midi_rx = Some(rx);
+                self.status = format!("MIDI in: {name}");
+            } else {
+                self.status = format!("MIDI: couldn't open {name}");
+            }
+        }
+    }
+
+    /// Drain queued MIDI notes and play the loaded sample. MIDI note 60 (middle C) maps to the
+    /// sample's native pitch; Note Off is ignored (monophonic one-shot preview).
+    fn poll_midi(&mut self) {
+        let Some(rx) = &self.midi_rx else { return };
+        let events: Vec<MidiNoteEvent> = rx.try_iter().collect();
+        if events.is_empty() {
+            return;
+        }
+        for (note, vel, on) in events {
+            if on {
+                if let Some(ap) = &mut self.audio_player {
+                    ap.play_note_vel(note as i32 - 60, vel);
+                }
+            }
+        }
+        self.want_repaint = true;
+    }
+
     /// Export tracker sample `idx` to a user-chosen `.wav` (16-bit PCM at its native rate).
     fn export_audio_sample(&mut self, idx: usize) {
         let Some((name, samples, ch, rate)) = self.audio_player.as_ref().and_then(|ap| {
@@ -2395,6 +2469,8 @@ impl PixelView {
         let mut want_octave: Option<i32> = None;
         let mut want_sample: Option<Option<usize>> = None; // Some(Some(i))=pick sample; Some(None)=full song
         let mut want_export: Option<usize> = None; // export tracker sample i to WAV
+        let mut want_midi: Option<Option<String>> = None; // choose MIDI in device (None = off)
+        let mut want_midi_refresh = false; // re-scan MIDI devices
 
         // Transport row.
         ui.horizontal(|ui| {
@@ -2509,6 +2585,43 @@ impl PixelView {
             });
             if let Some(semi) = piano_keyboard(ui, oct, if big { 130.0 } else { 66.0 }) {
                 want_note = Some(semi);
+            }
+            // MIDI controller picker (big view only): play the loaded sample from hardware keys.
+            if big {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.weak("🎹 MIDI in:");
+                    let current = self.midi_port.clone();
+                    let label = current.clone().unwrap_or_else(|| "None".to_string());
+                    egui::ComboBox::from_id_salt("midi_in_pick")
+                        .selected_text(elide(&label, 28))
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(current.is_none(), "None").clicked() {
+                                want_midi = Some(None);
+                            }
+                            for p in &self.midi_ports {
+                                if ui
+                                    .selectable_label(current.as_deref() == Some(p.as_str()), p)
+                                    .clicked()
+                                {
+                                    want_midi = Some(Some(p.clone()));
+                                }
+                            }
+                            if self.midi_ports.is_empty() {
+                                ui.weak("(no controllers found)");
+                            }
+                        });
+                    if ui
+                        .small_button("⟲")
+                        .on_hover_text("Re-scan MIDI devices")
+                        .clicked()
+                    {
+                        want_midi_refresh = true;
+                    }
+                    if self.midi_conn.is_some() {
+                        ui.weak("· play the sample from your keys");
+                    }
+                });
             }
         } else if is_tracker_ext(
             &path
@@ -2639,6 +2752,12 @@ impl PixelView {
         }
         if let Some(i) = want_export {
             self.export_audio_sample(i);
+        }
+        if want_midi_refresh {
+            self.refresh_midi_ports();
+        }
+        if let Some(port) = want_midi {
+            self.connect_midi(port);
         }
         if self.audio_player.as_ref().is_some_and(|ap| ap.is_playing()) {
             self.want_repaint = true;
@@ -10005,6 +10124,7 @@ impl eframe::App for PixelView {
         self.poll_colo_open(&ctx);
         self.poll_colo_save();
         self.poll_colo_sauce();
+        self.poll_midi(); // hardware MIDI keys → play the loaded sample
         // Screensaver: once a (random) pack has finished downloading + mounting, open its
         // first art file. Both async ops idle ⇒ the listing has settled.
         if self.pending_autoplay && self.random_rx.is_none() && self.remote_rx.is_none() {
@@ -10775,6 +10895,11 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
         eframe::set_value(storage, Self::AUDIO_VOLUME_KEY, &self.audio_volume);
         eframe::set_value(storage, Self::AUDIO_MUTED_KEY, &self.audio_muted);
+        eframe::set_value(
+            storage,
+            Self::MIDI_PORT_KEY,
+            &self.midi_port.clone().unwrap_or_default(),
+        );
         // Remember where we were. Save the *display* path, not `self.folder`: inside an
         // archive / downloaded 16colo pack, `self.folder` is a temp dir that's gone next
         // launch, whereas the display path (`pack.zip/…`, `<16colo.rs>/year/pack`) is
@@ -12609,8 +12734,17 @@ impl AudioPlayer {
     /// pitch (0 = as-recorded), played once (a one-shot instrument key). rodio's `speed`
     /// resamples, so it shifts pitch *and* tempo — the expected sampler behavior.
     fn play_note(&mut self, semitone: i32) {
+        self.play_note_vel(semitone, 127);
+    }
+
+    /// Like [`play_note`], but scale the gain by MIDI `velocity` (0..127) on top of the master
+    /// volume — so a hardware controller's dynamics come through. Monophonic (each key replaces
+    /// the last), which is exactly the "key preview" behavior.
+    fn play_note_vel(&mut self, semitone: i32, velocity: u8) {
         self.play_speed = 2.0f32.powf(semitone as f32 / 12.0);
         self.play_source(true);
+        let v = (velocity as f32 / 127.0).clamp(0.0, 1.0);
+        self.player.set_volume(self.effective_volume() * v);
     }
 
     /// Build a fresh player for the current region at `self.play_speed`; `one_shot` overrides
@@ -12693,6 +12827,58 @@ fn is_audio_ext(p: &Path) -> bool {
 /// Extensions we play via the `xmrs` tracker synthesizer (rather than rodio's PCM decoders).
 fn is_tracker_ext(ext: &str) -> bool {
     matches!(ext, "mod" | "xm" | "s3m" | "it" | "mtm" | "stm" | "mptm")
+}
+
+/// A note event from a hardware MIDI controller: `(note 0..127, velocity 0..127, on)`.
+type MidiNoteEvent = (u8, u8, bool);
+
+/// Enumerate the names of the connected MIDI **input** devices (for the picker). A fresh
+/// `MidiInput` per enumeration, since `connect` consumes one — cheap, and always current.
+fn midi_input_port_names() -> Vec<String> {
+    let Ok(inp) = midir::MidiInput::new("pixelview-midi-enum") else {
+        return Vec::new();
+    };
+    inp.ports()
+        .iter()
+        .map(|p| inp.port_name(p).unwrap_or_else(|_| "<unknown>".into()))
+        .collect()
+}
+
+/// Open the MIDI input port whose name is `name` and forward Note On/Off events over `tx`.
+/// The callback runs on midir's own reader thread — hence the channel bridge. Returns the
+/// live connection, which the caller MUST keep alive (dropping it closes the port).
+fn open_midi_port(
+    name: &str,
+    tx: std::sync::mpsc::Sender<MidiNoteEvent>,
+) -> Option<midir::MidiInputConnection<std::sync::mpsc::Sender<MidiNoteEvent>>> {
+    let mut inp = midir::MidiInput::new("pixelview-midi-in").ok()?;
+    inp.ignore(midir::Ignore::None);
+    let ports = inp.ports();
+    let port = ports
+        .into_iter()
+        .find(|p| inp.port_name(p).as_deref().ok() == Some(name))?;
+    let pname = inp.port_name(&port).unwrap_or_default();
+    inp.connect(
+        &port,
+        &pname,
+        move |_ts, msg, tx| {
+            if msg.len() < 3 {
+                return;
+            }
+            let (status, note, vel) = (msg[0] & 0xF0, msg[1], msg[2]);
+            match status {
+                0x90 if vel > 0 => {
+                    let _ = tx.send((note, vel, true)); // Note On
+                }
+                0x80 | 0x90 => {
+                    let _ = tx.send((note, vel, false)); // Note Off (or Note On vel 0)
+                }
+                _ => {}
+            }
+        },
+        tx,
+    )
+    .ok()
 }
 
 /// Render a tracker module (MOD/XM/S3M/IT) to interleaved-stereo f32 samples via `xmrs`, so
