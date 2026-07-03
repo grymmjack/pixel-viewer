@@ -286,21 +286,28 @@ impl Decoder for PdfDecoder {
     }
 }
 
-/// Render page 1 to a raster via `pdftoppm` (poppler), reading the PDF on stdin and the PNG
-/// on stdout — no temp file, no bundled lib. `None` if pdftoppm is absent or errors.
 fn render_first_page(bytes: &[u8]) -> Option<PixImage> {
+    render_page(bytes, 1, 1100)
+}
+
+/// Render one PDF page (1-based) to a raster via `pdftoppm` (poppler): PDF on stdin, PNG on
+/// stdout — no temp file, no bundled lib. `scale_to` sets the longest side in px. `None` if
+/// pdftoppm is absent or errors. Backs both the grid tile and the in-app multi-page viewer.
+pub fn render_page(bytes: &[u8], page: usize, scale_to: u32) -> Option<PixImage> {
     use std::io::Write;
     use std::process::{Command, Stdio};
+    let pg = page.max(1).to_string();
+    let sc = scale_to.max(64).to_string();
     let mut child = Command::new("pdftoppm")
         .args([
             "-png",
             "-f",
-            "1",
+            &pg,
             "-l",
-            "1",
+            &pg,
             "-singlefile",
             "-scale-to",
-            "1100",
+            &sc,
             "-",
         ])
         .stdin(Stdio::piped())

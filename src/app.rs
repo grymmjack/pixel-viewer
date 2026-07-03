@@ -789,10 +789,11 @@ pub struct PixelView {
     img_meta: HashMap<PathBuf, ImgMeta>,
     sauce_cache: HashMap<PathBuf, Option<crate::sauce::Sauce>>, // parsed SAUCE per path
     pdf_cache: HashMap<PathBuf, Option<crate::decode::PdfMeta>>, // lazy PDF metadata for Details
+    pdf_view: Option<PdfView>, // in-app multi-page PDF viewer state (None = not viewing a PDF)
     audio_cache: HashMap<PathBuf, Option<crate::decode::AudioInfo>>, // lazy audio metadata
     audio_player: Option<AudioPlayer>, // in-app play/pause/seek preview (rodio), None = idle
-    audio_autoplay: bool,              // start playing on select + loop until stopped (persisted)
-    audio_drag: Option<f32>,           // waveform drag-select anchor time (transient)
+    audio_autoplay: bool,      // start playing on select + loop until stopped (persisted)
+    audio_drag: Option<f32>,   // waveform drag-select anchor time (transient)
     palettes: HashMap<PathBuf, Option<Vec<[u8; 4]>>>, // details swatches; None = too many colors
     thumb_rgba: HashMap<PathBuf, (usize, usize, Vec<u8>)>, // thumb CPU pixels (for grid recolor)
     grid_recolor: HashMap<PathBuf, (String, egui::TextureHandle)>, // recolored grid tiles, per recolor key
@@ -1479,6 +1480,7 @@ impl PixelView {
             img_meta: HashMap::new(),
             sauce_cache: HashMap::new(),
             pdf_cache: HashMap::new(),
+            pdf_view: None,
             audio_cache: HashMap::new(),
             audio_player: None,
             audio_autoplay,
@@ -3135,6 +3137,7 @@ impl PixelView {
         }
         self.anim = None;
         self.player = None;
+        self.pdf_view = None;
         self.full_tex = None;
         self.full_src = None;
         self.full_reduced = None;
@@ -3153,6 +3156,24 @@ impl PixelView {
                 self.anim = Some(a);
                 return;
             }
+        }
+
+        // PDF → the in-app multi-page viewer. Render the current page now (at viewer res);
+        // page nav / spread mode re-render on demand. Left/Right step pages, not images.
+        if is_pdf_path(&path) {
+            let pages = std::fs::read(&src)
+                .ok()
+                .and_then(|b| crate::decode::pdf_meta(&b))
+                .map(|m| m.pages.max(1))
+                .unwrap_or(1);
+            self.pdf_view = Some(PdfView {
+                path: path.clone(),
+                pages,
+                page: 1,
+                two_page: false,
+            });
+            self.render_pdf_to_full(ctx);
+            return;
         }
 
         // Baud-rate playback for stream art (ANSImation / "watch RIP draw"). The static
@@ -3243,6 +3264,54 @@ impl PixelView {
                 self.minimap = None; // pixels changed → rebuild the minimap from them
             }
             Err(e) => self.status = format!("decode failed: {e}"),
+        }
+    }
+
+    /// Render the current PDF page (and the next one in two-page mode) via poppler and upload
+    /// it into `full_tex`, so the existing zoom/pan/fit viewer shows it. Fits to the window.
+    fn render_pdf_to_full(&mut self, ctx: &egui::Context) {
+        let Some(pv) = &self.pdf_view else { return };
+        let (path, page, two, pages) = (pv.path.clone(), pv.page, pv.two_page, pv.pages);
+        let Ok(bytes) = std::fs::read(self.resolve_local(&path)) else {
+            self.status = "Couldn't read the PDF".into();
+            return;
+        };
+        const VIEW_SCALE: u32 = 1600; // longest side px — crisper than the tile
+        let Some(left) = crate::decode::render_pdf_page(&bytes, page, VIEW_SCALE) else {
+            self.status = "PDF page render needs poppler (pdftoppm)".into();
+            return;
+        };
+        // Two-page spread: render the facing page and lay them side by side.
+        let img = if two && page < pages {
+            match crate::decode::render_pdf_page(&bytes, page + 1, VIEW_SCALE) {
+                Some(right) => compose_side_by_side(&left, &right),
+                None => left,
+            }
+        } else {
+            left
+        };
+        let size = [img.width as usize, img.height as usize];
+        let rgba = img.rgba_bytes();
+        let tex =
+            TiledTexture::from_rgba(ctx, &path.to_string_lossy(), size, &rgba, view_tex_opts());
+        self.full_src = Some((path.clone(), size, rgba));
+        self.full_tex = Some((path, tex));
+        self.full_reduced = None;
+        self.minimap = None;
+        self.offset = egui::Vec2::ZERO;
+        self.view_to_top = true;
+        self.fit_requested = true;
+    }
+
+    /// Step the open PDF's page by `delta` (clamped), honoring two-page stride, and re-render.
+    fn pdf_step_page(&mut self, ctx: &egui::Context, delta: isize) {
+        let Some(pv) = &mut self.pdf_view else { return };
+        let stride = if pv.two_page { 2 } else { 1 } as isize;
+        let last = pv.pages as isize;
+        let next = ((pv.page as isize - 1) + delta * stride).clamp(0, (last - 1).max(0)) + 1;
+        if next as usize != pv.page {
+            pv.page = next as usize;
+            self.render_pdf_to_full(ctx);
         }
     }
 
@@ -7187,11 +7256,21 @@ impl PixelView {
             }
         }
         if self.rebinding.is_none() && !interrupt {
+            // In the PDF viewer, Left/Right turn PAGES (stepping to another file mid-read is
+            // rarely what you want); everywhere else they step images.
             if prev {
-                self.step_image(ctx, false);
+                if self.pdf_view.is_some() {
+                    self.pdf_step_page(ctx, -1);
+                } else {
+                    self.step_image(ctx, false);
+                }
             }
             if next {
-                self.step_image(ctx, true);
+                if self.pdf_view.is_some() {
+                    self.pdf_step_page(ctx, 1);
+                } else {
+                    self.step_image(ctx, true);
+                }
             }
             if self.path_edit.is_none() {
                 if fit {
@@ -7301,6 +7380,51 @@ impl PixelView {
                 self.step_image(ctx, forward);
             }
             return;
+        }
+
+        // PDF viewer controls: page nav + single/two-page spread. Deferred so the closure
+        // needn't hold `&mut self.pdf_view` while it also re-renders.
+        if self.pdf_view.is_some() && !immersive {
+            let (page, pages, two) = {
+                let pv = self.pdf_view.as_ref().unwrap();
+                (pv.page, pv.pages, pv.two_page)
+            };
+            let mut pdf_prev = false;
+            let mut pdf_next = false;
+            let mut pdf_spread: Option<bool> = None;
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(page > 1, egui::Button::new("⬅ Prev"))
+                    .clicked()
+                {
+                    pdf_prev = true;
+                }
+                ui.label(format!("Page {page} / {pages}"));
+                if ui
+                    .add_enabled(page < pages, egui::Button::new("Next ➡"))
+                    .clicked()
+                {
+                    pdf_next = true;
+                }
+                ui.separator();
+                if ui.selectable_label(!two, "1 page").clicked() && two {
+                    pdf_spread = Some(false);
+                }
+                if ui.selectable_label(two, "2 page").clicked() && !two {
+                    pdf_spread = Some(true);
+                }
+                ui.weak("· ⬅/➡ turn pages · scroll/Ctrl+wheel to zoom");
+            });
+            if let Some(sp) = pdf_spread {
+                if let Some(pv) = &mut self.pdf_view {
+                    pv.two_page = sp;
+                }
+                self.render_pdf_to_full(ctx);
+            } else if pdf_prev {
+                self.pdf_step_page(ctx, -1);
+            } else if pdf_next {
+                self.pdf_step_page(ctx, 1);
+            }
         }
 
         // Baud-rate playback (ANSImation / "watch RIP draw"): a controls row + the
@@ -11977,6 +12101,15 @@ fn make_entry(path: PathBuf, is_dir: bool) -> Entry {
 /// Hover-tooltip contents for a grid tile.
 /// A deferred right-click-menu choice for a grid tile / table row — applied by the
 /// caller (which holds `&mut self`), so the menu closure needn't borrow `self`.
+/// In-app multi-page PDF viewer state: which PDF, how many pages, the current page (1-based),
+/// and single- vs two-page (spread) mode. Pages render on demand via poppler `pdftoppm`.
+struct PdfView {
+    path: PathBuf,
+    pages: usize,
+    page: usize,
+    two_page: bool,
+}
+
 /// The in-app audio preview player (rodio). Decodes the file to interleaved samples ONCE so
 /// it can freely (re)start, loop, play a drag-selected region, and draw a moving playhead —
 /// each play appends a fresh `SamplesBuffer` of the region to a new `Player` on the held
@@ -12091,6 +12224,40 @@ impl AudioPlayer {
             (self.region_start + elapsed).min(self.sel_end)
         }
     }
+}
+
+fn is_pdf_path(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+}
+
+/// Lay two rendered pages side by side (a small gutter between), each top-aligned on a white
+/// canvas sized to fit both — for the two-page PDF spread.
+fn compose_side_by_side(
+    a: &crate::image_types::PixImage,
+    b: &crate::image_types::PixImage,
+) -> crate::image_types::PixImage {
+    const GUT: usize = 12;
+    let (aw, ah) = (a.width as usize, a.height as usize);
+    let (bw, bh) = (b.width as usize, b.height as usize);
+    let w = aw + GUT + bw;
+    let h = ah.max(bh);
+    let mut px = vec![[255u8, 255, 255, 255]; w * h];
+    let blit = |px: &mut [[u8; 4]], src: &crate::image_types::PixImage, x0: usize| {
+        let (sw, sh) = (src.width as usize, src.height as usize);
+        for y in 0..sh {
+            for x in 0..sw {
+                let d = y * w + x0 + x;
+                if d < px.len() {
+                    px[d] = src.pixels[y * sw + x];
+                }
+            }
+        }
+    };
+    blit(&mut px, a, 0);
+    blit(&mut px, b, aw + GUT);
+    crate::image_types::PixImage::from_rgba(w as u32, h as u32, px)
 }
 
 /// A mono peak envelope (0..1), `buckets` wide, from interleaved samples — for drawing the

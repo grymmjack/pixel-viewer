@@ -42,8 +42,9 @@ pub use rip::RipStream;
 /// `app.rs`'s viewer predicates (`is_image_ext`) can share the one list, not duplicate it.
 pub use code::CODE_EXTS;
 
-/// PDF metadata (page count / size / title / author) for the Details pane.
-pub use pdf::{pdf_meta, PdfMeta};
+/// PDF metadata (page count / size / title / author) for the Details pane, and a
+/// single-page renderer for the in-app multi-page viewer.
+pub use pdf::{pdf_meta, render_page as render_pdf_page, PdfMeta};
 
 /// Audio metadata (duration / sample rate / channels / codec) + the extension list, for
 /// the Details pane and `is_image_ext`.
