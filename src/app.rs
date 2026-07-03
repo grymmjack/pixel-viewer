@@ -796,6 +796,7 @@ pub struct PixelView {
     dls_cache: HashMap<PathBuf, Option<crate::dls::DlsInfo>>, // lazy .dls directory info
     audio_player: Option<AudioPlayer>, // in-app play/pause/seek preview (rodio), None = idle
     audio_decode_cache: Vec<(PathBuf, u64, DecodedAudio)>, // LRU of decoded audio (key: path+sig)
+    audio_loading: Option<AudioLoading>, // a background audio decode in flight (spinner while pending)
     audio_autoplay: bool,      // start playing on select + loop until stopped (persisted)
     audio_drag: Option<f32>,   // waveform drag-select anchor time (transient)
     audio_octave: i32,         // onscreen-keyboard octave offset (transient)
@@ -1537,6 +1538,7 @@ impl PixelView {
             pdf_view: None,
             audio_cache: HashMap::new(),
             audio_decode_cache: Vec::new(),
+            audio_loading: None,
             sf_cache: HashMap::new(),
             sfz_cache: HashMap::new(),
             dls_cache: HashMap::new(),
@@ -2358,22 +2360,8 @@ impl PixelView {
                 return;
             }
         }
-        // Load a new file: decode (cached) + open the device.
-        let Some(decoded) = self.decode_audio_cached(path) else {
-            self.status = "Couldn't read/decode the audio file".into();
-            return;
-        };
-        match AudioPlayer::from_decoded(path, decoded) {
-            Ok(mut ap) => {
-                ap.volume = self.audio_volume;
-                ap.muted = self.audio_muted;
-                ap.looping = self.audio_autoplay; // autoplay = loop until stopped
-                ap.play_region();
-                self.audio_player = Some(ap);
-                self.status = format!("Playing {}", short_name(path));
-            }
-            Err(e) => self.status = format!("Audio: {e}"),
-        }
+        // A new file → (background) load, then play on ready.
+        self.start_audio_load(path, true);
     }
 
     /// Stop the preview player.
@@ -2439,21 +2427,6 @@ impl PixelView {
             .iter()
             .map(PathBuf::from)
             .find(|p| p.is_file())
-    }
-
-    /// The GM SoundFont **loaded** into memory, cached for the session — a system default can be
-    /// 100+ MB, so we parse it once (not per MIDI). `None` if none is available or it won't parse.
-    fn midi_soundfont_arc(&mut self) -> Option<std::sync::Arc<rustysynth::SoundFont>> {
-        let path = self.midi_soundfont()?;
-        if let Some((p, sf)) = &self.midi_sf_cache {
-            if *p == path {
-                return Some(sf.clone());
-            }
-        }
-        let mut f = std::fs::File::open(&path).ok()?;
-        let sf = std::sync::Arc::new(rustysynth::SoundFont::new(&mut f).ok()?);
-        self.midi_sf_cache = Some((path, sf.clone()));
-        Some(sf)
     }
 
     /// (Dis)connect the chosen MIDI input device. `None` closes any open port. Dropping the
@@ -2528,28 +2501,12 @@ impl PixelView {
         if self.is_audio_loaded(path) || !self.plugin_audio {
             return;
         }
-        let Some(decoded) = self.decode_audio_cached(path) else {
-            return;
-        };
-        if let Ok(mut ap) = AudioPlayer::from_decoded(path, decoded) {
-            ap.volume = self.audio_volume;
-            ap.muted = self.audio_muted;
-            ap.looping = self.audio_autoplay;
-            if self.audio_autoplay {
-                ap.play_region();
-            }
-            self.audio_player = Some(ap);
-        }
+        self.start_audio_load(path, false);
     }
 
-    /// Decode `path`'s audio, going through an in-memory LRU so a **revisit skips the expensive
-    /// decode** — a tracker module (seconds of `xmrs` synthesis) is cloned from the cache instead
-    /// of re-synthesized. Keyed by the display path + a size/mtime signature (so an edited file
-    /// re-decodes); the cache is bounded to ~192 MB, evicting least-recently-used. Returns the
-    /// decoded data (a clone; a copy also stays cached), or `None` if the file can't be decoded.
-    fn decode_audio_cached(&mut self, path: &Path) -> Option<DecodedAudio> {
-        let real = self.resolve_local(path);
-        let sig = std::fs::metadata(&real)
+    /// A cache signature for `real` (size ^ mtime) so an edited file re-decodes.
+    fn audio_sig(real: &Path) -> u64 {
+        std::fs::metadata(real)
             .ok()
             .map(|m| {
                 let mt = m
@@ -2560,47 +2517,187 @@ impl PixelView {
                     .unwrap_or(0);
                 m.len() ^ (mt << 1)
             })
-            .unwrap_or(0);
-        // Cache hit: move it to the front (most-recent) and hand back a clone.
-        if let Some(pos) = self
+            .unwrap_or(0)
+    }
+
+    /// Decode-cache lookup only (no decode). Moves a hit to the front (LRU) and clones it out.
+    fn decode_from_cache(&mut self, path: &Path, sig: u64) -> Option<DecodedAudio> {
+        let pos = self
             .audio_decode_cache
             .iter()
-            .position(|(p, s, _)| p == path && *s == sig)
-        {
-            let entry = self.audio_decode_cache.remove(pos);
-            let decoded = entry.2.clone();
-            self.audio_decode_cache.insert(0, entry);
-            return Some(decoded);
-        }
-        // Miss: read + decode (the costly step), cache it, and evict to the byte budget.
-        // MIDI files need a (cached) SoundFont to synthesize through — resolve it here.
-        let bytes = std::fs::read(&real).ok()?;
-        let midi_sf = if is_midi_ext(
-            &real
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_ascii_lowercase())
-                .unwrap_or_default(),
-        ) {
-            self.midi_soundfont_arc()
-        } else {
-            None
-        };
-        let decoded = match decode_audio(path, bytes, midi_sf) {
-            Ok(d) => d,
-            Err(e) => {
-                self.status = e;
-                return None;
-            }
-        };
+            .position(|(p, s, _)| p == path && *s == sig)?;
+        let entry = self.audio_decode_cache.remove(pos);
+        let decoded = entry.2.clone();
+        self.audio_decode_cache.insert(0, entry);
+        Some(decoded)
+    }
+
+    /// Insert a freshly-decoded buffer at the front and evict to the ~192 MB byte budget.
+    fn cache_decoded(&mut self, path: &Path, sig: u64, decoded: DecodedAudio) {
         self.audio_decode_cache
-            .insert(0, (path.to_path_buf(), sig, decoded.clone()));
+            .insert(0, (path.to_path_buf(), sig, decoded));
         let mut total = 0usize;
         self.audio_decode_cache.retain(|(_, _, d)| {
             total += d.approx_bytes();
             total <= 192 * 1024 * 1024
         });
-        Some(decoded)
+    }
+
+    /// Begin loading `path` for the player. A **cache hit builds instantly** (no thread, no
+    /// spinner — it's a memcpy). A **miss decodes on a background thread** — a tracker's `xmrs`
+    /// synthesis or a big MIDI SoundFont load runs off the UI thread, so the UI stays responsive
+    /// and `poll_audio_load` shows a spinner + builds the player when it's ready.
+    fn start_audio_load(&mut self, path: &Path, force_play: bool) {
+        if !self.plugin_audio {
+            return;
+        }
+        if self.audio_loading.as_ref().is_some_and(|l| l.path == path) {
+            return; // already loading this exact file
+        }
+        let real = self.resolve_local(path);
+        let sig = Self::audio_sig(&real);
+        if let Some(decoded) = self.decode_from_cache(path, sig) {
+            self.audio_loading = None;
+            self.build_audio_player(path, decoded, force_play);
+            return;
+        }
+        // Miss → decode on a worker. For MIDI, resolve the GM SoundFont (fast stat) up front and
+        // reuse the cached Arc if it matches; otherwise the (possibly big) SF loads on the worker.
+        let ext = real
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let (sf_arc, sf_path) = if is_midi_ext(&ext) {
+            let resolved = self.midi_soundfont();
+            let cached = match (&self.midi_sf_cache, &resolved) {
+                (Some((p, sf)), Some(r)) if p == r => Some(sf.clone()),
+                _ => None,
+            };
+            (cached, resolved)
+        } else {
+            (None, None)
+        };
+        let disp = path.to_path_buf();
+        let sf_path2 = sf_path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<AudioLoaded, String> {
+                let bytes = std::fs::read(&real).map_err(|e| e.to_string())?;
+                let sf = if is_midi_ext(&ext) {
+                    if let Some(sf) = sf_arc {
+                        Some(sf)
+                    } else {
+                        let p = sf_path2.as_ref().ok_or_else(|| {
+                            "no General MIDI SoundFont — set one in Preferences → MIDI SoundFont"
+                                .to_string()
+                        })?;
+                        let mut f =
+                            std::fs::File::open(p).map_err(|e| format!("SoundFont: {e}"))?;
+                        Some(std::sync::Arc::new(
+                            rustysynth::SoundFont::new(&mut f)
+                                .map_err(|e| format!("SoundFont: {e:?}"))?,
+                        ))
+                    }
+                } else {
+                    None
+                };
+                let decoded = decode_audio(&disp, bytes, sf.clone())?;
+                Ok(AudioLoaded { decoded, sf })
+            })();
+            let _ = tx.send(result);
+        });
+        self.audio_loading = Some(AudioLoading {
+            path: path.to_path_buf(),
+            force_play,
+            sf_path,
+            t: 0.0,
+            rx,
+        });
+    }
+
+    /// Drain a finished background audio decode: cache the result (+ the loaded SoundFont) and
+    /// build the player. Ticks the loading timer while pending so the spinner keeps animating.
+    fn poll_audio_load(&mut self, dt: f32) {
+        let Some(loading) = &mut self.audio_loading else {
+            return;
+        };
+        loading.t += dt;
+        match loading.rx.try_recv() {
+            Ok(Ok(loaded)) => {
+                let path = loading.path.clone();
+                let force_play = loading.force_play;
+                let sf_path = loading.sf_path.clone();
+                self.audio_loading = None;
+                if let (Some(p), Some(sf)) = (sf_path, &loaded.sf) {
+                    self.midi_sf_cache = Some((p, sf.clone())); // cache the loaded SoundFont
+                }
+                let real = self.resolve_local(&path);
+                let sig = Self::audio_sig(&real);
+                self.cache_decoded(&path, sig, loaded.decoded.clone());
+                self.build_audio_player(&path, loaded.decoded, force_play);
+                self.want_repaint = true;
+            }
+            Ok(Err(e)) => {
+                self.status = e;
+                self.audio_loading = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.want_repaint = true; // keep the spinner animating
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.audio_loading = None;
+            }
+        }
+    }
+
+    /// While a background audio decode is in flight, dim the viewport and show a centered
+    /// "Loading…" spinner — so a slow tracker synth / big MIDI SoundFont load reads as *working*,
+    /// not frozen. Delayed ~0.2s so quick loads don't flash a spinner.
+    fn paint_audio_loading_overlay(&self, ctx: &egui::Context) {
+        let Some(loading) = &self.audio_loading else {
+            return;
+        };
+        if loading.t < 0.2 {
+            return;
+        }
+        let screen = ctx.content_rect();
+        let bg = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("audio_loading_bg"),
+        ));
+        bg.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(96));
+        egui::Area::new(egui::Id::new("audio_loading_overlay"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(20.0));
+                        ui.add_space(8.0);
+                        ui.label(format!("Loading {}…", short_name(&loading.path)));
+                    });
+                });
+            });
+    }
+
+    /// Wrap decoded audio in a device-bound player and apply volume/mute/loop + optional autoplay.
+    fn build_audio_player(&mut self, path: &Path, decoded: DecodedAudio, force_play: bool) {
+        match AudioPlayer::from_decoded(path, decoded) {
+            Ok(mut ap) => {
+                ap.volume = self.audio_volume;
+                ap.muted = self.audio_muted;
+                ap.looping = self.audio_autoplay;
+                if force_play || self.audio_autoplay {
+                    ap.play_region();
+                }
+                self.audio_player = Some(ap);
+                if force_play {
+                    self.status = format!("Playing {}", short_name(path));
+                }
+            }
+            Err(e) => self.status = format!("Audio: {e}"),
+        }
     }
 
     /// Draw the audio player — transport + interactive waveform + onscreen keyboard — for
@@ -3890,10 +3987,14 @@ impl PixelView {
         // below so `full_tex` holds the waveform image for the Details thumbnail / minimap.
         if is_audio_ext(&path) {
             self.ensure_audio_loaded(&path);
-        } else if self.audio_player.is_some() {
-            // Left the audio file → tear the player down so it can't keep looping.
-            self.stop_audio();
-            self.audio_player = None;
+        } else {
+            // Left the audio file → tear the player down (so it can't keep looping) and cancel
+            // any in-flight background decode (its stale result is ignored on arrival).
+            if self.audio_player.is_some() {
+                self.stop_audio();
+                self.audio_player = None;
+            }
+            self.audio_loading = None;
         }
 
         // Baud-rate playback for stream art (ANSImation / "watch RIP draw"). The static
@@ -10408,6 +10509,7 @@ impl eframe::App for PixelView {
         self.poll_colo_save();
         self.poll_colo_sauce();
         self.poll_midi(); // hardware MIDI keys → play the loaded sample
+        self.poll_audio_load(ctx.input(|i| i.stable_dt)); // background audio decode → build player
         // Screensaver: once a (random) pack has finished downloading + mounting, open its
         // first art file. Both async ops idle ⇒ the listing has settled.
         if self.pending_autoplay && self.random_rx.is_none() && self.remote_rx.is_none() {
@@ -10795,6 +10897,8 @@ impl eframe::App for PixelView {
             Mode::Grid => self.ui_grid(&ctx, ui),
             Mode::Single => self.ui_single(&ctx, ui),
         });
+
+        self.paint_audio_loading_overlay(&ctx);
 
         if self.show_hotkeys {
             let mut open = true;
@@ -12949,6 +13053,23 @@ impl DecodedAudio {
                 .map(|s| s.buf.samples.len() + s.buf.peaks.len())
                 .sum::<usize>())
     }
+}
+
+/// A background audio decode in flight (tracker synthesis / a big MIDI SoundFont load — the
+/// heavy work runs off the UI thread so a "Loading…" spinner can animate). The worker sends the
+/// result over `rx`; `poll_audio_load` builds the player when it arrives.
+struct AudioLoading {
+    path: PathBuf,             // display path (the audio player identity) being loaded
+    force_play: bool,          // start playing on ready (Play/Space vs merely opening)
+    sf_path: Option<PathBuf>,  // GM SoundFont being loaded on the worker (to cache its Arc)
+    t: f32,                    // seconds spent loading (delays the spinner so fast loads don't flash)
+    rx: std::sync::mpsc::Receiver<Result<AudioLoaded, String>>,
+}
+
+/// A finished background decode: the audio + (for MIDI) the loaded SoundFont to cache.
+struct AudioLoaded {
+    decoded: DecodedAudio,
+    sf: Option<std::sync::Arc<rustysynth::SoundFont>>,
 }
 
 /// The in-app audio preview player (rodio). Decodes the file to interleaved samples ONCE so
