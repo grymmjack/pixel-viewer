@@ -7,6 +7,7 @@
 mod adf;
 mod ansi;
 mod aseprite;
+mod audio;
 mod bin;
 mod builtin;
 mod c64_font;
@@ -43,6 +44,10 @@ pub use code::CODE_EXTS;
 
 /// PDF metadata (page count / size / title / author) for the Details pane.
 pub use pdf::{pdf_meta, PdfMeta};
+
+/// Audio metadata (duration / sample rate / channels / codec) + the extension list, for
+/// the Details pane and `is_image_ext`.
+pub use audio::{audio_info, AudioInfo, AUDIO_EXTS};
 
 #[derive(Debug)]
 pub enum DecodeError {
@@ -96,7 +101,8 @@ impl Registry {
                 Box::new(rip::RipDecoder),         // .rip (RIPscript vector; icy_parser_core)
                 Box::new(bin::BinDecoder),         // .bin (raw char/attr pairs, SAUCE width)
                 Box::new(pdf::PdfDecoder),         // .pdf placeholder page tile + metadata (lopdf)
-                Box::new(code::CodeDecoder), // source code / text (CP437 + hand-rolled highlight)
+                Box::new(audio::SoundDecoder), // audio waveform / icon tile + metadata (symphonia)
+                Box::new(code::CodeDecoder),   // source code / text (CP437 + hand-rolled highlight)
                 Box::new(builtin::ImageCrateDecoder), // png/gif/bmp/jpeg/webp/tga/tiff/pnm/qoi
             ],
         }
@@ -133,6 +139,10 @@ impl Registry {
             // generic `decode(bytes)` call can't pass — route it here (still panic-guarded).
             if code::CODE_EXTS.contains(&ext.as_str()) {
                 return caught(|| code::CodeDecoder::decode_ext(bytes, &ext));
+            }
+            // Audio likewise needs the extension for symphonia's format hint.
+            if audio::AUDIO_EXTS.contains(&ext.as_str()) {
+                return caught(|| audio::SoundDecoder::decode_ext(bytes, &ext));
             }
             for d in &self.decoders {
                 if d.extensions().iter().any(|e| *e == ext) {

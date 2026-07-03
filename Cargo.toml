@@ -19,6 +19,11 @@ resvg = "0.47.0"
 # no system deps. We render a placeholder page tile + show info; real page rasterization
 # (pdfium) is a deferred, feature-gated fast-follow. default-features off keeps it lean.
 lopdf = { version = "0.43", default-features = false }
+# Audio DECODING + metadata only (pure Rust, no audio device — safe in headless CI). Used
+# to draw a waveform thumbnail + show duration/samplerate/channels/codec. In-app *playback*
+# (rodio → cpal → ALSA) is a deferred, default-off feature so `cargo test` stays device-free.
+# Defaults cover wav/flac/ogg/vorbis/pcm + id3; `mp3` is opt-in.
+symphonia = { version = "0.6", features = ["mp3"] }
 # Read-only extraction of legacy + modern archives (zip/lha/arj/arc/zoo/7z/rar/…),
 # so archives can be browsed as virtual folders. Mike Krüger's crate (icy ecosystem).
 unarc-rs = "0.6"

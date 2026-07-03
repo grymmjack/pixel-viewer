@@ -789,6 +789,7 @@ pub struct PixelView {
     img_meta: HashMap<PathBuf, ImgMeta>,
     sauce_cache: HashMap<PathBuf, Option<crate::sauce::Sauce>>, // parsed SAUCE per path
     pdf_cache: HashMap<PathBuf, Option<crate::decode::PdfMeta>>, // lazy PDF metadata for Details
+    audio_cache: HashMap<PathBuf, Option<crate::decode::AudioInfo>>, // lazy audio metadata
     palettes: HashMap<PathBuf, Option<Vec<[u8; 4]>>>, // details swatches; None = too many colors
     thumb_rgba: HashMap<PathBuf, (usize, usize, Vec<u8>)>, // thumb CPU pixels (for grid recolor)
     grid_recolor: HashMap<PathBuf, (String, egui::TextureHandle)>, // recolored grid tiles, per recolor key
@@ -1450,6 +1451,7 @@ impl PixelView {
             img_meta: HashMap::new(),
             sauce_cache: HashMap::new(),
             pdf_cache: HashMap::new(),
+            audio_cache: HashMap::new(),
             palettes: HashMap::new(),
             thumb_rgba: HashMap::new(),
             grid_recolor: HashMap::new(),
@@ -2170,6 +2172,24 @@ impl PixelView {
             self.pdf_cache.insert(path.to_path_buf(), meta);
         }
         self.pdf_cache.get(path).cloned().flatten()
+    }
+
+    /// Lazily parse + cache an audio file's metadata (duration / rate / channels / codec)
+    /// for the Details pane. `None` when symphonia can't parse it (trackers, voc/au, midi).
+    fn audio_info(&mut self, path: &Path) -> Option<crate::decode::AudioInfo> {
+        if !self.audio_cache.contains_key(path) {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .unwrap_or_default();
+            let real = self.resolve_local(path);
+            let info = std::fs::read(&real)
+                .ok()
+                .and_then(|b| crate::decode::audio_info(&b, &ext));
+            self.audio_cache.insert(path.to_path_buf(), info);
+        }
+        self.audio_cache.get(path).cloned().flatten()
     }
 
     /// Open a file in the OS default application (xdg-open / open / explorer). Used by the
@@ -4205,6 +4225,18 @@ impl PixelView {
                     } else {
                         None
                     };
+                    // Audio: duration / sample rate / channels / codec (cached).
+                    let is_audio = entry
+                        .path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_ascii_lowercase())
+                        .is_some_and(|e| crate::decode::AUDIO_EXTS.contains(&e.as_str()));
+                    let audio = if is_audio {
+                        self.audio_info(&entry.path)
+                    } else {
+                        None
+                    };
                     // Plain thumbnail (the recolored preview lives in the Recolor pane).
                     if let Some(tex) = self.thumb_tex.get(&entry.path) {
                         let tsz = tex.size_vec2();
@@ -4274,6 +4306,36 @@ impl PixelView {
                                     ui.label(p.author.trim());
                                     ui.end_row();
                                 }
+                            } else if let Some(a) = &audio {
+                                // Audio metadata instead of the waveform tile's raster dims.
+                                if a.duration_secs > 0.0 {
+                                    ui.weak("Duration");
+                                    let s = a.duration_secs.round() as u64;
+                                    ui.label(format!("{}:{:02}", s / 60, s % 60));
+                                    ui.end_row();
+                                }
+                                if a.sample_rate > 0 {
+                                    ui.weak("Sample rate");
+                                    ui.label(format!("{} Hz", a.sample_rate));
+                                    ui.end_row();
+                                }
+                                if a.channels > 0 {
+                                    ui.weak("Channels");
+                                    ui.label(match a.channels {
+                                        1 => "mono".to_string(),
+                                        2 => "stereo".to_string(),
+                                        n => format!("{n}"),
+                                    });
+                                    ui.end_row();
+                                }
+                                ui.weak("Codec");
+                                ui.label(&a.codec);
+                                ui.end_row();
+                            } else if is_audio {
+                                // A tracker/voc/au/midi we can't decode — still label it audio.
+                                ui.weak("Type");
+                                ui.label("audio");
+                                ui.end_row();
                             } else if let Some(m) = meta {
                                 ui.weak("Dimensions");
                                 ui.label(format!("{} × {}", m.w, m.h));
@@ -4329,11 +4391,13 @@ impl PixelView {
                         {
                             want_pack = mount_pack.clone();
                         }
-                        // Documents (PDF): open in the OS default viewer/editor.
-                        if is_pdf
+                        // Documents / audio: open in the OS default viewer/editor/player.
+                        if (is_pdf || is_audio)
                             && ui
                                 .button("➡ Open in default app")
-                                .on_hover_text("Open this PDF in your OS default viewer/editor")
+                                .on_hover_text(
+                                    "Open this file in your OS default viewer/editor/player",
+                                )
                                 .clicked()
                         {
                             want_open_default = true;
@@ -11685,6 +11749,12 @@ fn opener_presets() -> Vec<Opener> {
             "xdg-open",
             "txt md log rs c cpp h py js ts json toml yaml",
         ),
+        mk("Audio player", "xdg-open", "mp3 wav ogg flac m4a opus aac"),
+        mk(
+            "Tracker (OpenMPT)",
+            "openmpt",
+            "xm it s3m mod rad mtm 669 far okt stm",
+        ),
     ]
 }
 
@@ -12572,8 +12642,10 @@ fn is_image_ext(p: &std::path::Path) -> bool {
     match p.extension().and_then(|x| x.to_str()) {
         Some(x) => {
             let x = x.to_ascii_lowercase();
-            // Raster/scene formats above, plus every source-code/text type (shared list).
-            EXTS.contains(&x.as_str()) || crate::decode::CODE_EXTS.contains(&x.as_str())
+            // Raster/scene formats above, plus every source-code/text + audio type (shared).
+            EXTS.contains(&x.as_str())
+                || crate::decode::CODE_EXTS.contains(&x.as_str())
+                || crate::decode::AUDIO_EXTS.contains(&x.as_str())
         }
         // Extensionless scene/BBS art (rendered as CP437 text). Dirs are filtered
         // out by an `is_dir()` check at every call site before reaching here.
