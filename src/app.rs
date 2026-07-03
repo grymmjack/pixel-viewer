@@ -7302,8 +7302,22 @@ impl PixelView {
         // Slideshow: auto-advance to the next file after it has "settled" (a baud
         // transmission, if any, finished typing) plus the chosen delay — great for
         // flipping through a whole pack hands-free.
+        // Slideshow is for things you *look* at — images, text-mode art, RIP. Don't
+        // auto-advance off a document you're reading/listening to: a PDF, an audio file, or a
+        // source/text file (you'd lose your place / cut off the track).
+        let cur_ext = self
+            .entries
+            .get(self.selected)
+            .and_then(|e| e.path.extension())
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let holds_document = self.pdf_view.is_some()
+            || crate::decode::AUDIO_EXTS.contains(&cur_ext.as_str())
+            || crate::decode::CODE_EXTS.contains(&cur_ext.as_str());
         if self.auto_next
             && !self.auto_paused
+            && !holds_document
             && self.path_edit.is_none()
             && self.rebinding.is_none()
         {
