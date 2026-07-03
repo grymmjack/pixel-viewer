@@ -28,11 +28,17 @@ embedded CP437 VGA font), and the binary scene formats **XBin** (`.xb`/`.xbin`),
 (`.rip` — EGA vector BBS graphics), both via Mike Krüger's `icy_parser_core` — all with
 SAUCE-driven hints, shown in the Details pane. Also **source code + text** (~90 exts: rs,
 c/cpp/h, py, js/ts, css, html, php, lua, asm, gd, json, yaml, md, log, … — rasterized with
-the CP437 font + a lean hand-rolled syntax highlighter, `decode/code.rs`), **PDF** (a
-placeholder page tile + page-count/size/title/author metadata via `lopdf`, `decode/pdf.rs`;
-real page rendering is deferred), and **audio** (`decode/audio.rs`: a real waveform tile for
-mp3/wav/ogg/flac via `symphonia`, else a music-note icon for trackers/voc/au/midi; duration/
-rate/channels/codec in Details). PDF + audio double as "open in your external editor/player".
+the CP437 font + a lean hand-rolled syntax highlighter, `decode/code.rs`), **PDF**
+(`decode/pdf.rs`: the tile is the **real first page** rendered via poppler's `pdftoppm` —
+PDF on stdin, PNG on stdout — falling back to a labeled placeholder if poppler is absent;
+page-count/size/title/author metadata via pure-Rust `lopdf`), and **audio**
+(`decode/audio.rs`: a real waveform tile for mp3/wav/ogg/flac via `symphonia`, else a
+music-note icon for trackers/voc/au/midi; duration/rate/channels/codec in Details, plus an
+**in-app play/pause/seek preview** via `rodio`). These three are **toggleable plugins**
+(Preferences → "Format plugins" checkboxes; a runtime atomic flag on the `Registry` — off
+drops the type from the listing + skips decoding). **Any** file also gets "Open in default
+app" (xdg-open/open/explorer) in the right-click "Open in…" menu, the Details pane, and via
+**Enter** in the viewer — so a source file drops into its associated editor.
 **Animated GIFs** play (autoplay + seek in the viewer,
 hover-to-play in the grid). Archives (`.zip`/`.lha`/`.arj`/…) and **16colo.rs** (the
 online ANSI archive: a Places entry with a nav bar — Years / Latest / Groups / Artists
@@ -89,14 +95,17 @@ src/
                      line-number gutter, tab expand, UTF-8→CP437, line+cell budget). `CODE_EXTS`
                      re-exported; registry routes code exts to `decode_ext(bytes, ext)`. ipynb
                      flattens to highlighted Python. Zero heavy deps (no syntect).
-    pdf.rs           .pdf — placeholder page tile (red PDF badge + page count) + metadata
-                     (page count / MediaBox size / /Info title+author) via `lopdf` (pure Rust).
-                     `pdf_meta`/`PdfMeta` feed the Details pane; real page raster is deferred.
+    pdf.rs           .pdf — the tile is the REAL first page via `render_first_page` (poppler
+                     `pdftoppm`: PDF→stdin, PNG→stdout, decoded by the image crate; stdin fed
+                     from a thread to avoid pipe deadlock), else a labeled placeholder. Metadata
+                     (page count / MediaBox size / /Info title+author) via `lopdf`; `pdf_meta`/
+                     `PdfMeta` feed the Details pane.
     audio.rs         audio → waveform tile (mp3/wav/ogg/flac via `symphonia`: decode → peak
                      envelope → resample → mirror) else a music-note icon (trackers/voc/au/midi).
-                     `audio_info`/`AudioInfo` (duration/rate/channels/codec) feed Details.
-                     Device-free (no playback) so `cargo test` stays headless; `AUDIO_EXTS`
+                     `audio_info`/`AudioInfo` (duration/rate/channels/codec) feed Details; the
+                     DECODE path is device-free so `cargo test` stays headless. `AUDIO_EXTS`
                      re-exported; registry routes audio exts to `decode_ext` (needs the ext hint).
+                     In-app PLAYBACK is separate (`AudioPlayer` in app.rs, rodio) — see below.
     tundra.rs        .tnd — TundraDraw 24-bit truecolor command stream
     idf.rs           .idf — iCE Draw: bounds + RLE + end-of-file font/palette
     adf.rs           .adf — Artworx: version + 64-color palette + font + pairs
@@ -142,7 +151,7 @@ cargo test gui_tests     # just the egui_kittest UI tests; cargo test <name> for
 
 First-time eframe/winit system deps on Debian/KDE:
 ```sh
-sudo apt-get install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+sudo apt-get install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libasound2-dev
 ```
 
 ## Architecture: the big picture
@@ -732,12 +741,15 @@ extension loop, calling `CodeDecoder::decode_ext(bytes, ext)` / `SoundDecoder::d
 inside `caught(||…)` (the same panic guard as `decode_caught`). Both always return *some* image
 (highlighted text / plain / waveform / icon), never an error, so a weird file still shows a tile.
 
-**Deferred, feature-gated fast-follows** (planned, not built): real PDF page rasterization +
-an in-app 1/2-page viewer via `pdfium-render` behind a `pdf-render` feature (ships a pdfium
-sidecar, runtime-bound — no build-time system dep); in-app audio **playback** (play/pause/seek)
-via `rodio` behind an `audio-playback` feature, and tracker playback via `xmrs` (pure Rust).
-Both playback features MUST stay default-OFF: `rodio → cpal → alsa-sys` needs `libasound2-dev`
-+ an output device, which would break the headless `cargo test` / CI.
+**Audio playback + PDF render — shipped (not feature-gated).** Real PDF page rasterization is
+done at decode time by shelling out to poppler's `pdftoppm` (no bundled lib; placeholder
+fallback if absent). In-app audio **playback** (play/pause/seek) is `rodio` (`AudioPlayer` in
+app.rs): the default output device is opened **lazily + fallibly on first Play** — a headless
+box reports "no audio output" in the status bar and `cargo test` never touches a device — so
+`rodio` is a normal (non-feature-gated) dep. `rodio → cpal → alsa-sys` does need
+**`libasound2-dev` at BUILD time** on Linux (added to CI + the first-time-deps list above).
+Still deferred: an in-app multi-page PDF *viewer* (1/2-page mode) and in-app **tracker**
+playback (xmrs / libopenmpt) — trackers/voc/au/midi keep their icon tile + external open.
 
 **The icy ecosystem (Mike Krüger's scene-art formats), the lean way.** Mike's
 `icy_engine` *renders* but hard-depends on `icy_net` → **tokio "full"** — too heavy for
