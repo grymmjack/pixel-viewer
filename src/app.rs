@@ -1230,6 +1230,11 @@ impl PixelView {
     const COLO_ORDER_KEY: &'static str = "colo_order";
 
     pub fn new(cc: &eframe::CreationContext<'_>, cli: CliArgs) -> Self {
+        // Register a broad-coverage fallback font so UI glyphs stop rendering as tofu (□). egui's
+        // bundled fonts cover Latin + a small emoji subset but omit whole Unicode blocks (Arrows,
+        // Geometric Shapes, …); DejaVu fills the gaps as a last-resort fallback. See the
+        // "Font glyph gotcha" note in CLAUDE.md.
+        install_fallback_font(&cc.egui_ctx);
         let registry = Arc::new(Registry::with_builtins());
         // Optional format plugins (persisted, default on) → apply to the registry so a
         // disabled one drops its file types from the listing + skips decoding.
@@ -13370,6 +13375,31 @@ fn blend_toward(base: egui::Color32, accent: [u8; 3], t: f32) -> egui::Color32 {
         mix(base.g(), accent[1]),
         mix(base.b(), accent[2]),
     )
+}
+
+/// Install DejaVu Sans as a **last-resort fallback** in egui's proportional + monospace font
+/// families. egui's bundled fonts (Ubuntu-Light + a small NotoEmoji subset) omit whole Unicode
+/// blocks — Arrows (↑↓), Geometric Shapes (▲▼●), etc. — which then render as tofu (□). Appended
+/// *last*, DejaVu is only consulted for glyphs the earlier fonts lack, so existing text/emoji are
+/// untouched; it just fills the gaps. DejaVu is embedded (like the palettes) so it works on any
+/// platform with no system font dependency. (DejaVu Fonts License — a permissive Bitstream-Vera
+/// derivative; redistribution/embedding allowed.)
+fn install_fallback_font(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "DejaVuSans".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/DejaVuSans.ttf"
+        ))),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("DejaVuSans".to_owned());
+    }
+    ctx.set_fonts(fonts);
 }
 
 /// A `min_size` that fits the **widest** of `labels` at the current button style, so a button
