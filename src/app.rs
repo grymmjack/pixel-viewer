@@ -3723,7 +3723,7 @@ impl PixelView {
         if let Some(port) = want_midi {
             self.connect_midi(port);
         }
-        if self.audio_player.as_ref().is_some_and(|ap| ap.is_playing()) {
+        if self.audio_player.as_ref().is_some_and(|ap| ap.has_active_audio()) {
             self.want_repaint = true;
         }
     }
@@ -11605,9 +11605,9 @@ impl PixelView {
                     // While something is playing, show a live VU meter + a clickable "PLAYING …"
                     // pill (left of the controls) — you can start audio then leave the viewer, so
                     // this both signals activity and jumps you back to the player.
-                    if let Some(ap) = self.audio_player.as_ref().filter(|a| a.is_playing()) {
+                    if let Some(ap) = self.audio_player.as_ref().filter(|a| a.has_active_audio()) {
                         let name = short_name(&ap.path);
-                        let level = ap.current_level();
+                        let level = ap.master_level();
                         ui.add_space(4.0);
                         let (vrect, _) =
                             ui.allocate_exact_size(egui::vec2(46.0, 12.0), egui::Sense::hover());
@@ -15276,6 +15276,16 @@ impl AudioPlayer {
         self.started && !self.player.is_paused() && !self.player.empty()
     }
 
+    /// Any audio flowing — the main player OR a live sample-pad voice (so the menu-bar "PLAYING"
+    /// pill + VU show while you're just hitting pads, not only when the song/sample plays).
+    fn has_active_audio(&self) -> bool {
+        self.is_playing()
+            || self
+                .pad_voices
+                .iter()
+                .any(|v| !v.player.empty() && !v.player.is_paused())
+    }
+
     /// Peak output level (0..1) in a ~20 ms window around the current playhead — drives the
     /// menu-bar VU meter so the user can see that audio is actually flowing. 0 when not playing.
     fn current_level(&self) -> f32 {
@@ -15292,6 +15302,14 @@ impl AudioPlayer {
         self.samples[s..e]
             .iter()
             .fold(0f32, |m, &x| m.max(x.abs()))
+            .min(1.0)
+    }
+
+    /// Master VU level (0..1): the main player folded with the loudest live pad voice, so the
+    /// menu-bar meter reacts to pad hits too — `current_level` alone only sees `self.player`.
+    fn master_level(&self) -> f32 {
+        self.current_level()
+            .max(self.pad_levels().iter().copied().fold(0.0, f32::max))
             .min(1.0)
     }
 
