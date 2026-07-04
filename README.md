@@ -146,6 +146,7 @@ down to the extensions a decoder claims.
 | **MIDI** | `mid` `midi` `kar` `rmi` | Synthesized through a General MIDI **SoundFont** (rustysynth) |
 | **AdLib / OPL** | **RAD** (`.rad`) | **OPL3 FM synthesis** — built-in OPL3 emulator + RAD replayer |
 | **Trackers** | `mod` `xm` `s3m` `it` | Full-song playback (xmrs) + per-sample explorer/export |
+| **Trackers (more)** | `669` `far` `okt` `med` `amf` `ult` `mtm` `stm` | Played via bundled **libxmp** (compiled from source) |
 
 ### 🎹 Instruments & sample banks *(plugin)*
 
@@ -197,6 +198,10 @@ sudo apt-get install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
 cpal → ALSA). The audio device itself is opened lazily and fallibly, so a headless box still
 builds and runs fine. For **PDF rendering**, install **poppler** (`poppler-utils` — provides
 `pdftoppm`) at runtime; without it, PDFs still show metadata and a labeled placeholder tile.
+
+The build also **compiles the bundled [libxmp](https://github.com/libxmp/libxmp)** (MIT, vendored
+under `vendor/libxmp`) from source for the extra tracker formats — this needs only a **C compiler**
+(the one you already have for the ALSA/SQLite deps); there's no `libxmp` package to install.
 
 eframe uses the **wgpu** backend by default — that's what gives the pixel-perfect
 nearest-neighbor textures, and it runs fine on KDE Plasma 6 / Wayland.

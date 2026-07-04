@@ -84,6 +84,10 @@ src/
   xi.rs              .xi (FastTracker II instrument) as a virtual folder: xmrs parse →
                      each sample extracted to a WAV; name/sample count
                      (.xrns/.xrni are ZIPs → handled by archive.rs's force-zip path)
+  libxmp.rs          FFI to bundled libxmp (vendor/libxmp, built by build.rs) — plays the
+                     tracker formats xmrs doesn't (669/far/okt/med/amf/ult/mtm/stm)
+build.rs             compiles vendor/libxmp (C) into a static lib via the cc crate
+vendor/libxmp/       vendored libxmp 4.6.3 source (MIT) — src/ + include/ + libxmp-sources.cmake
   decode/
     opl3.rs          OPL3 FM-synth chip emulator (public-domain "Opal" port) — for .rad
     rad.rs           Reality Adlib Tracker replayer (public-domain RADPlayer port) — .rad
@@ -780,6 +784,16 @@ inside `caught(||…)` (the same panic guard as `decode_caught`). Both always re
   (pure Rust — parses + synthesizes to interleaved-stereo i16 → f32) into the same sample
   buffer, so loop/region/playhead/waveform all work for modules too. voc/au (no in-app
   decoder) keep the icon tile + external open.
+- **More trackers** (669/FAR/OKT/MED/AMF/ULT/MTM/STM): no pure-Rust player exists, so **libxmp**
+  (MIT, vendored under `vendor/libxmp`) is **compiled from source** by `build.rs` (a `cc` build —
+  no cmake/autotools/system dep; it's self-contained + only links libm). `build.rs` compiles
+  exactly the files in libxmp's own `cmake/libxmp-sources.cmake` full list (a plain `src/**.c` glob
+  pulls in two disabled/leftover ProWizard files that don't compile). `libxmp.rs` is a tiny FFI:
+  `xmp_load_module_from_memory` → render to interleaved `f32`, run off the decode worker thread
+  (own context per render). It renders **exactly the song length** from `xmp_get_frame_info`'s
+  `total_time` with `xmp_play_buffer(loop=1)` — many modules loop forever, and 10 min of stereo
+  f32 is 211 MB, so a blind cap would over-render. `is_tracker_ext` is now just MOD/XM/S3M/IT
+  (which also get the sample explorer); `is_libxmp_ext` handles the rest.
 - **MIDI** (`.mid`/`.midi`/`.kar`/`.rmi`): a MIDI file is only note events, so `render_midi`
   synthesizes it to PCM through a **General MIDI SoundFont** via `rustysynth`
   (`MidiFileSequencer::render`) — then it feeds the same player path as any audio. The SoundFont is
