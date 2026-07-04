@@ -6882,6 +6882,12 @@ impl PixelView {
                                     ),
                                     egui::Color32::WHITE,
                                 );
+                            } else if self.colo_pieces.contains_key(path) && is_audio_ext(path) {
+                                // A 16colo audio piece has no server-side render PNG, so paint a
+                                // music-note tile rather than spin forever waiting for one.
+                                let ext =
+                                    path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                                paint_audio_tile(&ui.painter_at(rect), rect, ext);
                             } else {
                                 // 16colo piece → fetch its pre-rendered PNG over HTTP;
                                 // any other file → decode locally.
@@ -7563,7 +7569,10 @@ impl PixelView {
                 // Request the thumbnail once: a remote piece via the HTTP pool (its `tn`
                 // PNG), any other file via the local decoder; both land in `thumb_tex`.
                 let tex = self.thumb_tex.get(&path).cloned();
-                if tex.is_none() && !entry.is_dir {
+                // A 16colo audio piece has no server-side render → don't request one (it would
+                // spin forever); it's painted as a music-note tile below.
+                let colo_audio = piece.is_some() && is_audio_ext(&path);
+                if tex.is_none() && !entry.is_dir && !colo_audio {
                     if let Some(p) = &piece {
                         self.colo_thumbs.request(&path, &p.tn_url, THUMB_PX);
                     } else {
@@ -7672,6 +7681,11 @@ impl PixelView {
                                     ),
                                     egui::Color32::WHITE,
                                 );
+                            } else if colo_audio {
+                                // A 16colo audio piece: a music-note cell, not an endless spinner.
+                                let ext =
+                                    entry.path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                                paint_audio_tile(&ui.painter_at(rect), rect, ext);
                             } else if !entry.is_dir {
                                 // Spinner while the row's thumbnail loads (the request was
                                 // already issued above when tex was None).
@@ -11513,6 +11527,30 @@ fn short_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// Paint a placeholder "audio" tile — a music-note glyph (+ a format badge on larger tiles) —
+/// for a 16colo piece that has no server-side render, so it shows a tile, not an endless spinner.
+fn paint_audio_tile(painter: &egui::Painter, rect: egui::Rect, ext: &str) {
+    painter.text(
+        rect.center() - egui::vec2(0.0, rect.height() * 0.04),
+        egui::Align2::CENTER_CENTER,
+        "🎵",
+        egui::FontId::proportional((rect.height() * 0.42).clamp(14.0, 72.0)),
+        egui::Color32::from_rgb(120, 200, 235),
+    );
+    if rect.width() > 90.0 && !ext.is_empty() {
+        let up = ext.to_ascii_uppercase();
+        let pos = rect.left_top() + egui::vec2(5.0, 4.0);
+        let galley =
+            painter.layout_no_wrap(up, egui::FontId::proportional(11.0), egui::Color32::WHITE);
+        painter.rect_filled(
+            egui::Rect::from_min_size(pos, galley.size()).expand(2.0),
+            3.0,
+            egui::Color32::from_rgba_unmultiplied(30, 60, 80, 210),
+        );
+        painter.galley(pos, galley, egui::Color32::WHITE);
+    }
 }
 
 /// Paint a small segmented VU meter into `rect`, `level` in 0..1 (green → yellow → red segments).
