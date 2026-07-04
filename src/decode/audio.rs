@@ -250,39 +250,56 @@ fn render_waveform(cols: &[f32], ext: &str, info: &Option<AudioInfo>) -> PixImag
     PixImage::from_rgba(w as u32, h as u32, px)
 }
 
-/// A music-note icon tile for formats we can't decode (trackers, voc/au, midi).
+/// A music-note icon tile for formats we can't decode (trackers, voc/au, midi). A clean ♫ drawn
+/// from filled ellipse note-heads + stems + a beam — nicer than the old blocky CP437 glyph, and it
+/// stays legible when the tile is downscaled (the thumbnailer area-averages). The format label sits
+/// directly under the note (the old "audio - open in your player" line was removed — it overlapped
+/// the label).
 fn render_icon(ext: &str) -> PixImage {
     let (w, h) = (320usize, 240usize);
     let mut px = vec![BG; w * h];
-    let (note, _) = accent(ext); // colored by file format
-    // Big ♫ (CP437 0x0E) centered.
-    let scale = 10usize;
-    let gx = (w - 8 * scale) / 2;
-    let gy = 40;
-    blit_glyph(&mut px, w, gx, gy, 0x0E, note, scale);
-    // Format band.
+    let (note, dim) = accent(ext); // colored by file format
+    // Two beamed note-heads (symmetric ♫). A one-row `dim` under-edge gives the heads a little
+    // roundness/depth against the dark background.
+    fill_ellipse(&mut px, w, 116, 151, 34, 23, dim);
+    fill_ellipse(&mut px, w, 204, 151, 34, 23, dim);
+    fill_ellipse(&mut px, w, 116, 149, 34, 23, note);
+    fill_ellipse(&mut px, w, 204, 149, 34, 23, note);
+    // Stems up from each head's right edge, joined by a beam across their tops.
+    fill_rect(&mut px, w, 143, 58, 154, 150, note);
+    fill_rect(&mut px, w, 231, 58, 242, 150, note);
+    fill_rect(&mut px, w, 143, 46, 242, 66, note);
+    // Format label, centered directly under the note (the only text — legible when downscaled).
     let label = ext.to_ascii_uppercase();
     let tscale = 3usize;
     let tw = label.len() * 8 * tscale;
-    blit_text(
-        &mut px,
-        w,
-        (w.saturating_sub(tw)) / 2,
-        gy + 16 * scale + 16,
-        &label,
-        note,
-        tscale,
-    );
-    blit_text(
-        &mut px,
-        w,
-        6,
-        h - 20,
-        "audio - open in your player",
-        LABEL,
-        1,
-    );
+    blit_text(&mut px, w, (w.saturating_sub(tw)) / 2, 184, &label, note, tscale);
     PixImage::from_rgba(w as u32, h as u32, px)
+}
+
+/// Fill an axis-aligned rectangle `[x0,x1) × [y0,y1)` (signed coords; off-canvas pixels clipped).
+fn fill_rect(px: &mut [[u8; 4]], w: usize, x0: i32, y0: i32, x1: i32, y1: i32, c: [u8; 4]) {
+    for y in y0.max(0)..y1.max(0) {
+        for x in x0.max(0)..x1.max(0) {
+            set(px, w, x as usize, y as usize, c);
+        }
+    }
+}
+
+/// Fill an axis-aligned ellipse centered at `(cx,cy)` with radii `(rx,ry)`.
+fn fill_ellipse(px: &mut [[u8; 4]], w: usize, cx: i32, cy: i32, rx: i32, ry: i32, c: [u8; 4]) {
+    for y in (cy - ry)..=(cy + ry) {
+        for x in (cx - rx)..=(cx + rx) {
+            if x < 0 || y < 0 || rx == 0 || ry == 0 {
+                continue;
+            }
+            let dx = (x - cx) as f32 / rx as f32;
+            let dy = (y - cy) as f32 / ry as f32;
+            if dx * dx + dy * dy <= 1.0 {
+                set(px, w, x as usize, y as usize, c);
+            }
+        }
+    }
 }
 
 fn set(px: &mut [[u8; 4]], w: usize, x: usize, y: usize, c: [u8; 4]) {
