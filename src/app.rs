@@ -3478,14 +3478,22 @@ impl PixelView {
                 ui.strong(format!("Editing pad {}", i + 1));
                 ui.separator();
             }
+            // Pin the transport glyph buttons to a fixed size: the ⏸/▶ glyphs have different
+            // advance widths, so a bare button resizes on play/pause and shoves the row sideways
+            // ("jiggle"). A shared min_size makes both states occupy the same width.
+            let tbtn = egui::vec2(30.0, ui.spacing().interact_size.y);
             if ui
-                .button(if playing { "⏸" } else { "▶" })
+                .add(egui::Button::new(if playing { "⏸" } else { "▶" }).min_size(tbtn))
                 .on_hover_text("Play / pause (Space)")
                 .clicked()
             {
                 want_toggle = true;
             }
-            if ui.button("⏹").on_hover_text("Stop").clicked() {
+            if ui
+                .add(egui::Button::new("⏹").min_size(tbtn))
+                .on_hover_text("Stop")
+                .clicked()
+            {
                 want_stop = true;
             }
             if ui
