@@ -100,23 +100,66 @@ Files are recognized by **content (magic bytes) first, then extension** — so a
 mislabeled file still opens if its header is known. A folder listing is filtered
 down to the extensions a decoder claims.
 
+### 🖼 Images
+
 | Category | Formats | Notes |
 |---|---|---|
-| **Raster (image crate)** | PNG, GIF, BMP, JPEG, WebP, TGA, TIFF, PNM/PBM/PGM/PPM, QOI, **ICO** | |
+| **Raster** | PNG, GIF, BMP, JPEG, WebP, TGA, TIFF, PNM/PBM/PGM/PPM, QOI, **ICO** | Via the `image` crate |
 | **Palette-preserving** | **PCX** | Original indices + palette kept, not flattened |
-| **Editor formats** | **Aseprite** (`.aseprite` / `.ase`), **Photoshop PSD**, **GIMP XCF** | Composited / flattened to frame 0 |
-| **Vector** | **SVG** | Rasterized via resvg |
-| **Misc** | **.draw** | PNG preview |
-| **ANSI / ASCII art** | `.ans` `.asc` `.nfo` `.diz` `.ice` `.cia` | CP437 + ANSI SGR/cursor, iCE colors, SAUCE-driven cell size |
-| **Binary scene art** | **XBin** (`.xb` / `.xbin`), **raw BIN** (`.bin`), **TundraDraw** (`.tnd`, 24-bit), **iCE Draw** (`.idf`), **Artworx** (`.adf`) | |
-| **Commodore** | **PETSCII** (`.seq` / `.pet`), **petmate** (`.petmate`) | Authentic C64 font + VIC-II palette |
-| **BBS vector** | **RIPscript** (`.rip`) | 640×350 EGA, hand-rolled BGI rasterizer |
+| **Layered / editor** | **Aseprite** (`.aseprite` / `.ase`), **Photoshop PSD**, **GIMP XCF** | Composited / flattened |
 | **Animation** | Animated **GIF** | Plays in the viewer; hover-to-play in the grid |
-| **Archives (virtual folders)** | `.zip` `.lha` `.arj` `.arc` `.zoo` `.7z` `.rar` … | Browsed read-only; contents extracted on demand |
-| **Source code / text** *(plugin)* | ~90 exts — `rs` `c/cpp/h` `py` `js/ts` `css` `html` `php` `lua` `asm` `gd` `json` `yaml` `md` `log` `ipynb` … | CP437-rasterized with a hand-rolled syntax highlighter |
-| **PDF** *(plugin)* | `.pdf` | Real first-page tile + in-app 1-/2-page viewer (needs poppler) |
-| **Audio** *(plugin)* | `mp3` `wav` `ogg` `flac` + trackers `mod` `xm` `s3m` `it` + **MIDI** `mid` `midi` `rmi` + **RAD** `.rad` | Waveform + play/loop/seek/sampler/MIDI-in. MIDI = SoundFont synthesis; RAD = OPL3 FM synthesis |
-| **Sample banks** *(plugin)* | `.sf2` (SoundFont) · `.sfz` · `.dls` · `.xi` (FastTracker II) · `.xrns`/`.xrni` (Renoise) | Browsed as a folder of their samples |
+| **Misc** | **.draw** (DRAW project) | PNG preview |
+
+### ✒️ Vector
+
+| Category | Formats | Notes |
+|---|---|---|
+| **Vector graphics** | **SVG** | Rasterized via resvg |
+| **BBS vector** | **RIPscript** (`.rip`) | 640×350 EGA, hand-rolled BGI rasterizer + baud "watch it draw" |
+
+### 🅰 Text-mode & scene art
+
+| Category | Formats | Notes |
+|---|---|---|
+| **ANSI / ASCII art** | `.ans` `.asc` `.nfo` `.diz` `.ice` `.cia` | CP437 + ANSI SGR/cursor, iCE colors, 24-bit, SAUCE-driven cells, baud ANSImation |
+| **Binary scene art** | **XBin** (`.xb`/`.xbin`), **raw BIN** (`.bin`), **TundraDraw** (`.tnd`, 24-bit), **iCE Draw** (`.idf`), **Artworx** (`.adf`) | |
+| **Commodore** | **PETSCII** (`.seq`/`.pet`), **petmate** (`.petmate`) | Authentic C64 font + VIC-II palette |
+
+### 📄 Documents & code *(plugins)*
+
+| Category | Formats | Notes |
+|---|---|---|
+| **PDF** | `.pdf` | Real first-page tile + in-app 1-/2-page viewer (needs poppler) |
+| **Source code / text** | ~90 exts — `rs` `c`/`cpp`/`h` `py` `js`/`ts` `css` `html` `php` `lua` `asm` `gd` `bas` `json` `yaml` `xml` `md` `log` `sh` `rb` `go` `swift` `kt` `ipynb` … | CP437-rasterized with a hand-rolled syntax highlighter + line numbers |
+
+### 🔊 Sound *(plugin)*
+
+| Category | Formats | Notes |
+|---|---|---|
+| **Sampled audio** | `mp3` `wav` `ogg`/`oga` `flac` `ape` `mka` | In-app player: interactive waveform, loop/seek, sampler keyboard, MIDI-in |
+| **Other (external)** | `voc` `au` `snd` `aiff`/`aif` `m4a` `aac` `opus` `wma` `ra` | Music-note tile + "open in default app" |
+
+### 🎵 Music — synthesized & tracked *(plugin)*
+
+| Category | Formats | Notes |
+|---|---|---|
+| **MIDI** | `mid` `midi` `kar` `rmi` | Synthesized through a General MIDI **SoundFont** (rustysynth) |
+| **AdLib / OPL** | **RAD** (`.rad`) | **OPL3 FM synthesis** — built-in OPL3 emulator + RAD replayer |
+| **Trackers** | `mod` `xm` `s3m` `it` | Full-song playback (xmrs) + per-sample explorer/export |
+
+### 🎹 Instruments & sample banks *(plugin)*
+
+| Category | Formats | Notes |
+|---|---|---|
+| **Sample banks** | **SoundFont** (`.sf2`), **SFZ** (`.sfz`), **DLS** (`.dls`) | Browsed as a folder of their samples; presets/instruments/sample counts |
+| **Instruments** | **FastTracker II** (`.xi`), **Renoise** (`.xrns` song / `.xrni` instrument) | Browse + play + export the samples inside |
+
+### 🗜 Archives & online
+
+| Category | Formats | Notes |
+|---|---|---|
+| **Archives (virtual folders)** | `.zip` `.7z` `.rar` `.lha`/`.lzh` `.tar`/`.tgz`/`.tbz` `.ace` `.arj` `.arc` `.zoo` `.ha` `.uc2` `.sqz` `.hyp` | Browsed read-only; contents extracted on demand |
+| **Online archive** | **[16colo.rs](https://16colo.rs)** | The ANSI scene, mounted as a virtual disk (years / packs / artists / groups / search) |
 
 Scene-art formats are decoded with **SAUCE** metadata awareness (the standard
 trailer ANSI artists use to record title/author/group/dimensions), shown in the
