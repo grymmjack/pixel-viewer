@@ -2631,6 +2631,8 @@ impl PixelView {
         let (ls, le) = pad.loop_region(buf.duration);
         let region = build_pad_region(&buf, ls, le, pad.loop_type);
         let (pitch, loop_it) = (pad.pitch, pad.loop_on);
+        // Velocity sensitivity: track the incoming velocity, or ignore it (fixed 127) when off.
+        let vel = if pad.vel_track { vel } else { 127 };
         let gain = (if self.audio_muted || !self.pad_audible(i) {
             0.0
         } else {
@@ -2684,6 +2686,7 @@ impl PixelView {
             loop_start: 0.0,
             loop_end: 0.0,
             loop_type: if old.is_empty() { 0 } else { old.loop_type },
+            vel_track: if old.is_empty() { true } else { old.vel_track },
             flash_t: -1.0,
         };
         self.status = format!("Loaded pad {}", i + 1);
@@ -3939,6 +3942,7 @@ impl PixelView {
         let mut want_trigger: Option<usize> = None;
         let mut want_mute: Option<usize> = None;
         let mut want_solo: Option<usize> = None;
+        let mut want_vel_track: Option<usize> = None;
         let mut want_vol: Option<(usize, f32)> = None;
         let mut want_base: Option<i32> = None;
         let mut want_assign: Option<usize> = None;
@@ -4020,6 +4024,7 @@ impl PixelView {
                     let empty = self.pads[i].is_empty();
                     let muted = self.pads[i].muted;
                     let soloed = self.pads[i].soloed;
+                    let vel_track = self.pads[i].vel_track;
                     let mut volume = self.pads[i].volume;
                     let name = self.pads[i].name.clone();
                     let flash_t = self.pads[i].flash_t;
@@ -4186,6 +4191,15 @@ impl PixelView {
                                     {
                                         want_solo = Some(i);
                                     }
+                                    if ui
+                                        .add(egui::Button::selectable(vel_track, "V"))
+                                        .on_hover_text(
+                                            "Velocity: on = track MIDI velocity, off = fixed 127",
+                                        )
+                                        .clicked()
+                                    {
+                                        want_vel_track = Some(i);
+                                    }
                                 });
                                 // Volume.
                                 ui.spacing_mut().slider_width = (inner.width() - 4.0).max(40.0);
@@ -4224,6 +4238,9 @@ impl PixelView {
         }
         if let Some(i) = want_solo {
             self.pads[i].soloed = !self.pads[i].soloed;
+        }
+        if let Some(i) = want_vel_track {
+            self.pads[i].vel_track = !self.pads[i].vel_track;
         }
         if let Some((i, v)) = want_vol {
             self.pads[i].volume = v;
@@ -11409,6 +11426,7 @@ impl PixelView {
         let mut action: Option<MenuAction> = None;
         // Deferred master-audio controls (the closure can't borrow `self` mutably).
         let mut audio_stop = false;
+        let mut audio_panic_now = false; // global panic: stop all sound + pad voices
         let mut audio_mute = false;
         let mut audio_vol: Option<f32> = None;
         let mut audio_show_playing = false; // click the "PLAYING …" pill → jump to the player
@@ -11630,6 +11648,16 @@ impl PixelView {
                     if ui.button("⏹").on_hover_text("Stop audio").clicked() {
                         audio_stop = true;
                     }
+                    if ui
+                        .button(
+                            egui::RichText::new("Panic")
+                                .color(egui::Color32::from_rgb(240, 120, 110)),
+                        )
+                        .on_hover_text("Stop ALL sound + pad voices, incl. looping pads (Shift+Esc)")
+                        .clicked()
+                    {
+                        audio_panic_now = true;
+                    }
                     let (icon, tip) = if self.audio_muted {
                         ("🔇", "Unmute audio")
                     } else {
@@ -11686,6 +11714,9 @@ impl PixelView {
         }
         if audio_stop {
             self.stop_audio();
+        }
+        if audio_panic_now {
+            self.audio_panic();
         }
         if let Some(v) = audio_vol {
             self.set_audio_volume(v);
@@ -14761,6 +14792,7 @@ struct Pad {
     loop_start: f32,  // loop region start (seconds within the sample)
     loop_end: f32,    // loop region end (seconds; ≤ start ⇒ the whole sample)
     loop_type: u8,    // playback direction: 0 = forward, 1 = reverse, 2 = ping-pong
+    vel_track: bool,  // track incoming MIDI velocity (on) vs. fixed max velocity 127 (off)
     flash_t: f32,     // ctx time of the last trigger (green flash); transient
 }
 
@@ -14800,6 +14832,7 @@ impl Pad {
             loop_start: 0.0,
             loop_end: 0.0,
             loop_type: 0,
+            vel_track: true,
             flash_t: -1.0,
         }
     }
@@ -14833,6 +14866,7 @@ impl Pad {
             format!("{}", self.loop_start),
             format!("{}", self.loop_end),
             self.loop_type.to_string(),
+            if self.vel_track { "1" } else { "0" }.to_string(),
         ]
     }
 
@@ -14853,6 +14887,7 @@ impl Pad {
             loop_start: g(8).parse().unwrap_or(0.0),
             loop_end: g(9).parse().unwrap_or(0.0),
             loop_type: g(10).parse().unwrap_or(0),
+            vel_track: g(11) != "0", // default on (old records without the field track velocity)
             flash_t: -1.0,
         };
         (pad, has_audio)
