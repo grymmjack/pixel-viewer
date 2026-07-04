@@ -662,7 +662,21 @@ The bundled egui font **lacks the Geometric Shapes block** — `▲`/`▼` (U+25
 `●` (U+25CF) etc. render as tofu (`□`). Confirmed-rendering glyphs: the emoji arrows
 `⬅`/`➡`/**`⬆`**/**`⬇`**, `⟲`/`⟳`, `…`/`×`/`›`/`★`/`📁`, `·`. For anything else prefer
 ASCII (`*`) or **paint it** (see `drag_handle`'s dots). When in doubt, test in the
-real app — tofu has bitten this UI several times.
+real app — tofu has bitten this UI several times. (The `↑`/`↓` U+2191/2193 arrows are
+also tofu — use `⬆`/`⬇`.)
+
+## Button-jiggle gotcha (read before a button whose label swaps by state)
+
+egui sizes each widget to its content every frame, so a button whose label changes width
+between states — a glyph swap (`▶`/`⏸`, `🔊`/`🔇`), a text swap (`↑ Asc`/`↓ Desc`,
+`▶ Play`/`⏸ Pause`), or a live counter — **resizes on toggle and shoves the rest of its
+horizontal row sideways** ("jiggle"). Fix: pin such a button to a fixed width with
+`.min_size(fixed_btn_size(ui, &["state A", "state B", …]))` — the helper measures the widest
+label's galley + button padding (font-robust, no magic px). For a *label* that shoves buttons
+(e.g. the single-view zoom readout `N×`/`1/N×`/`%`), reserve a fixed width via
+`ui.add_sized([w, h], Label::new(..))` with `w` measured off the widest reading. All the audio
+transport / GIF / RIP-baud play-pause, the sortbar Asc/Desc, and the menu-bar mute are pinned
+this way — match it for any new state-swapping control.
 
 ## Palette-order gotcha (ANSI SGR vs VGA attribute)
 
