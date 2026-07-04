@@ -2803,6 +2803,14 @@ impl PixelView {
                 egui::Color32::from_rgba_unmultiplied(88, 196, 172, 34),
             );
             let mid = rect.center().y;
+            // Faint center baseline so near-silent stretches still read as a continuous
+            // waveform (like the thumbnail), instead of dropping out to the background. The
+            // bars draw over it wherever the signal is loud.
+            p.hline(
+                rect.x_range(),
+                mid,
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 74, 68)),
+            );
             let cols = w as usize;
             let n = ap.peaks.len().max(1);
             for cx in 0..cols {
