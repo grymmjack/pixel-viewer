@@ -6,6 +6,7 @@ mod colo_thumb;
 mod decode;
 mod dls;
 mod image_types;
+mod libxmp;
 mod palettes_builtin;
 mod rating;
 mod ratings;

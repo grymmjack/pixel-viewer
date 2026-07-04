@@ -13516,9 +13516,17 @@ fn is_audio_ext(p: &Path) -> bool {
         .is_some_and(|e| crate::decode::AUDIO_EXTS.contains(&e.as_str()))
 }
 
-/// Extensions we play via the `xmrs` tracker synthesizer (rather than rodio's PCM decoders).
+/// Extensions we play via the `xmrs` tracker synthesizer (which also gives us a sample explorer).
 fn is_tracker_ext(ext: &str) -> bool {
-    matches!(ext, "mod" | "xm" | "s3m" | "it" | "mtm" | "stm" | "mptm")
+    matches!(ext, "mod" | "xm" | "s3m" | "it")
+}
+
+/// Extensions we play via bundled **libxmp** — the tracker formats `xmrs` doesn't handle.
+fn is_libxmp_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "669" | "far" | "okt" | "med" | "amf" | "ult" | "mtm" | "stm" | "mptm"
+    )
 }
 
 /// Extensions we render through the rustysynth SoundFont synthesizer (standard MIDI + RMID).
@@ -13655,6 +13663,13 @@ fn decode_audio(
         // A Reality Adlib Tracker module: OPL3 FM synthesis (no PCM samples to extract).
         let (s, c, r) = render_rad(&bytes)?;
         (s, c, r, Vec::new())
+    } else if is_libxmp_ext(&ext) {
+        // A tracker format xmrs doesn't do (669/far/okt/…) → render via bundled libxmp.
+        let (s, ch, rate) =
+            crate::libxmp::render(&bytes).ok_or_else(|| "couldn't play this module".to_string())?;
+        let ch = std::num::NonZeroU16::new(ch).ok_or("bad channel count")?;
+        let rate = std::num::NonZeroU32::new(rate).ok_or("bad sample rate")?;
+        (s, ch, rate, Vec::new())
     } else if is_midi_ext(&ext) {
         // A MIDI file: synthesize it through a General MIDI SoundFont (note events → audio).
         let sf = midi_sf.ok_or_else(|| {

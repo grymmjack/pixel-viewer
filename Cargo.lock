@@ -3531,6 +3531,7 @@ name = "pixelview"
 version = "0.1.0"
 dependencies = [
  "asefile",
+ "cc",
  "eframe",
  "egui_kittest",
  "icy_parser_core",
