@@ -10068,6 +10068,7 @@ impl PixelView {
         let mut audio_stop = false;
         let mut audio_mute = false;
         let mut audio_vol: Option<f32> = None;
+        let mut audio_show_playing = false; // click the "PLAYING …" pill → jump to the player
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui.button("Open folder…").clicked() {
@@ -10292,6 +10293,25 @@ impl PixelView {
                     if ui.button(icon).on_hover_text(tip).clicked() {
                         audio_mute = true;
                     }
+                    // While something is playing, show a live VU meter + a clickable "PLAYING …"
+                    // pill (left of the controls) — you can start audio then leave the viewer, so
+                    // this both signals activity and jumps you back to the player.
+                    if let Some(ap) = self.audio_player.as_ref().filter(|a| a.is_playing()) {
+                        let name = short_name(&ap.path);
+                        let level = ap.current_level();
+                        ui.add_space(4.0);
+                        let (vrect, _) =
+                            ui.allocate_exact_size(egui::vec2(46.0, 12.0), egui::Sense::hover());
+                        paint_vu_meter(ui.painter(), vrect, level);
+                        if ui
+                            .button(format!("▶ {}", elide(&name, 22)))
+                            .on_hover_text("Playing — click to open the player")
+                            .clicked()
+                        {
+                            audio_show_playing = true;
+                        }
+                        self.want_repaint = true; // keep the meter animating
+                    }
                 });
             }
         });
@@ -10306,6 +10326,13 @@ impl PixelView {
         }
         if let Some(v) = audio_vol {
             self.set_audio_volume(v);
+        }
+        if audio_show_playing {
+            // Jump to the viewer showing the currently-playing file (it may be in another folder).
+            if let Some(path) = self.audio_player.as_ref().map(|ap| ap.path.clone()) {
+                self.mode = Mode::Single;
+                self.load_full(ctx, path);
+            }
         }
     }
 
@@ -11486,6 +11513,34 @@ fn short_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// Paint a small segmented VU meter into `rect`, `level` in 0..1 (green → yellow → red segments).
+fn paint_vu_meter(painter: &egui::Painter, rect: egui::Rect, level: f32) {
+    painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(20, 22, 28));
+    let segs = 9usize;
+    let gap = 1.0;
+    let seg_w = ((rect.width() - gap * (segs as f32 + 1.0)) / segs as f32).max(1.0);
+    for i in 0..segs {
+        let on = level >= (i as f32 + 0.35) / segs as f32;
+        let base = if i >= 7 {
+            egui::Color32::from_rgb(230, 70, 60)
+        } else if i >= 5 {
+            egui::Color32::from_rgb(235, 200, 70)
+        } else {
+            egui::Color32::from_rgb(90, 210, 150)
+        };
+        let col = if on { base } else { base.gamma_multiply(0.18) };
+        let x = rect.left() + gap + i as f32 * (seg_w + gap);
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(x, rect.top() + 2.0),
+                egui::vec2(seg_w, rect.height() - 4.0),
+            ),
+            1.0,
+            col,
+        );
+    }
 }
 
 /// Format a MIDI note number as a name like `C4` / `F#3` (middle C = 60 = C4).
@@ -13373,6 +13428,25 @@ impl AudioPlayer {
 
     fn is_playing(&self) -> bool {
         self.started && !self.player.is_paused() && !self.player.empty()
+    }
+
+    /// Peak output level (0..1) in a ~20 ms window around the current playhead — drives the
+    /// menu-bar VU meter so the user can see that audio is actually flowing. 0 when not playing.
+    fn current_level(&self) -> f32 {
+        if !self.is_playing() {
+            return 0.0;
+        }
+        let ch = self.channels.get() as usize;
+        let sr = self.sample_rate.get() as f32;
+        let n = self.samples.len();
+        let center = ((self.pos() * sr) as usize).saturating_mul(ch);
+        let half = (sr as usize / 100).saturating_mul(ch); // ~10 ms each side
+        let s = center.saturating_sub(half).min(n);
+        let e = (center + half).min(n);
+        self.samples[s..e]
+            .iter()
+            .fold(0f32, |m, &x| m.max(x.abs()))
+            .min(1.0)
     }
 
     /// The current playhead position in seconds (loop-aware). At a pitched speed the sample
