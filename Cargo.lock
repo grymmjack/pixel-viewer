@@ -3553,6 +3553,7 @@ dependencies = [
  "xcf",
  "xmrs",
  "xmrsplayer",
+ "zip",
 ]
 
 [[package]]

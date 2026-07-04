@@ -27,6 +27,10 @@ symphonia = { version = "0.6", features = ["mp3"] }
 # Read-only extraction of legacy + modern archives (zip/lha/arj/arc/zoo/7z/rar/…),
 # so archives can be browsed as virtual folders. Mike Krüger's crate (icy ecosystem).
 unarc-rs = "0.6"
+# Write + read `.pvkit` sample-kit files (a zip of pad WAVs + a manifest) and the pad
+# "Download zip" export. Already in the tree transitively via unarc-rs (zip 8.6.x), so it's
+# proven to build on stable rustc 1.92; a direct dep unifies to that same build.
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 # Mike Krüger's scene-art parsers (PETSCII/RIP/ATASCII/…). The lightweight parser
 # crate only — no tokio/egui — driven into our own renderer via its CommandSink.
 # Pinned to a rev so upstream master can't break our build.

@@ -803,10 +803,29 @@ pub struct PixelView {
     audio_octave: i32,         // onscreen-keyboard octave offset (transient)
     audio_volume: f32,         // master playback volume 0..1 (menu-bar slider, persisted)
     audio_muted: bool,         // master mute (menu-bar speaker toggle, persisted)
+    // 4×4 sample-pad grid (a mini Battery) — a persistent, cross-file "kit" of favorite samples
+    // for quick auditioning. Always length 16. Metadata persists (PADS_KEY); each pad's audio is
+    // a WAV under `<data_dir>/pads/` (write-through). Saveable/loadable as a named `.pvkit`.
+    pads: Vec<Pad>,
+    pad_base_note: i32, // base MIDI note for auto pad-mapping (default 48 = C3, chromatic up); persisted
+    audio_left_w: f32,  // width of the resizable sample-list pane in the big audio view; persisted
+    audio_wave_h: f32,  // height of the resizable waveform in the big audio view; persisted
+    audio_kb_h: f32,    // height of the resizable onscreen keyboard in the big audio view; persisted
+    pad_assign: Option<usize>, // "MIDI-learn" mode: the next note-on assigns this pad's note (transient)
+    edit_focus: EditFocus,     // what the waveform editor is pointed at (Song / Sample / a Pad drill-in)
+    editor_stash: Option<EditorStash>, // saved editor state during a pad drill-in (restored on Back)
+    note_flash: HashMap<i32, f32>, // MIDI note → last-played ctx time, for the keyboard key lights (transient)
+    kit_name: String,   // current kit's name ("Untitled" by default; persisted)
+    octave_lock: bool,  // lock the onscreen-keyboard octave across editor views (persisted)
+    data_dir: PathBuf,  // eframe data dir (pads WAVs + saved kits live under here)
     // Hardware MIDI controller → play the loaded sample. The callback runs on midir's thread
     // and sends note events over `midi_rx`; `midi_conn` must be kept alive (drop = close).
     midi_rx: Option<std::sync::mpsc::Receiver<MidiNoteEvent>>,
     midi_conn: Option<midir::MidiInputConnection<std::sync::mpsc::Sender<MidiNoteEvent>>>,
+    // A clone of the egui `Context`, so the MIDI input callback (on midir's own thread) can wake
+    // egui with `request_repaint()` — otherwise a note-on while the UI is idle isn't processed
+    // by `poll_midi` until the next repaint (e.g. a mouse move).
+    egui_ctx: egui::Context,
     midi_port: Option<String>, // chosen MIDI input device name (persisted)
     midi_ports: Vec<String>,   // last-enumerated device names (for the picker combo)
     midi_sf: Option<PathBuf>,  // General MIDI SoundFont for playing .mid files (persisted; None = auto-detect)
@@ -872,6 +891,17 @@ pub struct PixelView {
     grid_gap: f32,           // horizontal spacing between grid tiles, in points
     grid_gap_y: f32,         // vertical spacing between grid rows, in points
     caption_fields: u16,     // bitmask: what to show under each grid thumbnail
+    // Per-category grid-tile backgrounds: a subtle accent behind folder / archive /
+    // sample-bank tiles so container kinds read at a glance. Accents are blended into
+    // the theme background (`tile_category_bg`); off = the plain default everywhere.
+    tile_bg_enabled: bool,
+    tile_bg_folder: [u8; 3],    // real directories
+    tile_bg_archive: [u8; 3],   // .zip/.lha/.arj/… browsable archives
+    tile_bg_container: [u8; 3], // sample banks: .sf2/.sfz/.dls/.xi
+    // Draggable thumbnail-area heights (points) for the Details + Recolor panes: the preview
+    // *fits inside* this fixed band instead of dictating the pane's height. Persisted.
+    details_thumb_h: f32,
+    recolor_thumb_h: f32,
     quantize_on: bool,       // details palette: reduce to N colors (median cut)
     quantize_n: usize,       // target color count when reducing
     dither_method: u8,       // index into thumb::DITHER_NAMES (0 = none)
@@ -950,6 +980,14 @@ pub struct PixelView {
     auto_next_dwell: f32, // slideshow: seconds the current (settled) file has been shown
     auto_paused: bool, // slideshow paused by a user interaction (scroll/key/drag); not persisted
     immersive: bool,  // F11 fullscreen: hide all bars/UI, show only the art
+    // DEBUG_MODE=true: dock the window to the bottom-right corner on startup (so a dev test
+    // instance stays out of the way). Consumed once the monitor size is known. Not persisted.
+    debug_dock_pending: bool,
+    // Window title bar: when on, the open folder/file's display path is shown after "pixelview";
+    // the GUI zoom % (Ctrl +/-) is always appended in parens when it isn't 100%. `title_last`
+    // dedupes so we only push a `ViewportCommand::Title` when the string actually changes.
+    title_show_path: bool,
+    title_last: String,
     idle_t: f32,      // seconds of mouse stillness (immersive cursor auto-hide)
     shuffle: bool,    // screensaver: at a pack's end, load another random pack (persisted)
     // screensaver: a worker picking a random 16colo.rs pack → (year, name, download URL)
@@ -1098,6 +1136,15 @@ impl PixelView {
     /// Master audio volume (0..1) + mute — the menu-bar volume control.
     const AUDIO_VOLUME_KEY: &'static str = "audio_volume";
     const AUDIO_MUTED_KEY: &'static str = "audio_muted";
+    /// Sample-pad grid: metadata rows (`Vec<Vec<String>>` via `Pad::record`), the kit name, and
+    /// the onscreen-keyboard octave lock. Pad *audio* is WAVs under `<data_dir>/pads/`.
+    const PADS_KEY: &'static str = "pads";
+    const KIT_NAME_KEY: &'static str = "kit_name";
+    const OCTAVE_LOCK_KEY: &'static str = "audio_octave_lock";
+    const PAD_BASE_KEY: &'static str = "pad_base_note";
+    const AUDIO_LEFT_W_KEY: &'static str = "audio_left_w";
+    const AUDIO_WAVE_H_KEY: &'static str = "audio_wave_h";
+    const AUDIO_KB_H_KEY: &'static str = "audio_kb_h";
     /// Chosen MIDI input device (name; reconnected on launch if still present).
     const MIDI_PORT_KEY: &'static str = "midi_port";
     /// General MIDI SoundFont path for rendering `.mid` files ("" = auto-detect a system one).
@@ -1113,6 +1160,8 @@ impl PixelView {
     const MIN_RATING: &'static str = "min_rating";
     const EXPLORER_KEY: &'static str = "show_explorer";
     const DETAILS_KEY: &'static str = "show_details";
+    /// Show the open path/file in the window title bar (zoom % is always appended when ≠100%).
+    const TITLE_PATH_KEY: &'static str = "title_show_path";
     const RECOLOR_KEY: &'static str = "show_recolor";
     const RECOLOR_GRID_KEY: &'static str = "recolor_grid";
     const ZOOM_LOCK_KEY: &'static str = "zoom_lock";
@@ -1140,6 +1189,19 @@ impl PixelView {
     const GAP_KEY: &'static str = "grid_gap";
     const GAP_Y_KEY: &'static str = "grid_gap_y";
     const CAPTION_KEY: &'static str = "caption_fields";
+    /// Per-category tile backgrounds, stored as one record: `(enabled, folder, archive, container)`.
+    const TILE_BG_KEY: &'static str = "tile_backgrounds";
+    /// Draggable thumbnail-band heights for the Details / Recolor panes.
+    const DETAILS_THUMB_H_KEY: &'static str = "details_thumb_h";
+    const RECOLOR_THUMB_H_KEY: &'static str = "recolor_thumb_h";
+    /// Built-in accent defaults for the three container categories (folder, archive, container).
+    /// Reasonably saturated on purpose — `tile_category_bg` blends them *down* into the theme
+    /// background, so a vivid source gives a legible-but-subtle tint in both light and dark modes.
+    const TILE_BG_DEFAULTS: ([u8; 3], [u8; 3], [u8; 3]) = (
+        [80, 130, 200],  // folder — steel blue
+        [200, 150, 70],  // archive — amber
+        [165, 110, 220], // container — purple (echoes the .sf2 accent)
+    );
     const QUANT_ON_KEY: &'static str = "quantize_on";
     const QUANT_N_KEY: &'static str = "quantize_n";
     const DITHER_METHOD_KEY: &'static str = "dither_method";
@@ -1196,7 +1258,7 @@ impl PixelView {
         let (midi_conn, midi_rx, midi_port) = match &saved_midi {
             Some(name) if midi_ports.iter().any(|p| p == name) => {
                 let (tx, rx) = std::sync::mpsc::channel();
-                match open_midi_port(name, tx) {
+                match open_midi_port(name, tx, cc.egui_ctx.clone()) {
                     Some(conn) => (Some(conn), Some(rx), Some(name.clone())),
                     None => (None, None, saved_midi.clone()),
                 }
@@ -1420,6 +1482,38 @@ impl PixelView {
         let viewdb = crate::viewdb::ViewDb::open(&data_dir);
         // Persistent on-disk HTTP cache (16colo JSON / thumbnails / files / zips).
         crate::cache::init(&data_dir);
+        // Sample-pad kit: metadata rows + each non-empty pad's WAV, reloaded from `<data>/pads`.
+        let pad_rows: Vec<Vec<String>> = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Vec<Vec<String>>>(s, Self::PADS_KEY))
+            .unwrap_or_default();
+        let pads = load_pad_kit(&data_dir, &pad_rows);
+        let kit_name = cc
+            .storage
+            .and_then(|s| eframe::get_value::<String>(s, Self::KIT_NAME_KEY))
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "Untitled".to_string());
+        let octave_lock = get_bool(Self::OCTAVE_LOCK_KEY).unwrap_or(false);
+        let pad_base_note = cc
+            .storage
+            .and_then(|s| eframe::get_value::<i32>(s, Self::PAD_BASE_KEY))
+            .unwrap_or(48) // C3
+            .clamp(0, 115);
+        let audio_left_w = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::AUDIO_LEFT_W_KEY))
+            .unwrap_or(340.0)
+            .clamp(140.0, 900.0);
+        let audio_wave_h = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::AUDIO_WAVE_H_KEY))
+            .unwrap_or(220.0)
+            .clamp(70.0, 600.0);
+        let audio_kb_h = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::AUDIO_KB_H_KEY))
+            .unwrap_or(130.0)
+            .clamp(50.0, 400.0);
         let theme = get_u8(Self::THEME_KEY).unwrap_or(0);
         if theme == 1 {
             cc.egui_ctx.set_visuals(egui::Visuals::light());
@@ -1438,6 +1532,25 @@ impl PixelView {
             .storage
             .and_then(|s| eframe::get_value::<u16>(s, Self::CAPTION_KEY))
             .unwrap_or(CAP_NAME);
+        // Per-category tile backgrounds — one persisted record, defaulting to on with the
+        // built-in accents. `TILE_BG_DEFAULTS` is shared with the Preferences "Reset".
+        let (df, da, dc) = Self::TILE_BG_DEFAULTS;
+        let (tile_bg_enabled, tile_bg_folder, tile_bg_archive, tile_bg_container) = cc
+            .storage
+            .and_then(|s| {
+                eframe::get_value::<(bool, [u8; 3], [u8; 3], [u8; 3])>(s, Self::TILE_BG_KEY)
+            })
+            .unwrap_or((true, df, da, dc));
+        let details_thumb_h = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::DETAILS_THUMB_H_KEY))
+            .unwrap_or(220.0)
+            .clamp(60.0, 1200.0);
+        let recolor_thumb_h = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::RECOLOR_THUMB_H_KEY))
+            .unwrap_or(240.0)
+            .clamp(60.0, 1200.0);
         let quantize_on = get_bool(Self::QUANT_ON_KEY).unwrap_or(false);
         let quantize_n = cc
             .storage
@@ -1560,8 +1673,21 @@ impl PixelView {
             audio_octave: 0,
             audio_volume,
             audio_muted,
+            pads,
+            pad_base_note,
+            audio_left_w,
+            audio_wave_h,
+            audio_kb_h,
+            pad_assign: None,
+            edit_focus: EditFocus::Song,
+            editor_stash: None,
+            note_flash: HashMap::new(),
+            kit_name,
+            octave_lock,
+            data_dir,
             midi_rx,
             midi_conn,
+            egui_ctx: cc.egui_ctx.clone(),
             midi_port,
             midi_ports,
             midi_sf,
@@ -1610,6 +1736,12 @@ impl PixelView {
             grid_gap,
             grid_gap_y,
             caption_fields,
+            tile_bg_enabled,
+            tile_bg_folder,
+            tile_bg_archive,
+            tile_bg_container,
+            details_thumb_h,
+            recolor_thumb_h,
             quantize_on,
             quantize_n,
             dither_method,
@@ -1670,6 +1802,11 @@ impl PixelView {
             auto_next_dwell: 0.0,
             auto_paused: false,
             immersive: false,
+            debug_dock_pending: std::env::var("DEBUG_MODE")
+                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
+                .unwrap_or(false),
+            title_show_path: get_bool(Self::TITLE_PATH_KEY).unwrap_or(true),
+            title_last: String::new(),
             idle_t: 0.0,
             shuffle,
             random_rx: None,
@@ -1816,6 +1953,7 @@ impl PixelView {
                     .is_none_or(|x| self.registry.known_extension(x))
                     || crate::archive::is_archive(&p)
                     || is_sample_bank(&p)
+                    || (self.plugin_audio && is_kit_ext(&p)) // saved kits (click → load)
                 {
                     all.push(make_entry(p, false));
                 }
@@ -2010,7 +2148,8 @@ impl PixelView {
     /// Start a flat 16colo.rs *piece* listing for `dir` (an artist / group / search).
     /// Pieces stream in on a background thread (mirrors the recursive-search pattern:
     /// `colo_rx` + an `AtomicBool` cancel), each a `ColoMsg::Hit(entry, piece)`, drained
-    /// by [`poll_colo_pieces`]. Switches the view to the table so the scene columns show.
+    /// by [`poll_colo_pieces`]. Keeps the current Grid/Table view (the scene columns show
+    /// only in Table, but the grid renders the pieces as thumbnails either way).
     fn start_colo_pieces(&mut self, dir: PathBuf, source: ColoSource) {
         // `show_folder` resets the view + clears the previous flat-listing state.
         let label = match &source {
@@ -2022,7 +2161,9 @@ impl PixelView {
         };
         self.show_folder(dir.clone(), Vec::new());
         self.colo_flat = true;
-        self.table_view = true; // a flat piece listing is the table's whole reason to exist
+        // Honor whichever view (Grid/Table) the user already has — don't yank them into the
+        // table behind their back. The scene columns only show in Table, but the grid renders
+        // the same pieces as thumbnails, so either mode is valid; the user picks.
         self.status = label;
 
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2397,6 +2538,420 @@ impl PixelView {
         }
     }
 
+    /// Whether pad `i` should be heard (per-pad mute folded with kit-wide solo). See
+    /// [`pad_is_audible`] for the rule (extracted so it's unit-testable).
+    fn pad_audible(&self, i: usize) -> bool {
+        pad_is_audible(&self.pads, i)
+    }
+
+    /// The on-disk WAV backing working-kit pad `i`.
+    fn pad_wav_path(&self, i: usize) -> PathBuf {
+        pad_wav_path(&self.data_dir, i)
+    }
+
+    /// The MIDI note that triggers pad `i`: its individual override (MIDI-learned) if set, else
+    /// the auto chromatic mapping from the base note (pad 0 = base, pad 1 = base+1, …). Changing
+    /// the base note remaps every non-overridden pad for free (nothing is stored for auto pads).
+    fn pad_note(&self, i: usize) -> i32 {
+        self.pads
+            .get(i)
+            .and_then(|p| p.note)
+            .unwrap_or(self.pad_base_note + i as i32)
+            .clamp(0, 127)
+    }
+
+    /// Whether MIDI note `midi` triggers some loaded pad (used to colour the keyboard key red).
+    fn note_routes_to_pad(&self, midi: i32) -> bool {
+        (0..self.pads.len()).any(|i| !self.pads[i].is_empty() && self.pad_note(i) == midi)
+    }
+
+    /// Route a note-on from the onscreen keyboard or a hardware MIDI key. Order: (1) MIDI-learn
+    /// mode assigns the note to the pending pad; (2) a note matching a loaded pad's note fires
+    /// that pad at native pitch (drum-rack); (3) otherwise it auditions the editor sample pitched
+    /// from middle C (60). Always records the key light. Returns true if a pad/assign handled it.
+    fn route_note_on(&mut self, midi: i32, vel: u8, now: f32) -> bool {
+        let midi = midi.clamp(0, 127);
+        self.note_flash.retain(|_, t| now - *t < 1.0); // bound the map
+        self.note_flash.insert(midi, now);
+        if let Some(i) = self.pad_assign.take() {
+            if i < self.pads.len() {
+                self.pads[i].note = Some(midi);
+                self.status = format!("Pad {} → {}", i + 1, midi_note_name(midi as u8));
+            }
+            return true;
+        }
+        if let Some(i) =
+            (0..self.pads.len()).find(|&i| !self.pads[i].is_empty() && self.pad_note(i) == midi)
+        {
+            self.trigger_pad(i, vel, now);
+            return true;
+        }
+        if let Some(ap) = &mut self.audio_player {
+            ap.play_note_vel(midi - 60, vel);
+        }
+        false
+    }
+
+    /// Fire pad `i`, applying its own pitch / loop region / loop-type, scaled by velocity and the
+    /// pad's mix state, as a concurrent voice on the current player's mixer. Lights the pad
+    /// (`flash_t`) even when solo-silenced, so the routing is visible. No-op if empty/audio off.
+    fn trigger_pad(&mut self, i: usize, vel: u8, now: f32) {
+        if !self.plugin_audio || i >= self.pads.len() {
+            return;
+        }
+        let Some(buf) = self.pads[i].buf.clone() else {
+            return;
+        };
+        let pad = &self.pads[i];
+        let (ls, le) = pad.loop_region(buf.duration);
+        let region = build_pad_region(&buf, ls, le, pad.loop_type);
+        let (pitch, loop_it) = (pad.pitch, pad.loop_on);
+        let gain = (if self.audio_muted || !self.pad_audible(i) {
+            0.0
+        } else {
+            pad.volume
+        }) * (vel as f32 / 127.0).clamp(0.0, 1.0);
+        if let Some(ap) = &mut self.audio_player {
+            ap.trigger_pad_voice(i, buf, region, pitch, gain, loop_it);
+        }
+        self.pads[i].flash_t = now;
+    }
+
+    /// Load the current editor buffer (selection region if set, else the whole sample) into pad
+    /// `i`, name it after the active tracker sample / file, and write its WAV through to disk.
+    fn load_pad(&mut self, i: usize) {
+        if i >= self.pads.len() {
+            return;
+        }
+        if self.audio_player.is_none() {
+            self.status = "Load an audio file first".into();
+            return;
+        }
+        let ap = self.audio_player.as_ref().unwrap();
+        if ap.samples.is_empty() {
+            return;
+        }
+        let buf = ap.current_region_buf();
+        let name = ap
+            .active_sample
+            .and_then(|s| ap.tracker_samples.get(s))
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| short_name(&ap.path));
+        let _ = std::fs::create_dir_all(pads_dir(&self.data_dir));
+        let _ = write_wav_16(
+            &self.pad_wav_path(i),
+            &buf.samples,
+            buf.channels.get(),
+            buf.sample_rate.get(),
+        );
+        let old = self.pads[i].clone();
+        // Loading fresh audio resets the loop region (it's sample-relative), but keeps the pad's
+        // note / mix / pitch / loop-type when replacing a non-empty pad.
+        self.pads[i] = Pad {
+            name,
+            buf: Some(std::sync::Arc::new(buf)),
+            note: old.note,
+            volume: if old.is_empty() { 1.0 } else { old.volume },
+            muted: old.muted,
+            soloed: old.soloed,
+            pitch: if old.is_empty() { 0 } else { old.pitch },
+            loop_on: false,
+            loop_start: 0.0,
+            loop_end: 0.0,
+            loop_type: if old.is_empty() { 0 } else { old.loop_type },
+            flash_t: -1.0,
+        };
+        self.status = format!("Loaded pad {}", i + 1);
+    }
+
+    /// Drill the main waveform/transport editor into pad `i`: stash what it was showing, load the
+    /// pad's audio, and seed the selection from the pad's loop region — so you can shape the pad's
+    /// loop/pitch on the big editor. [`focus_back`] restores the previous view (committing edits).
+    fn focus_pad(&mut self, i: usize) {
+        if i >= self.pads.len() || self.pads[i].buf.is_none() || self.audio_player.is_none() {
+            return;
+        }
+        let buf = self.pads[i].buf.clone().unwrap();
+        {
+            let ap = self.audio_player.as_mut().unwrap();
+            ap.stop();
+            let taken = ap.take_buffer();
+            let (active, song) = (ap.active_sample, ap.song_backup.take());
+            // Only stash on the first drill-in; switching pad→pad keeps the original base.
+            if self.editor_stash.is_none() {
+                self.editor_stash = Some(EditorStash {
+                    buf: taken,
+                    active_sample: active,
+                    song_backup: song,
+                    focus: self.edit_focus,
+                    octave: self.audio_octave,
+                });
+            }
+            ap.put_buffer((*buf).clone());
+            ap.active_sample = None;
+            ap.song_backup = None;
+        }
+        if !self.octave_lock {
+            self.audio_octave = 0; // a fresh pad edit starts at octave 0 unless the octave is locked
+        }
+        let dur = self.audio_player.as_ref().map(|a| a.duration).unwrap_or(0.0);
+        let (ls, le) = self.pads[i].loop_region(dur);
+        let loop_on = self.pads[i].loop_on;
+        if let Some(ap) = self.audio_player.as_mut() {
+            ap.sel_start = ls;
+            ap.sel_end = le;
+            ap.looping = loop_on;
+        }
+        self.edit_focus = EditFocus::Pad(i);
+    }
+
+    /// Leave a pad drill-in: commit the editor's loop region back to the pad, then restore the
+    /// stashed editor buffer + focus (the song / tracker sample you were on before).
+    fn focus_back(&mut self) {
+        if let (EditFocus::Pad(i), Some(ap)) = (self.edit_focus, self.audio_player.as_ref()) {
+            if i < self.pads.len() {
+                self.pads[i].loop_start = ap.sel_start;
+                self.pads[i].loop_end = ap.sel_end;
+                self.pads[i].loop_on = ap.looping;
+            }
+        }
+        match (self.audio_player.as_mut(), self.editor_stash.take()) {
+            (Some(ap), Some(stash)) => {
+                ap.stop();
+                ap.put_buffer(stash.buf);
+                ap.active_sample = stash.active_sample;
+                ap.song_backup = stash.song_backup;
+                self.edit_focus = stash.focus;
+                if !self.octave_lock {
+                    self.audio_octave = stash.octave; // restore the pre-drill octave
+                }
+            }
+            _ => self.edit_focus = EditFocus::Song,
+        }
+    }
+
+    /// Empty pad `i` and delete its backing WAV.
+    fn clear_pad(&mut self, i: usize) {
+        if i >= self.pads.len() {
+            return;
+        }
+        let _ = std::fs::remove_file(self.pad_wav_path(i));
+        self.pads[i] = Pad::empty();
+    }
+
+    /// Save pad `i`'s audio to a user-chosen WAV.
+    fn download_pad(&mut self, i: usize) {
+        let Some(buf) = self.pads.get(i).and_then(|p| p.buf.clone()) else {
+            return;
+        };
+        let stem = if self.pads[i].name.trim().is_empty() {
+            format!("pad_{:02}", i + 1)
+        } else {
+            sanitize_filename(&self.pads[i].name)
+        };
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name(format!("{stem}.wav"))
+            .add_filter("WAV", &["wav"])
+            .save_file()
+        {
+            match write_wav_16(&path, &buf.samples, buf.channels.get(), buf.sample_rate.get()) {
+                Ok(()) => self.status = format!("Exported {}", short_name(&path)),
+                Err(e) => self.status = format!("Export failed: {e}"),
+            }
+        }
+    }
+
+    /// Export every non-empty pad's audio into a user-chosen `.zip` of WAVs. (Phase 5 unifies this
+    /// with the named-kit `.pvkit` format so an exported zip is re-loadable.)
+    fn export_pads_zip(&mut self) {
+        use std::io::Write;
+        let items: Vec<(usize, String, Vec<u8>)> = self
+            .pads
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                p.buf.as_ref().map(|b| {
+                    (
+                        i,
+                        p.name.clone(),
+                        wav_bytes_16(&b.samples, b.channels.get(), b.sample_rate.get()),
+                    )
+                })
+            })
+            .collect();
+        if items.is_empty() {
+            self.status = "No pads to export".into();
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name("kit.zip")
+            .add_filter("Zip", &["zip"])
+            .save_file()
+        else {
+            return;
+        };
+        let res = (|| -> Result<(), zip::result::ZipError> {
+            let mut zw = zip::ZipWriter::new(std::fs::File::create(&path)?);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for (i, name, wav) in &items {
+                zw.start_file(format!("pad_{:02}_{}.wav", i + 1, sanitize_filename(name)), opts)?;
+                zw.write_all(wav)?;
+            }
+            zw.finish()?;
+            Ok(())
+        })();
+        self.status = match res {
+            Ok(()) => format!("Exported {}", short_name(&path)),
+            Err(e) => format!("Zip failed: {e}"),
+        };
+    }
+
+    /// `<data_dir>/kits` — where named `.pvkit` files live (browsable in the Places dock).
+    fn kits_dir(&self) -> PathBuf {
+        self.data_dir.join("kits")
+    }
+
+    /// Save the whole kit to a `.pvkit` (a zip: `manifest.txt` with the kit name, chosen MIDI
+    /// controller, base note, keyboard octave + per-pad records, plus each non-empty pad's WAV).
+    /// This is the one true kit format — the Places "Kits" browser and Load… both read it.
+    fn save_kit(&mut self, path: &Path) {
+        use std::io::Write;
+        let mut manifest = String::new();
+        manifest.push_str(&format!("name\t{}\n", self.kit_name));
+        manifest.push_str(&format!("midi\t{}\n", self.midi_port.as_deref().unwrap_or("")));
+        manifest.push_str(&format!("base\t{}\n", self.pad_base_note));
+        manifest.push_str(&format!("octave\t{}\n", self.audio_octave));
+        manifest.push_str(&format!("octlock\t{}\n", if self.octave_lock { 1 } else { 0 }));
+        for (i, p) in self.pads.iter().enumerate() {
+            manifest.push_str(&format!("pad\t{}\t{}\n", i, p.record().join("\t")));
+        }
+        let res = (|| -> Result<(), zip::result::ZipError> {
+            let mut zw = zip::ZipWriter::new(std::fs::File::create(path)?);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zw.start_file("manifest.txt", opts)?;
+            zw.write_all(manifest.as_bytes())?;
+            for (i, p) in self.pads.iter().enumerate() {
+                if let Some(b) = &p.buf {
+                    zw.start_file(format!("pad_{i:02}.wav"), opts)?;
+                    zw.write_all(&wav_bytes_16(&b.samples, b.channels.get(), b.sample_rate.get()))?;
+                }
+            }
+            zw.finish()?;
+            Ok(())
+        })();
+        self.status = match res {
+            Ok(()) => format!("Saved kit “{}”", self.kit_name),
+            Err(e) => format!("Save failed: {e}"),
+        };
+    }
+
+    /// Save the current kit into the kits dir under `name` (→ `<data>/kits/<name>.pvkit`).
+    fn save_kit_named(&mut self, name: &str) {
+        let name = name.trim();
+        self.kit_name = if name.is_empty() { "Untitled".into() } else { name.to_string() };
+        let dir = self.kits_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{}.pvkit", sanitize_filename(&self.kit_name)));
+        self.save_kit(&path);
+    }
+
+    /// Load a `.pvkit` into the working kit: metadata (name / MIDI / base / octave / lock / pad
+    /// records) from the manifest + each pad's WAV, then write the audio through to `<data>/pads`
+    /// so it becomes the persistent working kit. Reconnects the saved MIDI controller if present.
+    fn load_kit(&mut self, path: &Path) {
+        use std::io::Read;
+        let parsed = (|| -> Result<(String, Vec<Pad>, Option<String>, i32, i32, bool), String> {
+            let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+            let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+            let mut manifest = String::new();
+            if let Ok(mut f) = zip.by_name("manifest.txt") {
+                f.read_to_string(&mut manifest).map_err(|e| e.to_string())?;
+            }
+            let mut name = "Untitled".to_string();
+            let mut midi: Option<String> = None;
+            let (mut base, mut octave, mut lock) = (48, 0, false);
+            let mut pads = vec![Pad::empty(); PAD_COUNT];
+            for line in manifest.lines() {
+                let f: Vec<&str> = line.split('\t').collect();
+                match f.as_slice() {
+                    ["name", v] => name = v.to_string(),
+                    ["midi", v] if !v.is_empty() => midi = Some(v.to_string()),
+                    ["base", v] => base = v.parse().unwrap_or(48),
+                    ["octave", v] => octave = v.parse().unwrap_or(0),
+                    ["octlock", v] => lock = *v == "1",
+                    ["pad", idx, rest @ ..] => {
+                        if let Ok(i) = idx.parse::<usize>() {
+                            if i < PAD_COUNT {
+                                let row: Vec<String> = rest.iter().map(|s| s.to_string()).collect();
+                                pads[i] = Pad::from_record(&row).0;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Decode each pad's WAV from the zip (decode_audio takes the bytes + an ext hint).
+            for i in 0..PAD_COUNT {
+                let mut bytes = Vec::new();
+                let ok = zip
+                    .by_name(&format!("pad_{i:02}.wav"))
+                    .ok()
+                    .and_then(|mut f| f.read_to_end(&mut bytes).ok())
+                    .is_some();
+                if ok {
+                    if let Ok(d) = decode_audio(Path::new("pad.wav"), std::mem::take(&mut bytes), None) {
+                        pads[i].buf = Some(std::sync::Arc::new(SampleBuf {
+                            samples: d.samples,
+                            channels: d.channels,
+                            sample_rate: d.sample_rate,
+                            duration: d.duration,
+                            peaks: d.peaks,
+                        }));
+                    }
+                } else {
+                    pads[i].buf = None; // manifest said audio but the WAV is missing → empty
+                }
+            }
+            Ok((name, pads, midi, base, octave, lock))
+        })();
+        match parsed {
+            Ok((name, pads, midi, base, octave, lock)) => {
+                self.kit_name = name;
+                self.pads = pads;
+                self.pad_base_note = base.clamp(0, 115);
+                self.audio_octave = octave.clamp(-4, 4);
+                self.octave_lock = lock;
+                // Write the loaded audio through so it becomes the persistent working kit.
+                let _ = std::fs::create_dir_all(pads_dir(&self.data_dir));
+                for i in 0..PAD_COUNT {
+                    match self.pads[i].buf.clone() {
+                        Some(b) => {
+                            let _ = write_wav_16(
+                                &self.pad_wav_path(i),
+                                &b.samples,
+                                b.channels.get(),
+                                b.sample_rate.get(),
+                            );
+                        }
+                        None => {
+                            let _ = std::fs::remove_file(self.pad_wav_path(i));
+                        }
+                    }
+                }
+                // Reconnect the kit's MIDI controller if it's currently available.
+                if let Some(port) = midi {
+                    if self.midi_ports.iter().any(|p| p == &port) {
+                        self.connect_midi(Some(port));
+                    }
+                }
+                self.status = format!("Loaded kit “{}”", self.kit_name);
+            }
+            Err(e) => self.status = format!("Load kit failed: {e}"),
+        }
+    }
+
     /// Set the master audio volume (0..1) and push it to the live player immediately.
     fn set_audio_volume(&mut self, v: f32) {
         self.audio_volume = v.clamp(0.0, 1.0);
@@ -2424,6 +2979,34 @@ impl PixelView {
     fn reset_format_colors(&mut self) {
         crate::format_color::reset_all();
         self.rethumbnail_audio();
+    }
+
+    /// Resting-state background for a browse tile, tinted by its container category.
+    /// Returns `None` for a plain file (the caller keeps the theme's default background).
+    ///
+    /// `base` is the theme's normal tile fill (`extreme_bg_color`); each category's accent
+    /// (`tile_bg_folder` / `_archive` / `_container`) is a user preference blended *into* that
+    /// base so the tint reads in both light and dark themes without drowning the thumbnail.
+    ///
+    /// Order matters: a sample bank (.sf2/.sfz/.dls/.xi) also has `is_archive == true`, so it
+    /// must be matched **before** the generic archive branch.
+    fn tile_category_bg(&self, entry: &Entry, base: egui::Color32) -> Option<egui::Color32> {
+        if !self.tile_bg_enabled {
+            return None;
+        }
+        // How far to pull `base` toward the accent — subtle so it cues the kind without
+        // fighting the content on top.
+        const TINT: f32 = 0.22;
+        let accent = if entry.is_dir {
+            self.tile_bg_folder
+        } else if entry.is_archive && is_sample_bank(&entry.path) {
+            self.tile_bg_container
+        } else if entry.is_archive {
+            self.tile_bg_archive
+        } else {
+            return None;
+        };
+        Some(blend_toward(base, accent, TINT))
     }
 
     /// Drop cached audio thumbnails so they re-decode with the current format colors.
@@ -2454,6 +3037,13 @@ impl PixelView {
     /// Load a tracker sample (`Some(i)`) or the full song (`None`) into the player so the
     /// waveform + transport + keyboard all follow it, and audition it.
     fn select_audio_sample(&mut self, idx: Option<usize>) {
+        // Choosing a tracker sample is an explicit editor change → leave any pad drill-in so a
+        // stale Pad focus can't linger (its stash held the *previous* buffer, not this one).
+        self.editor_stash = None;
+        self.edit_focus = match idx {
+            Some(i) => EditFocus::Sample(i),
+            None => EditFocus::Song,
+        };
         if let Some(ap) = &mut self.audio_player {
             ap.select_sample(idx);
         }
@@ -2499,7 +3089,7 @@ impl PixelView {
         self.midi_port = port.clone();
         if let Some(name) = port {
             let (tx, rx) = std::sync::mpsc::channel();
-            if let Some(conn) = open_midi_port(&name, tx) {
+            if let Some(conn) = open_midi_port(&name, tx, self.egui_ctx.clone()) {
                 self.midi_conn = Some(conn);
                 self.midi_rx = Some(rx);
                 self.status = format!("MIDI in: {name}");
@@ -2511,7 +3101,7 @@ impl PixelView {
 
     /// Drain queued MIDI notes and play the loaded sample. MIDI note 60 (middle C) maps to the
     /// sample's native pitch; Note Off is ignored (monophonic one-shot preview).
-    fn poll_midi(&mut self) {
+    fn poll_midi(&mut self, now: f32) {
         let Some(rx) = &self.midi_rx else { return };
         let events: Vec<MidiNoteEvent> = rx.try_iter().collect();
         if events.is_empty() {
@@ -2519,9 +3109,8 @@ impl PixelView {
         }
         for (note, vel, on) in events {
             if on {
-                if let Some(ap) = &mut self.audio_player {
-                    ap.play_note_vel(note as i32 - 60, vel);
-                }
+                // Route through the pad grid first (assign-mode / pad trigger), else audition.
+                self.route_note_on(note as i32, vel, now);
             }
         }
         self.want_repaint = true;
@@ -2769,6 +3358,7 @@ impl PixelView {
     /// directly after drawing. Shared by the main viewer and the Details pane.
     fn draw_audio_controls(&mut self, ui: &mut egui::Ui, path: &Path, big: bool, meta_dur: Option<f32>) {
         let loaded = self.is_audio_loaded(path);
+        let now = ui.input(|i| i.time) as f32; // for pad triggers + key-light timers
         let dur = self
             .audio_player
             .as_ref()
@@ -2786,6 +3376,7 @@ impl PixelView {
 
         let mut want_toggle = false;
         let mut want_stop = false;
+        let mut want_back = false; // leave a pad drill-in
         let mut want_loop: Option<bool> = None;
         let mut want_autoplay: Option<bool> = None;
         let mut want_select: Option<(f32, f32)> = None;
@@ -2799,8 +3390,20 @@ impl PixelView {
         let mut want_midi: Option<Option<String>> = None; // choose MIDI in device (None = off)
         let mut want_midi_refresh = false; // re-scan MIDI devices
 
-        // Transport row.
+        // Transport row (a "‹ Back" + "Editing pad N" prefix while drilled into a pad).
         ui.horizontal(|ui| {
+            if let EditFocus::Pad(i) = self.edit_focus {
+                if ui
+                    .button("‹ Back")
+                    .on_hover_text("Return to the song / sample (keeps the pad's loop edits)")
+                    .clicked()
+                {
+                    want_back = true;
+                }
+                ui.separator();
+                ui.strong(format!("Editing pad {}", i + 1));
+                ui.separator();
+            }
             if ui
                 .button(if playing { "⏸" } else { "▶" })
                 .on_hover_text("Play / pause (Space)")
@@ -2830,11 +3433,51 @@ impl PixelView {
             let mm = |s: f32| format!("{}:{:02}", (s as u64) / 60, (s as u64) % 60);
             ui.weak(format!("{} / {}", mm(pos), mm(dur)));
         });
+        // Per-pad loop / pitch / loop-type controls while drilled into a pad (they edit the pad
+        // directly; the waveform drag sets the loop region, committed on Back). Play/trigger the
+        // pad to hear the pitch + loop-type applied.
+        if let EditFocus::Pad(i) = self.edit_focus {
+            if i < self.pads.len() {
+                ui.horizontal(|ui| {
+                    let mut loop_on = self.pads[i].loop_on;
+                    if ui.checkbox(&mut loop_on, "Loop").changed() {
+                        self.pads[i].loop_on = loop_on;
+                        if let Some(ap) = &mut self.audio_player {
+                            ap.looping = loop_on;
+                        }
+                    }
+                    let cur = (self.pads[i].loop_type as usize).min(2);
+                    egui::ComboBox::from_id_salt("pad_loop_type")
+                        .selected_text(LOOP_TYPES[cur])
+                        .show_ui(ui, |ui| {
+                            for (t, name) in LOOP_TYPES.iter().enumerate() {
+                                if ui.selectable_label(cur == t, *name).clicked() {
+                                    self.pads[i].loop_type = t as u8;
+                                }
+                            }
+                        });
+                    ui.separator();
+                    ui.weak("Pitch");
+                    ui.add(
+                        egui::DragValue::new(&mut self.pads[i].pitch)
+                            .range(-24..=24)
+                            .suffix(" st"),
+                    );
+                    if ui.small_button("Oct −").clicked() {
+                        self.pads[i].pitch = (self.pads[i].pitch - 12).max(-24);
+                    }
+                    if ui.small_button("Oct +").clicked() {
+                        self.pads[i].pitch = (self.pads[i].pitch + 12).min(24);
+                    }
+                    ui.weak("· drag the waveform to set the loop · click the pad / press its key to audition");
+                });
+            }
+        }
         ui.add_space(4.0);
 
         // Interactive waveform: hi-res bars, shaded loop region, moving playhead.
         if let Some(ap) = self.audio_player.as_ref().filter(|_| loaded) {
-            let h = if big { 220.0 } else { 96.0 };
+            let h = if big { self.audio_wave_h } else { 96.0 };
             let (rect, resp) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width(), h),
                 egui::Sense::click_and_drag(),
@@ -2912,62 +3555,89 @@ impl PixelView {
                 }
             }
             ui.weak("drag: loop region · click: seek · dbl-click: all · middle-click: play here");
+            // Resize the waveform height (big view only).
+            if big {
+                let dy = drag_h_divider(ui, ui.available_width());
+                if dy != 0.0 {
+                    self.audio_wave_h = (self.audio_wave_h + dy).clamp(70.0, 600.0);
+                }
+            }
         }
 
-        // Onscreen keyboard: audition the sample as a one-shot instrument.
+        // Keyboard + sample list. The BIG (viewer) player splits these into two columns — the
+        // tracker sample list on the left, the keyboard + 4×4 sample-pad grid on the right; the
+        // compact (Details) player keeps the simple stacked layout and has no pads.
         if loaded {
-            ui.add_space(4.0);
-            let oct = self.audio_octave;
-            ui.horizontal(|ui| {
-                ui.weak("🎹");
-                if ui.small_button("Oct −").clicked() {
-                    want_octave = Some(oct - 1);
-                }
-                ui.weak(format!("{oct:+}"));
-                if ui.small_button("Oct +").clicked() {
-                    want_octave = Some(oct + 1);
-                }
-                ui.weak("click keys to pitch the sample");
-            });
-            if let Some(semi) = piano_keyboard(ui, oct, if big { 130.0 } else { 66.0 }) {
-                want_note = Some(semi);
-            }
-            // MIDI controller picker (big view only): play the loaded sample from hardware keys.
             if big {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.weak("🎹 MIDI in:");
-                    let current = self.midi_port.clone();
-                    let label = current.clone().unwrap_or_else(|| "None".to_string());
-                    egui::ComboBox::from_id_salt("midi_in_pick")
-                        .selected_text(elide(&label, 28))
-                        .show_ui(ui, |ui| {
-                            if ui.selectable_label(current.is_none(), "None").clicked() {
-                                want_midi = Some(None);
-                            }
-                            for p in &self.midi_ports {
-                                if ui
-                                    .selectable_label(current.as_deref() == Some(p.as_str()), p)
-                                    .clicked()
-                                {
-                                    want_midi = Some(Some(p.clone()));
-                                }
-                            }
-                            if self.midi_ports.is_empty() {
-                                ui.weak("(no controllers found)");
-                            }
-                        });
-                    if ui
-                        .small_button("⟲")
-                        .on_hover_text("Re-scan MIDI devices")
-                        .clicked()
-                    {
-                        want_midi_refresh = true;
+                let levels = self
+                    .audio_player
+                    .as_ref()
+                    .map(|ap| ap.pad_levels())
+                    .unwrap_or([0.0; PAD_COUNT]);
+                let avail = ui.available_width();
+                let left_w = self.audio_left_w.clamp(140.0, (avail - 220.0).max(160.0));
+                let mut new_left_w = left_w;
+                ui.add_space(6.0);
+                ui.separator();
+                ui.horizontal_top(|ui| {
+                    let h = ui.available_height();
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(left_w, h),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| self.audio_sample_list(ui, true, &mut want_sample, &mut want_export),
+                    );
+                    // Draggable divider — resize the sample-list pane (persisted).
+                    let (dr, dresp) =
+                        ui.allocate_exact_size(egui::vec2(7.0, h), egui::Sense::drag());
+                    let active = dresp.hovered() || dresp.dragged();
+                    ui.painter().vline(
+                        dr.center().x,
+                        dr.y_range(),
+                        egui::Stroke::new(
+                            if active { 2.0 } else { 1.0 },
+                            if active {
+                                ui.visuals().strong_text_color()
+                            } else {
+                                ui.visuals().weak_text_color()
+                            },
+                        ),
+                    );
+                    if active {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                     }
-                    if self.midi_conn.is_some() {
-                        ui.weak("· play the sample from your keys");
+                    if dresp.dragged() {
+                        new_left_w =
+                            (left_w + dresp.drag_delta().x).clamp(140.0, (avail - 220.0).max(160.0));
                     }
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), h),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            self.audio_keyboard_section(
+                                ui,
+                                true,
+                                now,
+                                &mut want_note,
+                                &mut want_octave,
+                                &mut want_midi,
+                                &mut want_midi_refresh,
+                            );
+                            self.draw_pad_grid(ui, now, levels);
+                        },
+                    );
                 });
+                self.audio_left_w = new_left_w;
+            } else {
+                self.audio_keyboard_section(
+                    ui,
+                    false,
+                    now,
+                    &mut want_note,
+                    &mut want_octave,
+                    &mut want_midi,
+                    &mut want_midi_refresh,
+                );
+                self.audio_sample_list(ui, false, &mut want_sample, &mut want_export);
             }
         } else if is_tracker_ext(
             &path
@@ -2982,74 +3652,6 @@ impl PixelView {
             ui.weak("Press ▶ to load the waveform + keyboard.");
         }
 
-        // Sample explorer: a tracker module carries a bank of individual samples. List them
-        // below the keyboard — click one to load it (the waveform/keyboard follow it), or ⬇
-        // export it as WAV. Snapshot the list first so the row loop doesn't borrow the player.
-        let sample_list: Vec<(String, f32)> = self
-            .audio_player
-            .as_ref()
-            .filter(|_| loaded)
-            .map(|ap| {
-                ap.tracker_samples
-                    .iter()
-                    .map(|s| (s.name.clone(), s.buf.duration))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !sample_list.is_empty() {
-            let active = self
-                .audio_player
-                .as_ref()
-                .and_then(|ap| ap.active_sample);
-            ui.add_space(8.0);
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.strong(format!("Samples ({})", sample_list.len()));
-                ui.weak("· click to load · ⬇ export WAV");
-            });
-            ui.add_space(2.0);
-            // "Full song" row (revert the keyboard/waveform to the whole module).
-            if ui
-                .selectable_label(active.is_none(), "🎵  Full song")
-                .clicked()
-            {
-                want_sample = Some(None);
-            }
-            let row_h = if big { 22.0 } else { 18.0 };
-            // Fill the remaining vertical space down to the bottom of the pane (so a big bank
-            // uses the whole viewer/dock instead of a stubby fixed box), with a sane floor.
-            let list_h = (ui.available_height() - 4.0).max(if big { 160.0 } else { 90.0 });
-            egui::ScrollArea::vertical()
-                .id_salt("tracker_samples")
-                .max_height(list_h)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    for (i, (name, dur)) in sample_list.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.set_min_height(row_h);
-                            if ui
-                                .add(egui::Button::new("⬇").small().frame(false))
-                                .on_hover_text("Export this sample as WAV")
-                                .clicked()
-                            {
-                                want_export = Some(i);
-                            }
-                            let mm = format!("{:.2}s", dur);
-                            let label = format!("{:>2}. {}", i + 1, name);
-                            let sel = active == Some(i);
-                            let resp = ui.selectable_label(sel, label);
-                            if resp.clicked() {
-                                want_sample = Some(Some(i));
-                            }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| ui.weak(mm),
-                            );
-                        });
-                    }
-                });
-        }
-
         // Apply the collected actions (order: adjust the region/loop before (re)starting).
         if let Some(b) = want_autoplay {
             self.audio_autoplay = b;
@@ -3058,6 +3660,13 @@ impl PixelView {
             if let Some(ap) = &mut self.audio_player {
                 ap.sel_start = lo;
                 ap.sel_end = hi.max(lo + 0.01);
+            }
+            // While drilled into a pad, the loop-region drag edits that pad's loop live.
+            if let EditFocus::Pad(i) = self.edit_focus {
+                if i < self.pads.len() {
+                    self.pads[i].loop_start = lo;
+                    self.pads[i].loop_end = hi.max(lo + 0.01);
+                }
             }
         }
         if let Some(b) = want_loop {
@@ -3078,6 +3687,9 @@ impl PixelView {
         if want_toggle {
             self.toggle_audio(path);
         }
+        if want_back {
+            self.focus_back();
+        }
         if want_stop {
             self.stop_audio();
         }
@@ -3085,9 +3697,8 @@ impl PixelView {
             self.audio_octave = o.clamp(-4, 4);
         }
         if let Some(semi) = want_note {
-            if let Some(ap) = &mut self.audio_player {
-                ap.play_note(semi);
-            }
+            // Onscreen keyboard: route through the pad grid too (semi is relative to native = 60).
+            self.route_note_on(semi + 60, 100, now);
         }
         if let Some(secs) = want_seek {
             if let Some(ap) = &self.audio_player {
@@ -3113,6 +3724,511 @@ impl PixelView {
             self.connect_midi(port);
         }
         if self.audio_player.as_ref().is_some_and(|ap| ap.is_playing()) {
+            self.want_repaint = true;
+        }
+    }
+
+    /// The onscreen-keyboard section (octave row + piano + MIDI-in picker). Collects its actions
+    /// into the caller's `want_*`; shared by the big + compact players so it isn't duplicated.
+    fn audio_keyboard_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        big: bool,
+        now: f32,
+        want_note: &mut Option<i32>,
+        want_octave: &mut Option<i32>,
+        want_midi: &mut Option<Option<String>>,
+        want_midi_refresh: &mut bool,
+    ) {
+        ui.add_space(4.0);
+        let oct = self.audio_octave;
+        ui.horizontal(|ui| {
+            ui.weak("🎹");
+            if ui.small_button("Oct −").clicked() {
+                *want_octave = Some(oct - 1);
+            }
+            ui.weak(format!("{oct:+}"));
+            if ui.small_button("Oct +").clicked() {
+                *want_octave = Some(oct + 1);
+            }
+            ui.checkbox(&mut self.octave_lock, "Lock")
+                .on_hover_text("Keep this octave across editor views (pad drill-ins / samples)");
+            ui.weak("· click keys to pitch");
+        });
+        // Light every recently-played note (mouse / onscreen / MIDI): red when it's routed to a
+        // pad, an accent colour for a plain audition. Keyboard space is `midi - 60`.
+        let highlights: Vec<(i32, egui::Color32)> = self
+            .note_flash
+            .iter()
+            .filter(|(_, &t)| now - t < 0.22)
+            .map(|(&midi, _)| {
+                let c = if self.note_routes_to_pad(midi) {
+                    egui::Color32::from_rgb(232, 72, 72)
+                } else {
+                    egui::Color32::from_rgb(96, 170, 235)
+                };
+                (midi - 60, c)
+            })
+            .collect();
+        let kb_h = if big { self.audio_kb_h } else { 66.0 };
+        if let Some(semi) = piano_keyboard(ui, oct, kb_h, &highlights) {
+            *want_note = Some(semi);
+        }
+        if big {
+            // Resize the keyboard height (pads below get the remaining space).
+            let dy = drag_h_divider(ui, ui.available_width());
+            if dy != 0.0 {
+                self.audio_kb_h = (self.audio_kb_h + dy).clamp(50.0, 400.0);
+            }
+        }
+        if !highlights.is_empty() {
+            self.want_repaint = true; // fade the key lights out
+        }
+        // MIDI controller picker (big view only): play pads / the sample from hardware keys.
+        if big {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.weak("🎹 MIDI in:");
+                let current = self.midi_port.clone();
+                let connected = self.midi_conn.is_some();
+                // ✓ once a controller is connected (the choice sticks across restarts).
+                if connected {
+                    ui.colored_label(egui::Color32::from_rgb(90, 200, 120), "✓");
+                }
+                let label = current.clone().unwrap_or_else(|| "None".to_string());
+                egui::ComboBox::from_id_salt("midi_in_pick")
+                    .selected_text(elide(&label, 28))
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(current.is_none(), "None").clicked() {
+                            *want_midi = Some(None);
+                        }
+                        for p in &self.midi_ports {
+                            if ui
+                                .selectable_label(current.as_deref() == Some(p.as_str()), p)
+                                .clicked()
+                            {
+                                *want_midi = Some(Some(p.clone()));
+                            }
+                        }
+                        if self.midi_ports.is_empty() {
+                            ui.weak("(no controllers found)");
+                        }
+                    });
+                if ui
+                    .small_button("⟲")
+                    .on_hover_text("Re-scan MIDI devices")
+                    .clicked()
+                {
+                    *want_midi_refresh = true;
+                }
+                if connected {
+                    ui.weak("· play pads / the sample from your keys");
+                }
+            });
+        }
+    }
+
+    /// The tracker sample explorer list (click to load into the editor, ⬇ to export a WAV).
+    /// Collects into the caller's `want_*`. Empty (a non-tracker file) → renders nothing.
+    fn audio_sample_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        big: bool,
+        want_sample: &mut Option<Option<usize>>,
+        want_export: &mut Option<usize>,
+    ) {
+        let sample_list: Vec<(String, f32)> = self
+            .audio_player
+            .as_ref()
+            .map(|ap| {
+                ap.tracker_samples
+                    .iter()
+                    .map(|s| (s.name.clone(), s.buf.duration))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if sample_list.is_empty() {
+            return;
+        }
+        let active = self.audio_player.as_ref().and_then(|ap| ap.active_sample);
+        ui.horizontal(|ui| {
+            ui.strong(format!("Samples ({})", sample_list.len()));
+            ui.weak("· click to load · ⬇ WAV");
+        });
+        ui.add_space(2.0);
+        if ui
+            .selectable_label(active.is_none(), "🎵  Full song")
+            .clicked()
+        {
+            *want_sample = Some(None);
+        }
+        let row_h = if big { 22.0 } else { 18.0 };
+        let list_h = (ui.available_height() - 4.0).max(if big { 160.0 } else { 90.0 });
+        egui::ScrollArea::vertical()
+            .id_salt("tracker_samples")
+            .max_height(list_h)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (i, (name, dur)) in sample_list.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(row_h);
+                        if ui
+                            .add(egui::Button::new("⬇").small().frame(false))
+                            .on_hover_text("Export this sample as WAV")
+                            .clicked()
+                        {
+                            *want_export = Some(i);
+                        }
+                        let mm = format!("{:.2}s", dur);
+                        let label = format!("{:>2}. {}", i + 1, name);
+                        let sel = active == Some(i);
+                        if ui.selectable_label(sel, label).clicked() {
+                            *want_sample = Some(Some(i));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.weak(mm)
+                        });
+                    });
+                }
+            });
+    }
+
+    /// The 4×4 sample-pad grid (a mini Battery). `levels` are the per-pad VU peaks (from
+    /// `AudioPlayer::pad_levels`) and `now` is `ctx` time (for the trigger flash). Collects its
+    /// own `want_pad_*` and applies them at the end (it's a `&mut self` method, not a closure).
+    fn draw_pad_grid(&mut self, ui: &mut egui::Ui, now: f32, levels: [f32; PAD_COUNT]) {
+        let mut want_load: Option<usize> = None;
+        let mut want_clear: Option<usize> = None;
+        let mut want_download: Option<usize> = None;
+        let mut want_trigger: Option<usize> = None;
+        let mut want_mute: Option<usize> = None;
+        let mut want_solo: Option<usize> = None;
+        let mut want_vol: Option<(usize, f32)> = None;
+        let mut want_base: Option<i32> = None;
+        let mut want_assign: Option<usize> = None;
+        let mut want_edit: Option<usize> = None;
+        let mut want_zip = false;
+        let mut want_save_kit = false;
+        let mut want_load_kit = false;
+
+        ui.add_space(8.0);
+        ui.separator();
+        // Kit row: name it, save it to the Kits folder, or load a saved `.pvkit`.
+        ui.horizontal(|ui| {
+            ui.strong("Kit");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.kit_name)
+                    .desired_width(150.0)
+                    .hint_text("Untitled"),
+            );
+            if ui
+                .button("Save")
+                .on_hover_text("Save this kit to the Kits folder (browsable in Places)")
+                .clicked()
+            {
+                want_save_kit = true;
+            }
+            if ui
+                .button("Load…")
+                .on_hover_text("Load a .pvkit file")
+                .clicked()
+            {
+                want_load_kit = true;
+            }
+        });
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.strong("Pads");
+            // Base-note chooser: auto-maps every non-overridden pad chromatically from here.
+            ui.weak("· base");
+            let base = self.pad_base_note;
+            egui::ComboBox::from_id_salt("pad_base_note")
+                .selected_text(midi_note_name(base.clamp(0, 127) as u8))
+                .show_ui(ui, |ui| {
+                    for oct in 0..=7 {
+                        let n = oct * 12 + 12; // C0=12 … C7=96
+                        if ui
+                            .selectable_label(base == n, midi_note_name(n as u8))
+                            .clicked()
+                        {
+                            want_base = Some(n);
+                        }
+                    }
+                });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("⬇ zip")
+                    .on_hover_text("Export all pads as a .zip of WAVs")
+                    .clicked()
+                {
+                    want_zip = true;
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        let cols = 4usize;
+        let gap = 6.0f32;
+        // Pads FILL the pad pane: width divides the pane width, height divides the *remaining*
+        // vertical space (so the 4 rows fit the bottom pane exactly). The user shapes the rectangle
+        // by dragging the waveform/keyboard dividers above, which changes how much height is left.
+        let cell_w = ((ui.available_width() - gap * (cols as f32 - 1.0)) / cols as f32).max(80.0);
+        let cell_h = ((ui.available_height() - gap * 3.0) / 4.0).clamp(72.0, 400.0);
+        let old_spacing = ui.spacing().item_spacing;
+        ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
+        for r in 0..4 {
+            ui.horizontal(|ui| {
+                for c in 0..cols {
+                    let i = r * cols + c;
+                    // Copy the pad's state out so nothing borrows `self.pads` across the tile.
+                    let empty = self.pads[i].is_empty();
+                    let muted = self.pads[i].muted;
+                    let soloed = self.pads[i].soloed;
+                    let mut volume = self.pads[i].volume;
+                    let name = self.pads[i].name.clone();
+                    let flash_t = self.pads[i].flash_t;
+                    let overridden = self.pads[i].note.is_some();
+                    let note_name = midi_note_name(self.pad_note(i) as u8);
+                    let assigning = self.pad_assign == Some(i); // MIDI-learn armed on this pad
+
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(cell_w, cell_h),
+                        egui::Sense::click(),
+                    );
+                    let flash = flash_t >= 0.0 && now - flash_t < 0.18;
+                    let bg = if flash {
+                        egui::Color32::from_rgb(40, 120, 55)
+                    } else if empty {
+                        egui::Color32::from_rgb(26, 28, 34)
+                    } else if resp.hovered() {
+                        egui::Color32::from_rgb(46, 50, 62)
+                    } else {
+                        egui::Color32::from_rgb(38, 41, 50)
+                    };
+                    ui.painter().rect_filled(rect, 5.0, bg);
+                    let border = if assigning {
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 190, 70)) // MIDI-learn
+                    } else {
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(72))
+                    };
+                    ui.painter().rect_stroke(
+                        rect,
+                        5.0,
+                        border,
+                        egui::StrokeKind::Inside,
+                    );
+                    if !empty && resp.clicked() {
+                        want_trigger = Some(i);
+                    }
+
+                    // Painted vertical VU strip on the right edge.
+                    let vu = egui::Rect::from_min_max(
+                        egui::pos2(rect.right() - 10.0, rect.top() + 5.0),
+                        egui::pos2(rect.right() - 5.0, rect.bottom() - 5.0),
+                    );
+                    ui.painter()
+                        .rect_filled(vu, 1.0, egui::Color32::from_rgb(16, 18, 24));
+                    let lv = levels[i].clamp(0.0, 1.0);
+                    if lv > 0.001 {
+                        let top = vu.bottom() - vu.height() * lv;
+                        let col = if lv > 0.85 {
+                            egui::Color32::from_rgb(230, 90, 70)
+                        } else {
+                            egui::Color32::from_rgb(90, 210, 120)
+                        };
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_max(egui::pos2(vu.left(), top), vu.max),
+                            1.0,
+                            col,
+                        );
+                    }
+
+                    // Controls, in a child ui inset from the tile edges (minus the VU strip).
+                    let inner = egui::Rect::from_min_max(
+                        rect.min + egui::vec2(6.0, 4.0),
+                        egui::pos2(rect.right() - 14.0, rect.bottom() - 5.0),
+                    );
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(inner)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                        |ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
+                            ui.spacing_mut().button_padding = egui::vec2(3.0, 1.0);
+                            // Header: pad number + name + assigned note.
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("{}", i + 1))
+                                        .size(10.0)
+                                        .color(egui::Color32::from_gray(120)),
+                                );
+                                if !empty {
+                                    ui.label(
+                                        egui::RichText::new(elide(&name, 8))
+                                            .size(10.0)
+                                            .color(egui::Color32::from_gray(215)),
+                                    );
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        // Assigned note; brighter when individually overridden.
+                                        ui.label(
+                                            egui::RichText::new(&note_name).size(10.0).color(
+                                                if overridden {
+                                                    egui::Color32::from_rgb(150, 200, 255)
+                                                } else {
+                                                    egui::Color32::from_gray(130)
+                                                },
+                                            ),
+                                        );
+                                    },
+                                );
+                            });
+                            // Glyph row.
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(egui::Button::new("⟲").small())
+                                    .on_hover_text("Load the current selection into this pad")
+                                    .clicked()
+                                {
+                                    want_load = Some(i);
+                                }
+                                // MIDI-learn: arm this pad, then the next key (onscreen/hardware)
+                                // becomes its trigger note. Armed → the 🎹 button is highlighted.
+                                if ui
+                                    .add(egui::Button::new("🎹").small().selected(assigning))
+                                    .on_hover_text(
+                                        "Assign a MIDI note: click, then press a key on your \
+                                         controller or the onscreen keyboard",
+                                    )
+                                    .clicked()
+                                {
+                                    want_assign = Some(i);
+                                }
+                                if !empty {
+                                    if ui
+                                        .add(egui::Button::new("e").small())
+                                        .on_hover_text(
+                                            "Edit: focus the waveform on this pad to set its \
+                                             loop / pitch (Back returns)",
+                                        )
+                                        .clicked()
+                                    {
+                                        want_edit = Some(i);
+                                    }
+                                    if ui
+                                        .add(egui::Button::new("⬇").small())
+                                        .on_hover_text("Download this pad as WAV")
+                                        .clicked()
+                                    {
+                                        want_download = Some(i);
+                                    }
+                                    if ui
+                                        .add(egui::Button::new("×").small())
+                                        .on_hover_text("Clear this pad")
+                                        .clicked()
+                                    {
+                                        want_clear = Some(i);
+                                    }
+                                }
+                            });
+                            if !empty {
+                                // Mute / Solo.
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add(egui::Button::selectable(muted, "M"))
+                                        .on_hover_text("Mute")
+                                        .clicked()
+                                    {
+                                        want_mute = Some(i);
+                                    }
+                                    if ui
+                                        .add(egui::Button::selectable(soloed, "S"))
+                                        .on_hover_text("Solo")
+                                        .clicked()
+                                    {
+                                        want_solo = Some(i);
+                                    }
+                                });
+                                // Volume.
+                                ui.spacing_mut().slider_width = (inner.width() - 4.0).max(40.0);
+                                if ui
+                                    .add(egui::Slider::new(&mut volume, 0.0..=1.0).show_value(false))
+                                    .changed()
+                                {
+                                    want_vol = Some((i, volume));
+                                }
+                            }
+                        },
+                    );
+                }
+            });
+        }
+        ui.spacing_mut().item_spacing = old_spacing;
+
+        // Apply collected actions.
+        if let Some(n) = want_base {
+            self.pad_base_note = n.clamp(0, 115);
+        }
+        if let Some(i) = want_load {
+            self.load_pad(i);
+        }
+        if let Some(i) = want_clear {
+            self.clear_pad(i);
+        }
+        if let Some(i) = want_download {
+            self.download_pad(i);
+        }
+        if let Some(i) = want_trigger {
+            self.trigger_pad(i, 100, now);
+        }
+        if let Some(i) = want_mute {
+            self.pads[i].muted = !self.pads[i].muted;
+        }
+        if let Some(i) = want_solo {
+            self.pads[i].soloed = !self.pads[i].soloed;
+        }
+        if let Some((i, v)) = want_vol {
+            self.pads[i].volume = v;
+        }
+        if let Some(i) = want_edit {
+            self.focus_pad(i);
+        }
+        if let Some(i) = want_assign {
+            // Toggle MIDI-learn on this pad (click again to cancel).
+            self.pad_assign = if self.pad_assign == Some(i) { None } else { Some(i) };
+            if self.pad_assign.is_some() {
+                self.status = format!("Pad {}: press a key to assign its MIDI note…", i + 1);
+            }
+        }
+        if want_zip {
+            self.export_pads_zip();
+        }
+        if want_save_kit {
+            let name = self.kit_name.clone();
+            self.save_kit_named(&name);
+        }
+        if want_load_kit {
+            let _ = std::fs::create_dir_all(self.kits_dir());
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Kit", &["pvkit"])
+                .set_directory(self.kits_dir())
+                .pick_file()
+            {
+                self.load_kit(&path);
+            }
+        }
+        // Reap finished voices + keep VU meters / flashes animating.
+        if let Some(ap) = &mut self.audio_player {
+            ap.reap_pad_voices();
+        }
+        let voices = self
+            .audio_player
+            .as_ref()
+            .map(|ap| !ap.pad_voices.is_empty())
+            .unwrap_or(false);
+        if voices || self.pads.iter().any(|p| p.flash_t >= 0.0 && now - p.flash_t < 0.2) {
             self.want_repaint = true;
         }
     }
@@ -4248,6 +5364,10 @@ impl PixelView {
         };
         if entry.is_dir || entry.is_archive {
             self.open_folder(entry.path); // archives route to enter_archive
+        } else if self.plugin_audio && is_kit_ext(&entry.path) {
+            // A saved sample-pad kit → load it into the grid (don't open the viewer).
+            self.selected = idx;
+            self.load_kit(&entry.path);
         } else if self.colo_pieces.contains_key(&entry.path)
             && !self.colo_files.contains_key(&entry.path)
         {
@@ -4353,24 +5473,6 @@ impl PixelView {
             // to remove — also mirrored in the Places dock). A plain horizontal can
             // only clip at the panel edge, never overlap, so a long path stays safe.
             if !editing {
-                if self.folder.is_some() {
-                    ui.separator();
-                }
-                let can_pin = self
-                    .folder
-                    .as_ref()
-                    .is_some_and(|f| !self.favorites.contains(f));
-                if ui
-                    .add_enabled(can_pin, egui::Button::new("★ Pin"))
-                    .on_hover_text("Pin this folder to Favorites / Places")
-                    .clicked()
-                {
-                    if let Some(f) = self.folder.clone() {
-                        if !self.favorites.contains(&f) {
-                            self.favorites.push(f);
-                        }
-                    }
-                }
                 // Declutter: when enabled, the top bar surfaces only color-tagged
                 // favorites (the rest stay in the Places dock). Fall back to showing all
                 // when none are colored yet, so the bar is never confusingly empty.
@@ -4389,16 +5491,45 @@ impl PixelView {
                 } else {
                     0
                 };
-                if let Some(p) = self
-                    .favorites_buttons(ui, "📁", |path| !colored_only || colored.contains(path))
-                {
+                let can_pin = self
+                    .folder
+                    .as_ref()
+                    .is_some_and(|f| !self.favorites.contains(f));
+                // Push the ★ Pin button + 📁 favorite chips to the *right* edge of the path
+                // row (no longer flush against the breadcrumb), ★ Pin rightmost. A right-to-left
+                // layout hugs the right; `favorites_buttons(.., reverse=true)` emits the chips
+                // reversed so they still *read* left-to-right (and stay drag-reorderable).
+                let mut nav: Option<PathBuf> = None;
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Added first in a right-to-left layout → sits at the far right.
+                    if ui
+                        .add_enabled(can_pin, egui::Button::new("★ Pin"))
+                        .on_hover_text("Pin this folder to Favorites / Places")
+                        .clicked()
+                    {
+                        if let Some(f) = self.folder.clone() {
+                            if !self.favorites.contains(&f) {
+                                self.favorites.push(f);
+                            }
+                        }
+                    }
+                    if hidden > 0 {
+                        ui.weak(format!("+{hidden}")).on_hover_text(format!(
+                            "{hidden} uncolored favorite(s) hidden — find them in the Places \
+                             dock, or color-tag one to surface it here (View → Favorites bar)"
+                        ));
+                    }
+                    if let Some(p) = self.favorites_buttons(
+                        ui,
+                        "📁",
+                        |path| !colored_only || colored.contains(path),
+                        true,
+                    ) {
+                        nav = Some(p);
+                    }
+                });
+                if let Some(p) = nav {
                     self.open_folder(p);
-                }
-                if hidden > 0 {
-                    ui.weak(format!("+{hidden}")).on_hover_text(format!(
-                        "{hidden} uncolored favorite(s) hidden — find them in the Places dock, \
-                         or color-tag one to surface it here (View → Favorites bar)"
-                    ));
                 }
             }
         });
@@ -4500,6 +5631,7 @@ impl PixelView {
         ui: &mut egui::Ui,
         icon: &str,
         filter: impl Fn(&Path) -> bool,
+        reverse: bool,
     ) -> Option<PathBuf> {
         // Buttons must not wrap their text vertically near the right edge of
         // horizontal_wrapped (Extend = wrap whole buttons to the next row instead).
@@ -4522,7 +5654,15 @@ impl PixelView {
             .filter(|(_, f)| filter(f))
             .map(|(i, _)| i)
             .collect();
-        for (vis_pos, &i) in visible.iter().enumerate() {
+        // `reverse` displays the chips in reverse so they read left-to-right when the caller
+        // uses a right-to-left layout (the top-bar cluster, right-aligned next to ★ Pin);
+        // `vis_pos` stays the logical position so Move-up/down adjacency is unaffected.
+        let order: Vec<(usize, usize)> = if reverse {
+            visible.iter().copied().enumerate().rev().collect()
+        } else {
+            visible.iter().copied().enumerate().collect()
+        };
+        for (vis_pos, i) in order {
             let fav = self.favorites[i].clone();
             let label = format!("{icon} {}", self.fav_label(&fav));
             let color = self.fav_colors.get(&fav).copied();
@@ -5156,6 +6296,43 @@ impl PixelView {
         Some(tt)
     }
 
+    /// The display path shown in the window title bar: the open file in single view,
+    /// else the current folder. `None` when nothing is open yet.
+    fn title_location(&self) -> Option<String> {
+        let p = match self.mode {
+            Mode::Single => self
+                .full_tex
+                .as_ref()
+                .map(|(p, _)| p.clone())
+                .or_else(|| self.anim.as_ref().map(|a| a.path.clone()))
+                .or_else(|| self.entries.get(self.selected).map(|e| e.path.clone())),
+            Mode::Grid => self.folder.clone(),
+        };
+        p.map(|p| self.to_display(&p).display().to_string())
+    }
+
+    /// Rebuild the OS window title ("pixelview" + optional path + zoom %) and push it only
+    /// when it changed, so we don't spam the compositor with a viewport command every frame.
+    fn update_window_title(&mut self, ctx: &egui::Context) {
+        let mut title = String::from("pixelview");
+        if self.title_show_path {
+            if let Some(loc) = self.title_location() {
+                title.push_str("  —  ");
+                title.push_str(&loc);
+            }
+        }
+        // Always surface the GUI zoom (Ctrl +/-) when it isn't 100%, so it's clear how
+        // zoomed the interface is — independent of the path option.
+        let pct = (self.ui_zoom * 100.0).round() as i32;
+        if pct != 100 {
+            title.push_str(&format!("  ({pct}%)"));
+        }
+        if title != self.title_last {
+            self.title_last = title.clone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
+    }
+
     /// The image the Details / Recolor panes act on: in single view the open
     /// image; in the grid the hovered tile, falling back to the last-hovered one
     /// (so the panes stay usable after the pointer moves onto them).
@@ -5214,6 +6391,54 @@ impl PixelView {
             .filter(|(p, _)| p == path)
             .map(|(_, tt)| (tt.size[0] as f32, tt.size[1] as f32))
             .unwrap_or((tsz.x, tsz.y))
+    }
+
+    /// Paint `tex` aspect-fitted **inside a fixed band** (pane width × `area_h`), then a
+    /// draggable divider that resizes the band. The preview *fits* the band rather than
+    /// dictating the pane height — so the metadata/controls below never get shoved around —
+    /// and the user drags the divider (or widens the dock) to see more. Returns the band
+    /// height, updated if the divider was dragged. Shared by the Details + Recolor panes.
+    fn draw_thumb_area(
+        &mut self,
+        ui: &mut egui::Ui,
+        path: &Path,
+        tex: &egui::TextureHandle,
+        ar_y: f32,
+        area_h: f32,
+    ) -> f32 {
+        let (bw, bh) = self.preview_aspect(path, tex.size_vec2());
+        let avail_w = ui.available_width();
+        let area_h = area_h.clamp(60.0, 1200.0);
+        // Reserve the fixed band and fit the image inside it (letterboxed, both axes).
+        let (area, _) = ui.allocate_exact_size(egui::vec2(avail_w, area_h), egui::Sense::hover());
+        let fit = fit_centered(area, egui::vec2(bw.max(1.0), (bh * ar_y).max(1.0)));
+        ui.painter().image(
+            tex.id(),
+            fit,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+        // Divider handle: a row of dots the user drags up/down to resize the band.
+        let (bar, resp) = ui.allocate_exact_size(egui::vec2(avail_w, 10.0), egui::Sense::drag());
+        let active = resp.hovered() || resp.dragged();
+        let c = if active {
+            ui.visuals().strong_text_color()
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        for dx in [-16.0, -8.0, 0.0, 8.0, 16.0] {
+            ui.painter().circle_filled(bar.center() + egui::vec2(dx, 0.0), 1.4, c);
+        }
+        if active {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
+        let new_h = if resp.dragged() {
+            (area_h + resp.drag_delta().y).clamp(60.0, 1200.0)
+        } else {
+            area_h
+        };
+        ui.add_space(4.0);
+        new_h
     }
 
     fn ui_details(&mut self, ui: &mut egui::Ui) {
@@ -5329,32 +6554,18 @@ impl PixelView {
                     } else {
                         None
                     };
-                    // Plain thumbnail (the recolored preview lives in the Recolor pane).
-                    if let Some(tex) = self.thumb_tex.get(&entry.path) {
-                        let tsz = tex.size_vec2();
-                        // Fill the pane width so the thumbnail grows as the dock is
-                        // widened; cap height so a very tall image stays usable. Match the
-                        // full viewer's CRT stretch (≈1.2× taller) for text-mode art, so
-                        // the preview isn't squished next to the stretched full view. Take
-                        // the aspect from the open image's full texture (not the thumbnail's
-                        // own dims) so it agrees with the main view + minimap.
+                    // Plain thumbnail (the recolored preview lives in the Recolor pane). It fits
+                    // inside a fixed, user-draggable band (see `draw_thumb_area`) rather than
+                    // dictating the pane height. The CRT ≈1.2× stretch for text-mode art keeps it
+                    // agreeing with the main view + minimap.
+                    if let Some(tex) = self.thumb_tex.get(&entry.path).cloned() {
                         let ar_y = if self.crt_aspect && is_textmode_ext(&entry.path) {
                             1.2
                         } else {
                             1.0
                         };
-                        let (bw, bh) = self.preview_aspect(&entry.path, tsz);
-                        let mut w = ui.available_width();
-                        let mut h = w * (bh * ar_y) / bw;
-                        let max_h = 600.0;
-                        if h > max_h {
-                            h = max_h;
-                            w = h * bw / (bh * ar_y);
-                        }
-                        ui.vertical_centered(|ui| {
-                            ui.image(egui::load::SizedTexture::new(tex.id(), egui::vec2(w, h)));
-                        });
-                        ui.add_space(6.0);
+                        self.details_thumb_h =
+                            self.draw_thumb_area(ui, &entry.path, &tex, ar_y, self.details_thumb_h);
                     } else {
                         self.thumbs.request(&entry.path, THUMB_PX);
                         self.want_repaint = true;
@@ -5773,29 +6984,17 @@ impl PixelView {
                     tex = self.thumb_tex.get(&entry.path).cloned();
                 }
                 if let Some(tex) = tex {
-                    let tsz = tex.size_vec2();
-                    // Fill the pane width so the preview grows as the dock is widened;
-                    // only a very tall image is capped (by height) to keep it usable. Match
-                    // the full viewer's CRT stretch (≈1.2× taller) for text-mode art, and
-                    // take the aspect from the open image's full texture (not the preview
-                    // texture's own dims) so it agrees with the main view + minimap.
+                    // The preview fits inside a fixed, user-draggable band (see `draw_thumb_area`)
+                    // rather than dictating the pane height, so the swatches / controls below stay
+                    // put; drag the divider (or widen the dock) to see more. CRT ≈1.2× stretch for
+                    // text-mode art keeps it agreeing with the main view + minimap.
                     let ar_y = if self.crt_aspect && is_textmode_ext(&entry.path) {
                         1.2
                     } else {
                         1.0
                     };
-                    let (bw, bh) = self.preview_aspect(&entry.path, tsz);
-                    let mut w = ui.available_width();
-                    let mut h = w * (bh * ar_y) / bw;
-                    let max_h = 600.0;
-                    if h > max_h {
-                        h = max_h;
-                        w = h * bw / (bh * ar_y);
-                    }
-                    ui.vertical_centered(|ui| {
-                        ui.image(egui::load::SizedTexture::new(tex.id(), egui::vec2(w, h)));
-                    });
-                    ui.add_space(6.0);
+                    self.recolor_thumb_h =
+                        self.draw_thumb_area(ui, &entry.path, &tex, ar_y, self.recolor_thumb_h);
                 } else {
                     self.thumbs.request(&entry.path, THUMB_PX);
                     self.want_repaint = true;
@@ -6801,7 +8000,10 @@ impl PixelView {
                         } else if resp.hovered() {
                             ui.visuals().widgets.hovered.bg_fill
                         } else {
-                            ui.visuals().extreme_bg_color
+                            // Folder / archive / sample-bank tiles get a subtle category tint
+                            // at rest; plain files fall through to the theme default.
+                            let base = ui.visuals().extreme_bg_color;
+                            self.tile_category_bg(&entry, base).unwrap_or(base)
                         };
                         ui.painter().rect_filled(rect, 4.0, bg);
 
@@ -6928,6 +8130,23 @@ impl PixelView {
                                         egui::pos2(1.0, 1.0),
                                     ),
                                     egui::Color32::WHITE,
+                                );
+                            } else if is_kit_ext(path) {
+                                // A saved sample-pad kit — paint a drum glyph + KIT badge instead
+                                // of trying (and failing) to decode the zip as an image.
+                                let p = ui.painter_at(rect);
+                                p.text(
+                                    rect.center() - egui::vec2(0.0, tile * 0.06),
+                                    egui::Align2::CENTER_CENTER,
+                                    "🎵",
+                                    egui::FontId::proportional(tile * 0.4),
+                                    egui::Color32::from_rgb(210, 180, 120),
+                                );
+                                paint_format_badge(
+                                    &p,
+                                    rect.left_top() + egui::vec2(5.0, 4.0),
+                                    "kit",
+                                    egui::Color32::from_rgb(230, 170, 90),
                                 );
                             } else if self.colo_pieces.contains_key(path) && is_audio_ext(path) {
                                 // A 16colo audio piece has no server-side render PNG, so paint a
@@ -9823,13 +11042,21 @@ impl PixelView {
                 match self.mode {
                     Mode::Single => {
                         // The full zoom/pan hint used to sit here permanently, eating
-                        // ~200px of the right edge on every screen. Collapse it to a
-                        // compact "?" that carries the same text as a tooltip.
-                        ui.weak("?").on_hover_text(
-                            "Zoom: Ctrl+wheel, or hold Z and press 1-9/0 or Z + +/- to \
-                             step. Drag to pan. Text-mode art (and 'Snap') step in whole \
-                             device pixels per source pixel — shown as N×.",
-                        );
+                        // ~200px of the right edge on every screen. Collapsed to a small
+                        // framed help button: hover for the zoom/pan hint, click to open the
+                        // full Keyboard-shortcuts window.
+                        if ui
+                            .small_button("❔")
+                            .on_hover_text(
+                                "Zoom: Ctrl+wheel, or hold Z and press 1-9/0 or Z + +/- to \
+                                 step. Drag to pan. Text-mode art (and 'Snap') step in whole \
+                                 device pixels per source pixel — shown as N×.\n\nClick for all \
+                                 keyboard shortcuts.",
+                            )
+                            .clicked()
+                        {
+                            self.show_hotkeys = true;
+                        }
                         ui.separator();
                         // Pixel-perfect art reads in device-pixels-per-source-pixel
                         // ("N×", always a whole step) — clearer than a fractional % on a
@@ -10129,6 +11356,19 @@ impl PixelView {
 
     /// Top menu bar. The nested menu closures only *read* `self` and stash a
     /// deferred `MenuAction`, applied afterward — avoiding nested `&mut self`.
+    /// A top-level menu-bar button that records its `Response` into `resps`, so `ui_menubar`
+    /// can add real hover-to-switch behavior (egui 0.34's `MenuBar` only hover-switches
+    /// *sub*menus, not the top-level bar). Not a method — it takes no `self` — so each
+    /// `content` closure is free to borrow `self` at the call site.
+    fn menu_bar_button(
+        ui: &mut egui::Ui,
+        resps: &mut Vec<egui::Response>,
+        label: &str,
+        content: impl FnOnce(&mut egui::Ui),
+    ) {
+        resps.push(ui.menu_button(label, content).response);
+    }
+
     fn ui_menubar(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let mut action: Option<MenuAction> = None;
         // Deferred master-audio controls (the closure can't borrow `self` mutably).
@@ -10136,8 +11376,10 @@ impl PixelView {
         let mut audio_mute = false;
         let mut audio_vol: Option<f32> = None;
         let mut audio_show_playing = false; // click the "PLAYING …" pill → jump to the player
+        // Top-level menu button responses, for the hover-to-switch pass after the bar renders.
+        let mut menu_resps: Vec<egui::Response> = Vec::new();
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("File", |ui| {
+            Self::menu_bar_button(ui, &mut menu_resps, "File", |ui| {
                 if ui.button("Open folder…").clicked() {
                     action = Some(MenuAction::Open);
                     ui.close();
@@ -10148,7 +11390,7 @@ impl PixelView {
                     ui.close();
                 }
             });
-            ui.menu_button("Edit", |ui| {
+            Self::menu_bar_button(ui, &mut menu_resps, "Edit", |ui| {
                 let has_sel = !self.selection.is_empty() || self.hovered.is_some();
                 let can_paste = self.clipboard.is_some();
                 if ui
@@ -10203,7 +11445,7 @@ impl PixelView {
                     ui.close();
                 }
             });
-            ui.menu_button("View", |ui| {
+            Self::menu_bar_button(ui, &mut menu_resps, "View", |ui| {
                 if ui
                     .selectable_label(self.table_view, "Table view")
                     .on_hover_text("Show the current folder as a sortable table")
@@ -10263,7 +11505,7 @@ impl PixelView {
                     ui.close();
                 }
             });
-            ui.menu_button("Sort", |ui| {
+            Self::menu_bar_button(ui, &mut menu_resps, "Sort", |ui| {
                 for k in SortKey::COMMON {
                     if ui.selectable_label(self.sort_key == k, k.label()).clicked() {
                         action = Some(MenuAction::Sort(k));
@@ -10283,7 +11525,7 @@ impl PixelView {
                     ui.close();
                 }
             });
-            ui.menu_button("Go", |ui| {
+            Self::menu_bar_button(ui, &mut menu_resps, "Go", |ui| {
                 if ui.button("⬆ Up").clicked() {
                     action = Some(MenuAction::Up);
                     ui.close();
@@ -10328,7 +11570,7 @@ impl PixelView {
                     }
                 }
             });
-            ui.menu_button("Help", |ui| {
+            Self::menu_bar_button(ui, &mut menu_resps, "Help", |ui| {
                 if ui.button("Keyboard shortcuts").clicked() {
                     action = Some(MenuAction::Hotkeys);
                     ui.close();
@@ -10382,6 +11624,24 @@ impl PixelView {
                 });
             }
         });
+        // Real menu-bar UX: once *any* top-level menu is open, hovering a sibling switches to
+        // it (like a desktop menu bar / the app's context menus) instead of requiring a fresh
+        // click. egui 0.34's `MenuBar` only does this for submenus, so we do it here: each
+        // menu's popup id is `response.id.with("popup")`; `Popup::open_id` opens one and closes
+        // the rest. Applies next frame — imperceptible.
+        let popup_id = |r: &egui::Response| r.id.with("popup");
+        let any_open = menu_resps
+            .iter()
+            .any(|r| egui::Popup::is_id_open(ctx, popup_id(r)));
+        if any_open {
+            if let Some(r) = menu_resps
+                .iter()
+                .find(|r| r.hovered() && !egui::Popup::is_id_open(ctx, popup_id(r)))
+            {
+                egui::Popup::open_id(ctx, popup_id(r));
+                ctx.request_repaint();
+            }
+        }
         if let Some(a) = action {
             self.do_menu(ctx, a);
         }
@@ -10503,9 +11763,19 @@ impl PixelView {
                         if ui.button("🏠 Home").clicked() {
                             nav = home_dir();
                         }
-                        if let Some(p) =
-                            self.favorites_buttons(ui, "📁", |p| !crate::sixteen::is_remote(p))
-                        {
+                        // Sample-pad kits folder (only when the audio plugin is on). Browsing it
+                        // shows saved `.pvkit` files; clicking one loads that kit into the grid.
+                        if self.plugin_audio && ui.button("🎵 Kits").clicked() {
+                            let d = self.kits_dir();
+                            let _ = std::fs::create_dir_all(&d);
+                            nav = Some(d);
+                        }
+                        if let Some(p) = self.favorites_buttons(
+                            ui,
+                            "📁",
+                            |p| !crate::sixteen::is_remote(p),
+                            false,
+                        ) {
                             nav = Some(p);
                         }
                         // Smart filters: saved searches. Click recalls + runs; right-click
@@ -10537,7 +11807,8 @@ impl PixelView {
                         {
                             nav = Some(PathBuf::from(crate::sixteen::ROOT));
                         }
-                        if let Some(p) = self.favorites_buttons(ui, "🌐", crate::sixteen::is_remote)
+                        if let Some(p) =
+                            self.favorites_buttons(ui, "🌐", crate::sixteen::is_remote, false)
                         {
                             nav = Some(p);
                         }
@@ -10588,6 +11859,23 @@ impl eframe::App for PixelView {
         // Track the live zoom factor (changed by Ctrl +/-) so `save` can persist it.
         self.ui_zoom = ctx.zoom_factor();
         self.want_repaint = false;
+        // DEBUG_MODE=true → dock this instance to the bottom-right corner once the monitor
+        // size is known (it's None on the very first frame), leaving a taskbar margin so a
+        // dev test window stays out of the user's way.
+        if self.debug_dock_pending {
+            if let Some(mon) = ctx.input(|i| i.viewport().monitor_size) {
+                let size = egui::vec2(1200.0, 900.0).min(mon - egui::vec2(0.0, 80.0));
+                let pos = egui::pos2(
+                    (mon.x - size.x).max(0.0),
+                    (mon.y - size.y - 64.0).max(0.0), // 64px: clear a bottom taskbar
+                );
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                self.debug_dock_pending = false;
+            }
+        }
+        // Reflect the open path/file + GUI zoom in the OS title bar (deduped internally).
+        self.update_window_title(&ctx);
         // Decode any new "Open in…" program icons (cheap: returns early when all cached).
         self.ensure_opener_icons(&ctx);
 
@@ -10668,7 +11956,7 @@ impl eframe::App for PixelView {
         self.poll_colo_open(&ctx);
         self.poll_colo_save();
         self.poll_colo_sauce();
-        self.poll_midi(); // hardware MIDI keys → play the loaded sample
+        self.poll_midi(ctx.input(|i| i.time) as f32); // hardware MIDI keys → pads / sample
         self.poll_audio_load(ctx.input(|i| i.stable_dt)); // background audio decode → build player
         // Screensaver: once a (random) pack has finished downloading + mounting, open its
         // first art file. Both async ops idle ⇒ the listing has settled.
@@ -11020,11 +12308,13 @@ impl eframe::App for PixelView {
             egui::Panel::left("leftdock")
                 .resizable(true)
                 .default_size(300.0)
+                .min_size(180.0) // don't let a drag shrink it into a black sliver
                 .show_inside(ui, |ui| {
                     if self.show_details && self.show_explorer {
                         egui::Panel::bottom("ld_explorer")
                             .resizable(true)
                             .default_size(240.0)
+                            .min_size(120.0)
                             .show_inside(ui, |ui| self.ui_explorer(ui));
                         egui::CentralPanel::default().show_inside(ui, |ui| self.ui_details(ui));
                     } else if self.show_details {
@@ -11039,6 +12329,7 @@ impl eframe::App for PixelView {
             egui::Panel::right("recolor")
                 .resizable(true)
                 .default_size(340.0)
+                .min_size(220.0)
                 .show_inside(ui, |ui| self.ui_recolor(ui));
         }
 
@@ -11095,270 +12386,323 @@ impl eframe::App for PixelView {
             egui::Window::new("Preferences")
                 .open(&mut open)
                 .collapsible(false)
-                .resizable(false)
+                .resizable(true)
+                .default_size([720.0, 560.0])
                 .show(&ctx, |ui| {
-                    let mut theme = self.theme;
-                    let mut gap = self.grid_gap;
-                    ui.label("Theme");
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut theme, 0, "Dark");
-                        ui.selectable_value(&mut theme, 1, "Light");
-                    });
-                    ui.add_space(8.0);
-                    ui.label("Grid spacing (horizontal)");
-                    let resp = ui.add(egui::Slider::new(&mut gap, 0.0..=40.0).suffix(" pt"));
-                    wheel_adjust(ui, &resp, &mut gap, 1.0, 0.0f32, 40.0f32);
-                    let mut gap_y = self.grid_gap_y;
-                    ui.label("Grid spacing (vertical)");
-                    let resp = ui.add(egui::Slider::new(&mut gap_y, 0.0..=80.0).suffix(" pt"));
-                    wheel_adjust(ui, &resp, &mut gap_y, 1.0, 0.0f32, 80.0f32);
-                    if theme != self.theme {
-                        self.theme = theme;
-                        ctx.set_visuals(if theme == 1 {
-                            egui::Visuals::light()
-                        } else {
-                            egui::Visuals::dark()
-                        });
-                    }
-                    self.grid_gap = gap;
-                    self.grid_gap_y = gap_y;
-
-                    ui.add_space(10.0);
-                    // Text-mode/scene art renders at a tiny native 8×16 px per cell, so
-                    // it opens at this zoom instead of an unreadable 1:1. Measured in
-                    // *device* pixels per source pixel (N×) — the pixel-perfect unit the
-                    // viewer shows; applied to every ANSI/scene file as it loads.
-                    ui.label("Text-mode (ANSI/scene) zoom");
-                    let mut tz = self.textmode_zoom.round() as i32;
-                    egui::ComboBox::from_id_salt("textmode_zoom")
-                        .selected_text(format!("{tz}×"))
-                        .show_ui(ui, |ui| {
-                            for n in [1, 2, 3, 4, 5, 6, 8] {
-                                ui.selectable_value(&mut tz, n, format!("{n}×"));
-                            }
-                        });
-                    if (tz as f32 - self.textmode_zoom).abs() > f32::EPSILON {
-                        self.textmode_zoom = tz as f32;
-                        // Reflect the change immediately on an already-open ANSI.
-                        if self.viewing_textmode && !self.fit_mode {
-                            self.zoom = self.textmode_zoom / ctx.pixels_per_point();
-                        }
-                    }
-
-                    ui.add_space(10.0);
-                    ui.label("Show under thumbnails");
-                    let mut fields = self.caption_fields;
-                    ui.horizontal_wrapped(|ui| {
-                        for &(mask, label) in CAPTION_FIELDS {
-                            let mut on = fields & mask != 0;
-                            if ui.checkbox(&mut on, label).changed() {
-                                if on {
-                                    fields |= mask;
-                                } else {
-                                    fields &= !mask;
-                                }
-                            }
-                        }
-                    });
-                    self.caption_fields = fields;
-
-                    ui.add_space(10.0);
-                    ui.checkbox(&mut self.table_grid, "Table dividing lines")
-                        .on_hover_text(
-                            "Draw subtle row + column divider lines in the table view \
-                             (in addition to the zebra striping)",
-                        );
-                    ui.label("Table columns (file view)");
-                    let mut tcols = self.table_columns;
-                    ui.horizontal_wrapped(|ui| {
-                        for &(mask, label) in TABLE_COLUMNS {
-                            let mut on = tcols & mask != 0;
-                            if ui.checkbox(&mut on, label).changed() {
-                                if on {
-                                    tcols |= mask;
-                                } else {
-                                    tcols &= !mask;
-                                }
-                            }
-                        }
-                    });
-                    self.table_columns = tcols;
-
-                    ui.add_space(10.0);
-                    ui.label("Hotkeys");
-                    let mut new_rebind: Option<Option<Action>> = None;
-                    egui::Grid::new("prefs_keys")
-                        .num_columns(3)
-                        .spacing([10.0, 4.0])
+                    // Responsive layout: the sections flow into two columns when the (resizable)
+                    // window is wide enough, collapsing to a single stacked column when narrow.
+                    // The scroll area fills the window, so a scrollbar appears exactly when the
+                    // content is taller than the current window — drag the window bigger to see
+                    // more at once, or drag it wider to spread the controls across two columns.
+                    let ncols = if ui.available_width() >= 640.0 { 2 } else { 1 };
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            for a in Action::ALL {
-                                ui.label(a.label());
-                                let cur = self
-                                    .keymap
-                                    .get(&a)
-                                    .copied()
-                                    .unwrap_or_else(|| a.default_key());
-                                ui.strong(cur.symbol_or_name());
-                                let waiting = self.rebinding == Some(a);
-                                let btn = if waiting {
-                                    "press a key… (Esc cancels)"
-                                } else {
-                                    "Rebind"
-                                };
-                                if ui.button(btn).clicked() {
-                                    new_rebind = Some(if waiting { None } else { Some(a) });
+                            ui.columns(ncols, |cols| {
+                                let ui = &mut cols[0];
+                                let mut theme = self.theme;
+                                let mut gap = self.grid_gap;
+                                ui.label("Theme");
+                                ui.horizontal(|ui| {
+                                    ui.selectable_value(&mut theme, 0, "Dark");
+                                    ui.selectable_value(&mut theme, 1, "Light");
+                                });
+                                ui.add_space(8.0);
+                                ui.label("Grid spacing (horizontal)");
+                                let resp = ui.add(egui::Slider::new(&mut gap, 0.0..=40.0).suffix(" pt"));
+                                wheel_adjust(ui, &resp, &mut gap, 1.0, 0.0f32, 40.0f32);
+                                let mut gap_y = self.grid_gap_y;
+                                ui.label("Grid spacing (vertical)");
+                                let resp = ui.add(egui::Slider::new(&mut gap_y, 0.0..=80.0).suffix(" pt"));
+                                wheel_adjust(ui, &resp, &mut gap_y, 1.0, 0.0f32, 80.0f32);
+                                if theme != self.theme {
+                                    self.theme = theme;
+                                    ctx.set_visuals(if theme == 1 {
+                                        egui::Visuals::light()
+                                    } else {
+                                        egui::Visuals::dark()
+                                    });
                                 }
-                                ui.end_row();
-                            }
-                        });
-                    if let Some(r) = new_rebind {
-                        self.rebinding = r;
-                    }
+                                self.grid_gap = gap;
+                                self.grid_gap_y = gap_y;
 
-                    ui.add_space(10.0);
-                    ui.label("Viewer info OSD");
-                    ui.checkbox(&mut self.osd_enabled, "Show metadata overlay on open")
-                        .on_hover_text("A fading panel with the piece's details");
-                    ui.add_enabled_ui(self.osd_enabled, |ui| {
-                        ui.label("Position");
-                        // A spatial 3×3 picker (center unused) — the button's place in the
-                        // grid is where the OSD lands, so a corner is one click.
-                        egui::Grid::new("osd_pos_grid")
-                            .spacing([4.0, 4.0])
-                            .show(ui, |ui| {
-                                ui.selectable_value(&mut self.osd_position, 0, "Top L");
-                                ui.selectable_value(&mut self.osd_position, 1, "Top");
-                                ui.selectable_value(&mut self.osd_position, 2, "Top R");
-                                ui.end_row();
-                                ui.selectable_value(&mut self.osd_position, 3, "Left");
-                                ui.label(""); // center: unused
-                                ui.selectable_value(&mut self.osd_position, 4, "Right");
-                                ui.end_row();
-                                ui.selectable_value(&mut self.osd_position, 5, "Bot L");
-                                ui.selectable_value(&mut self.osd_position, 6, "Bot");
-                                ui.selectable_value(&mut self.osd_position, 7, "Bot R");
-                                ui.end_row();
+                                ui.add_space(10.0);
+                                ui.label("Window title bar");
+                                ui.checkbox(&mut self.title_show_path, "Show open path / file")
+                                    .on_hover_text(
+                                        "Append the open folder or file to the title bar. The GUI \
+                                         zoom % (Ctrl +/-) always shows in parens when it isn't 100%.",
+                                    );
+
+                                ui.add_space(10.0);
+                                // Text-mode/scene art renders at a tiny native 8×16 px per cell, so
+                                // it opens at this zoom instead of an unreadable 1:1. Measured in
+                                // *device* pixels per source pixel (N×) — the pixel-perfect unit the
+                                // viewer shows; applied to every ANSI/scene file as it loads.
+                                ui.label("Text-mode (ANSI/scene) zoom");
+                                let mut tz = self.textmode_zoom.round() as i32;
+                                egui::ComboBox::from_id_salt("textmode_zoom")
+                                    .selected_text(format!("{tz}×"))
+                                    .show_ui(ui, |ui| {
+                                        for n in [1, 2, 3, 4, 5, 6, 8] {
+                                            ui.selectable_value(&mut tz, n, format!("{n}×"));
+                                        }
+                                    });
+                                if (tz as f32 - self.textmode_zoom).abs() > f32::EPSILON {
+                                    self.textmode_zoom = tz as f32;
+                                    // Reflect the change immediately on an already-open ANSI.
+                                    if self.viewing_textmode && !self.fit_mode {
+                                        self.zoom = self.textmode_zoom / ctx.pixels_per_point();
+                                    }
+                                }
+
+                                ui.add_space(10.0);
+                                ui.label("Show under thumbnails");
+                                let mut fields = self.caption_fields;
+                                ui.horizontal_wrapped(|ui| {
+                                    for &(mask, label) in CAPTION_FIELDS {
+                                        let mut on = fields & mask != 0;
+                                        if ui.checkbox(&mut on, label).changed() {
+                                            if on {
+                                                fields |= mask;
+                                            } else {
+                                                fields &= !mask;
+                                            }
+                                        }
+                                    }
+                                });
+                                self.caption_fields = fields;
+
+                                ui.add_space(10.0);
+                                ui.checkbox(&mut self.table_grid, "Table dividing lines")
+                                    .on_hover_text(
+                                        "Draw subtle row + column divider lines in the table view \
+                                         (in addition to the zebra striping)",
+                                    );
+                                ui.label("Table columns (file view)");
+                                let mut tcols = self.table_columns;
+                                ui.horizontal_wrapped(|ui| {
+                                    for &(mask, label) in TABLE_COLUMNS {
+                                        let mut on = tcols & mask != 0;
+                                        if ui.checkbox(&mut on, label).changed() {
+                                            if on {
+                                                tcols |= mask;
+                                            } else {
+                                                tcols &= !mask;
+                                            }
+                                        }
+                                    }
+                                });
+                                self.table_columns = tcols;
+
+                                ui.add_space(10.0);
+                                ui.label("Hotkeys");
+                                let mut new_rebind: Option<Option<Action>> = None;
+                                egui::Grid::new("prefs_keys")
+                                    .num_columns(3)
+                                    .spacing([10.0, 4.0])
+                                    .show(ui, |ui| {
+                                        for a in Action::ALL {
+                                            ui.label(a.label());
+                                            let cur = self
+                                                .keymap
+                                                .get(&a)
+                                                .copied()
+                                                .unwrap_or_else(|| a.default_key());
+                                            ui.strong(cur.symbol_or_name());
+                                            let waiting = self.rebinding == Some(a);
+                                            let btn = if waiting {
+                                                "press a key… (Esc cancels)"
+                                            } else {
+                                                "Rebind"
+                                            };
+                                            if ui.button(btn).clicked() {
+                                                new_rebind = Some(if waiting { None } else { Some(a) });
+                                            }
+                                            ui.end_row();
+                                        }
+                                    });
+                                if let Some(r) = new_rebind {
+                                    self.rebinding = r;
+                                }
+
+                                ui.add_space(10.0);
+                                ui.label("Viewer info OSD");
+                                ui.checkbox(&mut self.osd_enabled, "Show metadata overlay on open")
+                                    .on_hover_text("A fading panel with the piece's details");
+                                ui.add_enabled_ui(self.osd_enabled, |ui| {
+                                    ui.label("Position");
+                                    // A spatial 3×3 picker (center unused) — the button's place in the
+                                    // grid is where the OSD lands, so a corner is one click.
+                                    egui::Grid::new("osd_pos_grid")
+                                        .spacing([4.0, 4.0])
+                                        .show(ui, |ui| {
+                                            ui.selectable_value(&mut self.osd_position, 0, "Top L");
+                                            ui.selectable_value(&mut self.osd_position, 1, "Top");
+                                            ui.selectable_value(&mut self.osd_position, 2, "Top R");
+                                            ui.end_row();
+                                            ui.selectable_value(&mut self.osd_position, 3, "Left");
+                                            ui.label(""); // center: unused
+                                            ui.selectable_value(&mut self.osd_position, 4, "Right");
+                                            ui.end_row();
+                                            ui.selectable_value(&mut self.osd_position, 5, "Bot L");
+                                            ui.selectable_value(&mut self.osd_position, 6, "Bot");
+                                            ui.selectable_value(&mut self.osd_position, 7, "Bot R");
+                                            ui.end_row();
+                                        });
+                                    ui.add(
+                                        egui::Slider::new(&mut self.osd_secs, 0.5..=15.0)
+                                            .suffix(" s")
+                                            .text("Hold"),
+                                    )
+                                    .on_hover_text("How long it stays before fading out");
+                                });
+
+                                ui.add_space(10.0);
+                                // ── right column (same column as the left when collapsed to 1) ──
+                                let ui = &mut cols[ncols - 1];
+                                ui.label("Format plugins");
+                                ui.weak("Turn off a file type you don't want the viewer to handle.");
+                                let mut plug_changed = false;
+                                plug_changed |= ui
+                                    .checkbox(&mut self.plugin_code, "Source code / text")
+                                    .on_hover_text("Syntax-highlighted source & text files (.rs, .py, .md …)")
+                                    .changed();
+                                plug_changed |= ui
+                                    .checkbox(&mut self.plugin_pdf, "PDF")
+                                    .on_hover_text("PDF page thumbnail + page/title/author info")
+                                    .changed();
+                                plug_changed |= ui
+                                    .checkbox(&mut self.plugin_audio, "Audio")
+                                    .on_hover_text("Audio waveform + metadata + in-app preview")
+                                    .changed();
+                                if plug_changed {
+                                    self.registry.set_plugin("code", self.plugin_code);
+                                    self.registry.set_plugin("pdf", self.plugin_pdf);
+                                    self.registry.set_plugin("audio", self.plugin_audio);
+                                    prefs_refresh = true; // re-scan so the listing adds/drops those types
+                                }
+
+                                // MIDI needs a General MIDI SoundFont to synthesize .mid files into audio.
+                                if self.plugin_audio {
+                                    ui.add_space(8.0);
+                                    ui.label("MIDI SoundFont");
+                                    let auto = self.midi_soundfont();
+                                    let shown = match (&self.midi_sf, &auto) {
+                                        (Some(p), _) if p.is_file() => short_name(p),
+                                        (_, Some(p)) => format!("auto: {}", short_name(p)),
+                                        _ => "none found — .mid files won't play".to_string(),
+                                    };
+                                    ui.weak(format!("Synthesizes .mid files · {shown}"));
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Choose .sf2…").clicked() {
+                                            if let Some(p) = rfd::FileDialog::new()
+                                                .add_filter("SoundFont", &["sf2"])
+                                                .pick_file()
+                                            {
+                                                self.midi_sf = Some(p);
+                                                self.midi_sf_cache = None; // reload the new SF
+                                                self.audio_decode_cache.clear(); // re-render with it
+                                                self.status = "MIDI SoundFont set".into();
+                                            }
+                                        }
+                                        if self.midi_sf.is_some()
+                                            && ui
+                                                .button("Auto")
+                                                .on_hover_text("Auto-detect a system General MIDI SoundFont")
+                                                .clicked()
+                                        {
+                                            self.midi_sf = None;
+                                            self.midi_sf_cache = None;
+                                            self.audio_decode_cache.clear();
+                                        }
+                                    });
+                                }
+
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    ui.label("Format colors");
+                                    if ui
+                                        .small_button("Reset")
+                                        .on_hover_text("Restore the default per-format colors")
+                                        .clicked()
+                                    {
+                                        reset_colors = true;
+                                    }
+                                });
+                                ui.weak("Accent color for each format's tile / waveform / badge.");
+                                let mut changed_color: Option<(&str, [u8; 3])> = None;
+                                egui::Grid::new("format_colors_grid")
+                                    .spacing([14.0, 4.0])
+                                    .show(ui, |ui| {
+                                        for (i, (ext, label)) in
+                                            crate::format_color::EDITABLE.iter().enumerate()
+                                        {
+                                            let mut rgb = crate::format_color::color(ext);
+                                            if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                                changed_color = Some((ext, rgb));
+                                            }
+                                            ui.label(*label);
+                                            if i % 2 == 1 {
+                                                ui.end_row();
+                                            }
+                                        }
+                                    });
+                                if let Some((ext, rgb)) = changed_color {
+                                    color_change = Some((ext.to_string(), rgb));
+                                }
+
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut self.tile_bg_enabled, "Tile backgrounds");
+                                    if ui
+                                        .small_button("Reset")
+                                        .on_hover_text("Restore the default folder / archive / container tints")
+                                        .clicked()
+                                    {
+                                        let (df, da, dc) = Self::TILE_BG_DEFAULTS;
+                                        self.tile_bg_folder = df;
+                                        self.tile_bg_archive = da;
+                                        self.tile_bg_container = dc;
+                                    }
+                                });
+                                ui.weak("A subtle accent behind folder / archive / sample-bank tiles in the grid.");
+                                ui.add_enabled_ui(self.tile_bg_enabled, |ui| {
+                                    egui::Grid::new("tile_bg_grid").spacing([14.0, 4.0]).show(ui, |ui| {
+                                        ui.color_edit_button_srgb(&mut self.tile_bg_folder);
+                                        ui.label("Folders");
+                                        ui.end_row();
+                                        ui.color_edit_button_srgb(&mut self.tile_bg_archive);
+                                        ui.label("Archives (.zip/.lha/…)");
+                                        ui.end_row();
+                                        ui.color_edit_button_srgb(&mut self.tile_bg_container);
+                                        ui.label("Containers (.sf2/.sfz/.dls/.xi)");
+                                        ui.end_row();
+                                    });
+                                });
+
+                                ui.add_space(10.0);
+                                ui.label("16colo.rs cache");
+                                let (bytes, count) = crate::cache::stats();
+                                ui.horizontal(|ui| {
+                                    ui.weak(format!(
+                                        "{} · {count} items",
+                                        human_size(bytes.max(0) as u64)
+                                    ));
+                                    if ui
+                                        .button("Clear cache")
+                                        .on_hover_text(
+                                            "Delete all cached 16colo.rs JSON, thumbnails, files and \
+                                             pack zips (they'll re-download on demand)",
+                                        )
+                                        .clicked()
+                                    {
+                                        crate::cache::clear();
+                                        self.status = "Cache cleared".into();
+                                    }
+                                });
                             });
-                        ui.add(
-                            egui::Slider::new(&mut self.osd_secs, 0.5..=15.0)
-                                .suffix(" s")
-                                .text("Hold"),
-                        )
-                        .on_hover_text("How long it stays before fading out");
-                    });
-
-                    ui.add_space(10.0);
-                    ui.label("Format plugins");
-                    ui.weak("Turn off a file type you don't want the viewer to handle.");
-                    let mut plug_changed = false;
-                    plug_changed |= ui
-                        .checkbox(&mut self.plugin_code, "Source code / text")
-                        .on_hover_text("Syntax-highlighted source & text files (.rs, .py, .md …)")
-                        .changed();
-                    plug_changed |= ui
-                        .checkbox(&mut self.plugin_pdf, "PDF")
-                        .on_hover_text("PDF page thumbnail + page/title/author info")
-                        .changed();
-                    plug_changed |= ui
-                        .checkbox(&mut self.plugin_audio, "Audio")
-                        .on_hover_text("Audio waveform + metadata + in-app preview")
-                        .changed();
-                    if plug_changed {
-                        self.registry.set_plugin("code", self.plugin_code);
-                        self.registry.set_plugin("pdf", self.plugin_pdf);
-                        self.registry.set_plugin("audio", self.plugin_audio);
-                        prefs_refresh = true; // re-scan so the listing adds/drops those types
-                    }
-
-                    // MIDI needs a General MIDI SoundFont to synthesize .mid files into audio.
-                    if self.plugin_audio {
-                        ui.add_space(8.0);
-                        ui.label("MIDI SoundFont");
-                        let auto = self.midi_soundfont();
-                        let shown = match (&self.midi_sf, &auto) {
-                            (Some(p), _) if p.is_file() => short_name(p),
-                            (_, Some(p)) => format!("auto: {}", short_name(p)),
-                            _ => "none found — .mid files won't play".to_string(),
-                        };
-                        ui.weak(format!("Synthesizes .mid files · {shown}"));
-                        ui.horizontal(|ui| {
-                            if ui.button("Choose .sf2…").clicked() {
-                                if let Some(p) = rfd::FileDialog::new()
-                                    .add_filter("SoundFont", &["sf2"])
-                                    .pick_file()
-                                {
-                                    self.midi_sf = Some(p);
-                                    self.midi_sf_cache = None; // reload the new SF
-                                    self.audio_decode_cache.clear(); // re-render with it
-                                    self.status = "MIDI SoundFont set".into();
-                                }
-                            }
-                            if self.midi_sf.is_some()
-                                && ui
-                                    .button("Auto")
-                                    .on_hover_text("Auto-detect a system General MIDI SoundFont")
-                                    .clicked()
-                            {
-                                self.midi_sf = None;
-                                self.midi_sf_cache = None;
-                                self.audio_decode_cache.clear();
-                            }
                         });
-                    }
-
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Format colors");
-                        if ui
-                            .small_button("Reset")
-                            .on_hover_text("Restore the default per-format colors")
-                            .clicked()
-                        {
-                            reset_colors = true;
-                        }
-                    });
-                    ui.weak("Accent color for each format's tile / waveform / badge.");
-                    let mut changed_color: Option<(&str, [u8; 3])> = None;
-                    egui::Grid::new("format_colors_grid")
-                        .spacing([14.0, 4.0])
-                        .show(ui, |ui| {
-                            for (i, (ext, label)) in
-                                crate::format_color::EDITABLE.iter().enumerate()
-                            {
-                                let mut rgb = crate::format_color::color(ext);
-                                if ui.color_edit_button_srgb(&mut rgb).changed() {
-                                    changed_color = Some((ext, rgb));
-                                }
-                                ui.label(*label);
-                                if i % 2 == 1 {
-                                    ui.end_row();
-                                }
-                            }
-                        });
-                    if let Some((ext, rgb)) = changed_color {
-                        color_change = Some((ext.to_string(), rgb));
-                    }
-
-                    ui.add_space(10.0);
-                    ui.label("16colo.rs cache");
-                    let (bytes, count) = crate::cache::stats();
-                    ui.horizontal(|ui| {
-                        ui.weak(format!(
-                            "{} · {count} items",
-                            human_size(bytes.max(0) as u64)
-                        ));
-                        if ui
-                            .button("Clear cache")
-                            .on_hover_text(
-                                "Delete all cached 16colo.rs JSON, thumbnails, files and \
-                                 pack zips (they'll re-download on demand)",
-                            )
-                            .clicked()
-                        {
-                            crate::cache::clear();
-                            self.status = "Cache cleared".into();
-                        }
-                    });
                 });
             self.show_prefs = open;
             if prefs_refresh {
@@ -11519,6 +12863,15 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
         eframe::set_value(storage, Self::AUDIO_VOLUME_KEY, &self.audio_volume);
         eframe::set_value(storage, Self::AUDIO_MUTED_KEY, &self.audio_muted);
+        // Sample-pad kit metadata (audio is written through to `<data>/pads/*.wav` on load/clear).
+        let pad_rows: Vec<Vec<String>> = self.pads.iter().map(|p| p.record()).collect();
+        eframe::set_value(storage, Self::PADS_KEY, &pad_rows);
+        eframe::set_value(storage, Self::KIT_NAME_KEY, &self.kit_name);
+        eframe::set_value(storage, Self::OCTAVE_LOCK_KEY, &self.octave_lock);
+        eframe::set_value(storage, Self::PAD_BASE_KEY, &self.pad_base_note);
+        eframe::set_value(storage, Self::AUDIO_LEFT_W_KEY, &self.audio_left_w);
+        eframe::set_value(storage, Self::AUDIO_WAVE_H_KEY, &self.audio_wave_h);
+        eframe::set_value(storage, Self::AUDIO_KB_H_KEY, &self.audio_kb_h);
         eframe::set_value(
             storage,
             Self::MIDI_PORT_KEY,
@@ -11558,6 +12911,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::MIN_RATING, &self.min_rating);
         eframe::set_value(storage, Self::EXPLORER_KEY, &self.show_explorer);
         eframe::set_value(storage, Self::DETAILS_KEY, &self.show_details);
+        eframe::set_value(storage, Self::TITLE_PATH_KEY, &self.title_show_path);
         eframe::set_value(storage, Self::RECOLOR_KEY, &self.show_recolor);
         eframe::set_value(storage, Self::RECOLOR_GRID_KEY, &self.recolor_grid);
         eframe::set_value(storage, Self::FIT_MODE_KEY, &self.fit_mode);
@@ -11596,6 +12950,18 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::GAP_KEY, &self.grid_gap);
         eframe::set_value(storage, Self::GAP_Y_KEY, &self.grid_gap_y);
         eframe::set_value(storage, Self::CAPTION_KEY, &self.caption_fields);
+        eframe::set_value(storage, Self::DETAILS_THUMB_H_KEY, &self.details_thumb_h);
+        eframe::set_value(storage, Self::RECOLOR_THUMB_H_KEY, &self.recolor_thumb_h);
+        eframe::set_value(
+            storage,
+            Self::TILE_BG_KEY,
+            &(
+                self.tile_bg_enabled,
+                self.tile_bg_folder,
+                self.tile_bg_archive,
+                self.tile_bg_container,
+            ),
+        );
         eframe::set_value(storage, Self::QUANT_ON_KEY, &self.quantize_on);
         eframe::set_value(storage, Self::QUANT_N_KEY, &self.quantize_n);
         eframe::set_value(storage, Self::DITHER_METHOD_KEY, &self.dither_method);
@@ -11801,6 +13167,41 @@ fn contrast_text(c: [u8; 3]) -> egui::Color32 {
         egui::Color32::BLACK
     } else {
         egui::Color32::WHITE
+    }
+}
+
+/// Blend `base` a fraction `t` (0..1) toward the sRGB accent `accent`. A cheap linear mix in
+/// gamma space — plenty for a subtle tile-background tint (see `tile_category_bg`).
+fn blend_toward(base: egui::Color32, accent: [u8; 3], t: f32) -> egui::Color32 {
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round().clamp(0.0, 255.0) as u8;
+    egui::Color32::from_rgb(
+        mix(base.r(), accent[0]),
+        mix(base.g(), accent[1]),
+        mix(base.b(), accent[2]),
+    )
+}
+
+/// A full-width horizontal drag handle (a row of dots) for resizing the region above it. Returns
+/// the vertical drag delta this frame (0 when idle); the caller adds it to the region's height.
+fn drag_h_divider(ui: &mut egui::Ui, width: f32) -> f32 {
+    let (bar, resp) = ui.allocate_exact_size(egui::vec2(width.max(1.0), 8.0), egui::Sense::drag());
+    let active = resp.hovered() || resp.dragged();
+    let c = if active {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    for dx in [-16.0, -8.0, 0.0, 8.0, 16.0] {
+        ui.painter()
+            .circle_filled(bar.center() + egui::vec2(dx, 0.0), 1.3, c);
+    }
+    if active {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    if resp.dragged() {
+        resp.drag_delta().y
+    } else {
+        0.0
     }
 }
 
@@ -13297,6 +14698,217 @@ struct NamedSample {
     buf: SampleBuf,
 }
 
+/// One slot in the 4×4 sample-pad grid (a mini Battery). Holds a loaded sample (shared via
+/// `Arc` so triggering a voice + drawing the VU don't deep-copy the audio), an optional MIDI
+/// note to trigger it, and per-pad mix state. The kit persists across restarts and can be
+/// saved/loaded as a named `.pvkit` file — see `Pad::record`/`from_record` + the pads WAV dir.
+#[derive(Clone)]
+struct Pad {
+    name: String,                        // display label ("" when empty)
+    buf: Option<std::sync::Arc<SampleBuf>>, // the loaded audio (None = empty slot)
+    note: Option<i32>,                   // assigned absolute MIDI note (60 = native pitch)
+    volume: f32,                         // per-pad gain 0..1
+    muted: bool,
+    soloed: bool,
+    // Per-pad playback shaping, set in the drill-in editor + saved with the pad/kit:
+    pitch: i32,       // semitone offset applied on trigger (0 = native; ±12 = ±octave)
+    loop_on: bool,    // loop the region while held/until stopped (vs. a one-shot hit)
+    loop_start: f32,  // loop region start (seconds within the sample)
+    loop_end: f32,    // loop region end (seconds; ≤ start ⇒ the whole sample)
+    loop_type: u8,    // playback direction: 0 = forward, 1 = reverse, 2 = ping-pong
+    flash_t: f32,     // ctx time of the last trigger (green flash); transient
+}
+
+/// Human-readable names for `Pad::loop_type` (indexed by the stored value).
+const LOOP_TYPES: [&str; 3] = ["Forward", "Reverse", "Ping-pong"];
+
+/// What the main waveform/transport editor is pointed at. Normally the loaded song / a tracker
+/// sample; a pad "drill-in" (the ⇱/`e` button) temporarily focuses it on a pad so you can set
+/// that pad's loop region + pitch + loop-type, with **Back** restoring the previous focus.
+#[derive(Clone, Copy, PartialEq)]
+enum EditFocus {
+    Song,
+    Sample(usize),
+    Pad(usize),
+}
+
+/// The editor state stashed while drilled into a pad, restored on Back.
+struct EditorStash {
+    buf: SampleBuf,
+    active_sample: Option<usize>,
+    song_backup: Option<SampleBuf>,
+    focus: EditFocus,
+    octave: i32, // the keyboard octave to restore on Back (unless the octave is locked)
+}
+
+impl Pad {
+    fn empty() -> Self {
+        Pad {
+            name: String::new(),
+            buf: None,
+            note: None,
+            volume: 1.0,
+            muted: false,
+            soloed: false,
+            pitch: 0,
+            loop_on: false,
+            loop_start: 0.0,
+            loop_end: 0.0,
+            loop_type: 0,
+            flash_t: -1.0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.buf.is_none()
+    }
+
+    /// The `(start, end)` loop region in seconds, resolved against the sample duration
+    /// (`loop_end ≤ loop_start` ⇒ the whole sample). Used at trigger time.
+    fn loop_region(&self, dur: f32) -> (f32, f32) {
+        if self.loop_end > self.loop_start {
+            (self.loop_start.max(0.0), self.loop_end.min(dur))
+        } else {
+            (0.0, dur)
+        }
+    }
+
+    /// Persisted metadata row (audio lives in a sibling WAV, reloaded separately). New fields are
+    /// **appended** so older saved kits still load (`from_record` fills missing with defaults).
+    fn record(&self) -> Vec<String> {
+        vec![
+            if self.buf.is_some() { "1" } else { "0" }.to_string(),
+            self.name.clone(),
+            self.note.map(|n| n.to_string()).unwrap_or_default(),
+            format!("{}", self.volume),
+            if self.muted { "1" } else { "0" }.to_string(),
+            if self.soloed { "1" } else { "0" }.to_string(),
+            self.pitch.to_string(),
+            if self.loop_on { "1" } else { "0" }.to_string(),
+            format!("{}", self.loop_start),
+            format!("{}", self.loop_end),
+            self.loop_type.to_string(),
+        ]
+    }
+
+    /// Rebuild a pad's metadata from a record row (`buf` stays `None`; the caller reloads the
+    /// audio from the WAV). The `has_audio` flag (field 0) tells the caller whether to look.
+    fn from_record(r: &[String]) -> (Self, bool) {
+        let g = |i: usize| r.get(i).cloned().unwrap_or_default();
+        let has_audio = g(0) == "1";
+        let pad = Pad {
+            name: g(1),
+            buf: None,
+            note: g(2).parse().ok(),
+            volume: g(3).parse().unwrap_or(1.0),
+            muted: g(4) == "1",
+            soloed: g(5) == "1",
+            pitch: g(6).parse().unwrap_or(0),
+            loop_on: g(7) == "1",
+            loop_start: g(8).parse().unwrap_or(0.0),
+            loop_end: g(9).parse().unwrap_or(0.0),
+            loop_type: g(10).parse().unwrap_or(0),
+            flash_t: -1.0,
+        };
+        (pad, has_audio)
+    }
+}
+
+const PAD_COUNT: usize = 16;
+
+/// Reverse an interleaved buffer frame-by-frame (keeps channel order within each frame).
+fn reverse_frames(samples: &[f32], ch: usize) -> Vec<f32> {
+    let ch = ch.max(1);
+    let frames = samples.len() / ch;
+    let mut out = Vec::with_capacity(frames * ch);
+    for f in (0..frames).rev() {
+        out.extend_from_slice(&samples[f * ch..f * ch + ch]);
+    }
+    out
+}
+
+/// Build the playable sample vec for a pad hit: the `[start,end)` region of `buf` with its
+/// loop-type direction applied — forward as-is, reverse flipped, ping-pong = forward+reverse
+/// (so a repeating ping-pong voice bounces). Returns interleaved f32 at `buf`'s rate/channels.
+fn build_pad_region(buf: &SampleBuf, start: f32, end: f32, loop_type: u8) -> Vec<f32> {
+    let ch = buf.channels.get() as usize;
+    let sr = buf.sample_rate.get() as f32;
+    let n = buf.samples.len();
+    let s = (((start * sr) as usize) * ch).min(n);
+    let e = (((end * sr) as usize) * ch).min(n).max(s);
+    let fwd = &buf.samples[s..e];
+    match loop_type {
+        1 => reverse_frames(fwd, ch), // reverse
+        2 => {
+            let mut v = fwd.to_vec(); // ping-pong: forward then backward
+            v.extend(reverse_frames(fwd, ch));
+            v
+        }
+        _ => fwd.to_vec(), // forward
+    }
+}
+
+/// Solo/mute fold for a pad grid: a muted pad is silent; if ANY pad is soloed only soloed pads
+/// sound; otherwise every pad sounds. Free fn so it's testable without a `PixelView`.
+fn pad_is_audible(pads: &[Pad], i: usize) -> bool {
+    let Some(p) = pads.get(i) else {
+        return false;
+    };
+    if p.muted {
+        return false;
+    }
+    if pads.iter().any(|q| q.soloed) {
+        p.soloed
+    } else {
+        true
+    }
+}
+
+/// `<data_dir>/pads` — where the working kit's pad audio lives (one WAV per non-empty pad).
+fn pads_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("pads")
+}
+
+/// The WAV path backing working-kit pad `i` (`pad_00.wav` … `pad_15.wav`).
+fn pad_wav_path(data_dir: &Path, i: usize) -> PathBuf {
+    pads_dir(data_dir).join(format!("pad_{i:02}.wav"))
+}
+
+/// Decode a `.wav` (or any audio file) into a `SampleBuf`, reusing the app's device-free
+/// `decode_audio` — so reloading persisted pads needs no separate WAV reader. `None` on any error.
+fn decode_sample_buf(path: &Path) -> Option<SampleBuf> {
+    let bytes = std::fs::read(path).ok()?;
+    let d = decode_audio(path, bytes, None).ok()?;
+    Some(SampleBuf {
+        samples: d.samples,
+        channels: d.channels,
+        sample_rate: d.sample_rate,
+        duration: d.duration,
+        peaks: d.peaks,
+    })
+}
+
+/// Rebuild the working kit from persisted metadata rows + the pad WAVs under `data_dir`.
+/// Always returns exactly `PAD_COUNT` pads (missing/short rows → empty pads); an
+/// audio-flagged pad whose WAV won't decode reverts to empty.
+fn load_pad_kit(data_dir: &Path, rows: &[Vec<String>]) -> Vec<Pad> {
+    (0..PAD_COUNT)
+        .map(|i| match rows.get(i) {
+            Some(row) => {
+                let (mut pad, has_audio) = Pad::from_record(row);
+                if has_audio {
+                    match decode_sample_buf(&pad_wav_path(data_dir, i)) {
+                        Some(buf) => pad.buf = Some(std::sync::Arc::new(buf)),
+                        None => pad.name.clear(), // audio gone → treat as empty
+                    }
+                }
+                pad
+            }
+            None => Pad::empty(),
+        })
+        .collect()
+}
+
 /// The **CPU-decoded** audio data for a file — the expensive part (tracker synthesis via
 /// `xmrs`, or PCM/compressed decode + peak analysis). Kept separate from the device-bound
 /// `AudioPlayer` so it can be **cached** (revisiting a file — especially a tracker, which
@@ -13366,6 +14978,17 @@ struct AudioPlayer {
     tracker_samples: Vec<NamedSample>, // samples inside a tracker module (empty for PCM files)
     active_sample: Option<usize>,      // which tracker sample is loaded (None = the whole song)
     song_backup: Option<SampleBuf>,    // the song buffer, stashed while a sample is auditioned
+    pad_voices: Vec<PadVoice>,         // concurrent one-shot pad hits on the shared mixer (polyphonic)
+}
+
+/// One live, concurrent sample-pad voice. Unlike the monophonic `AudioPlayer::player` (which is
+/// overwritten each hit), pad voices are all connected to the same `_stream.mixer()` and summed,
+/// so several pads can sound at once. `buf` is shared with the `Pad` (Arc) for cheap VU reads.
+struct PadVoice {
+    pad: usize,
+    player: rodio::Player,
+    buf: std::sync::Arc<SampleBuf>,
+    speed: f32, // pitch ratio (2^(semitone/12)) — the voice advances this much faster than wall time
 }
 
 impl AudioPlayer {
@@ -13403,6 +15026,7 @@ impl AudioPlayer {
             tracker_samples: d.tracker_samples,
             active_sample: None,
             song_backup: None,
+            pad_voices: Vec::new(),
         })
     }
 
@@ -13477,21 +15101,98 @@ impl AudioPlayer {
         self.play_source(false);
     }
 
-    /// Audition the selected region at a musical pitch: `semitone` semitones from its native
-    /// pitch (0 = as-recorded), played once (a one-shot instrument key). rodio's `speed`
-    /// resamples, so it shifts pitch *and* tempo — the expected sampler behavior.
-    fn play_note(&mut self, semitone: i32) {
-        self.play_note_vel(semitone, 127);
-    }
-
-    /// Like [`play_note`], but scale the gain by MIDI `velocity` (0..127) on top of the master
-    /// volume — so a hardware controller's dynamics come through. Monophonic (each key replaces
+    /// Audition the selected region at a musical pitch: `semitone` semitones from native (0 =
+    /// as-recorded), scaled by MIDI `velocity` (0..127) on top of the master volume. rodio's
+    /// `speed` resamples, so it shifts pitch *and* tempo — the expected sampler behavior.
+    /// Monophonic (each key replaces
     /// the last), which is exactly the "key preview" behavior.
     fn play_note_vel(&mut self, semitone: i32, velocity: u8) {
         self.play_speed = 2.0f32.powf(semitone as f32 / 12.0);
         self.play_source(true);
         let v = (velocity as f32 / 127.0).clamp(0.0, 1.0);
         self.player.set_volume(self.effective_volume() * v);
+    }
+
+    /// Fire a **concurrent** pad voice on the shared mixer (does NOT touch `self.player`), so
+    /// multiple pads can sound at once. `region` is the pre-built playable buffer (loop-type
+    /// direction already applied); `loop_it` repeats it forever (a looping pad replaces its own
+    /// prior voice so it can't stack). `gain` is the fully-resolved level (master · per-pad ·
+    /// solo/mute · velocity). `buf` (Arc, shared with the `Pad`) is kept for the VU meter.
+    fn trigger_pad_voice(
+        &mut self,
+        pad: usize,
+        buf: std::sync::Arc<SampleBuf>,
+        region: Vec<rodio::Sample>,
+        semitone: i32,
+        gain: f32,
+        loop_it: bool,
+    ) {
+        use rodio::Source;
+        let speed = 2.0f32.powf(semitone as f32 / 12.0);
+        let src = rodio::buffer::SamplesBuffer::new(buf.channels, buf.sample_rate, region).speed(speed);
+        let player = rodio::Player::connect_new(self._stream.mixer());
+        player.set_volume(gain);
+        if loop_it {
+            self.pad_voices.retain(|v| v.pad != pad); // a looping pad is monophonic (no stacking)
+            player.append(src.repeat_infinite());
+        } else {
+            player.append(src);
+        }
+        player.play();
+        self.pad_voices.push(PadVoice {
+            pad,
+            player,
+            buf,
+            speed,
+        });
+    }
+
+    /// Drop finished pad voices (call once per frame; bounds the Vec + frees rodio players).
+    fn reap_pad_voices(&mut self) {
+        self.pad_voices.retain(|v| !v.player.empty());
+    }
+
+    /// Peak level (0..1) per pad from its live voice(s), for the 16 VU meters — mirrors
+    /// `current_level`: a ~20 ms window around each voice's (pitch-scaled) playhead.
+    fn pad_levels(&self) -> [f32; PAD_COUNT] {
+        let mut out = [0f32; PAD_COUNT];
+        for v in &self.pad_voices {
+            if v.pad >= PAD_COUNT || v.player.is_paused() || v.player.empty() {
+                continue;
+            }
+            let ch = v.buf.channels.get() as usize;
+            let sr = v.buf.sample_rate.get() as f32;
+            let n = v.buf.samples.len();
+            let center = ((v.player.get_pos().as_secs_f32() * v.speed * sr) as usize).saturating_mul(ch);
+            let half = (sr as usize / 100).saturating_mul(ch); // ~10 ms each side
+            let s = center.saturating_sub(half).min(n);
+            let e = (center + half).min(n);
+            let peak = v.buf.samples[s..e].iter().fold(0f32, |m, &x| m.max(x.abs())).min(1.0);
+            out[v.pad] = out[v.pad].max(peak);
+        }
+        out
+    }
+
+    /// A `SampleBuf` of the current editor selection (or the whole buffer when no sub-region is
+    /// set) — what the pad "load" (⟲) button captures. Region math mirrors `play_source`.
+    fn current_region_buf(&self) -> SampleBuf {
+        let ch = self.channels.get() as usize;
+        let sr = self.sample_rate.get() as f32;
+        let n = self.samples.len();
+        let start = self.sel_start.clamp(0.0, self.duration);
+        let end = self.sel_end.clamp(start, self.duration);
+        let s = (((start * sr) as usize) * ch).min(n);
+        let e = (((end * sr) as usize) * ch).min(n).max(s);
+        let region: Vec<rodio::Sample> = self.samples[s..e].to_vec();
+        let duration = (region.len() / ch.max(1)) as f32 / sr;
+        let peaks = compute_peaks(&region, ch, 512);
+        SampleBuf {
+            samples: region,
+            channels: self.channels,
+            sample_rate: self.sample_rate,
+            duration,
+            peaks,
+        }
     }
 
     /// Build a fresh player for the current region at `self.play_speed`; `one_shot` overrides
@@ -13615,6 +15316,13 @@ fn is_pdf_path(p: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
 }
 
+/// Is `p` a saved sample-pad kit (`.pvkit`)? Clicking one loads it into the pad grid.
+fn is_kit_ext(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("pvkit"))
+}
+
 /// Is `p` an audio file we can preview in-app (PCM via rodio/symphonia + trackers via xmrs)?
 fn is_audio_ext(p: &Path) -> bool {
     p.extension()
@@ -13715,6 +15423,7 @@ fn midi_input_port_names() -> Vec<String> {
 fn open_midi_port(
     name: &str,
     tx: std::sync::mpsc::Sender<MidiNoteEvent>,
+    ctx: egui::Context,
 ) -> Option<midir::MidiInputConnection<std::sync::mpsc::Sender<MidiNoteEvent>>> {
     let mut inp = midir::MidiInput::new("pixelview-midi-in").ok()?;
     inp.ignore(midir::Ignore::None);
@@ -13738,8 +15447,11 @@ fn open_midi_port(
                 0x80 | 0x90 => {
                     let _ = tx.send((note, vel, false)); // Note Off (or Note On vel 0)
                 }
-                _ => {}
+                _ => return,
             }
+            // Wake the UI thread so `poll_midi` runs this frame — else a note while idle waits
+            // for the next repaint (a mouse move). Cheap; only on an actual note event.
+            ctx.request_repaint();
         },
         tx,
     )
@@ -13944,13 +15656,9 @@ fn sample_pcm_mono(smp: &xmrs::core::sample::Sample) -> Vec<f32> {
 
 /// Write interleaved `f32` samples to a 16-bit PCM WAV file (no external crate) — used to
 /// export tracker / SoundFont samples. `channels`/`sample_rate` describe the interleaving.
-fn write_wav_16(
-    path: &Path,
-    samples: &[f32],
-    channels: u16,
-    sample_rate: u32,
-) -> std::io::Result<()> {
-    use std::io::Write;
+/// Encode interleaved f32 samples as a complete 16-bit PCM WAV file in memory. Shared by the
+/// on-disk writer (`write_wav_16`), the per-pad WAV download, and the `.pvkit` / zip export.
+fn wav_bytes_16(samples: &[f32], channels: u16, sample_rate: u32) -> Vec<u8> {
     let bits = 16u16;
     let block_align = channels * bits / 8;
     let byte_rate = sample_rate * block_align as u32;
@@ -13973,7 +15681,17 @@ fn write_wav_16(
         let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
         buf.extend_from_slice(&v.to_le_bytes());
     }
-    std::fs::File::create(path)?.write_all(&buf)
+    buf
+}
+
+fn write_wav_16(
+    path: &Path,
+    samples: &[f32],
+    channels: u16,
+    sample_rate: u32,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::File::create(path)?.write_all(&wav_bytes_16(samples, channels, sample_rate))
 }
 
 /// Lay two rendered pages side by side (a small gutter between), each top-aligned on a white
@@ -14004,63 +15722,88 @@ fn compose_side_by_side(
     crate::image_types::PixImage::from_rgba(w as u32, h as u32, px)
 }
 
-/// Draw one octave of piano keys and return the clicked semitone (0 = C … 11 = B, plus
-/// `octave`×12), or `None`. Black keys are drawn + hit-tested last so they win where they
-/// overlap the white keys beneath.
-fn piano_keyboard(ui: &mut egui::Ui, octave: i32, h: f32) -> Option<i32> {
+/// Draw an onscreen keyboard of **as many octaves as fit** at a comfortable key width (so a wide
+/// pane shows more octaves instead of stretching a single one), starting at `octave`. Returns the
+/// clicked semitone (`oct*12 + semi`, relative to native pitch), or `None`. `highlights` are
+/// `(semitone, color)` in that same relative space — a "lit" (played) key: red when routed to a
+/// pad, an accent color for a plain audition. Black keys are drawn/hit-tested last so they win.
+fn piano_keyboard(
+    ui: &mut egui::Ui,
+    octave: i32,
+    h: f32,
+    highlights: &[(i32, egui::Color32)],
+) -> Option<i32> {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
     let p = ui.painter_at(rect);
-    let ww = rect.width() / 7.0;
     let white = [0i32, 2, 4, 5, 7, 9, 11]; // C D E F G A B
     let names = ["C", "D", "E", "F", "G", "A", "B"];
-    // (semitone, white-key boundary the black key centers on)
+    // (semitone, white-key boundary the black key centers on, within an octave)
     let black = [(1i32, 1.0f32), (3, 2.0), (6, 4.0), (8, 5.0), (10, 6.0)];
-    let base = octave * 12;
+    // Fit whole octaves at ~34 px/white-key so the keys aren't stretched.
+    let n_oct = ((rect.width() / (7.0 * 34.0)).round() as i32).clamp(1, 11);
+    let ww = rect.width() / (7 * n_oct) as f32;
+    let lit = |semi: i32| highlights.iter().find(|(s, _)| *s == semi).map(|(_, c)| *c);
     let border = egui::Stroke::new(1.0, egui::Color32::from_gray(60));
     let mut picked = None;
-    for (i, &semi) in white.iter().enumerate() {
-        let kr = egui::Rect::from_min_size(
-            rect.left_top() + egui::vec2(i as f32 * ww, 0.0),
-            egui::vec2(ww, h),
-        );
-        let resp = ui.interact(
-            kr.shrink(1.0),
-            ui.id().with(("wk", i)),
-            egui::Sense::click(),
-        );
-        let fill = if resp.is_pointer_button_down_on() {
-            egui::Color32::from_rgb(150, 180, 235)
-        } else {
-            egui::Color32::from_rgb(238, 238, 244)
-        };
-        p.rect_filled(kr.shrink(1.0), 2.0, fill);
-        p.rect_stroke(kr.shrink(1.0), 2.0, border, egui::StrokeKind::Inside);
-        p.text(
-            kr.center_bottom() - egui::vec2(0.0, 3.0),
-            egui::Align2::CENTER_BOTTOM,
-            names[i],
-            egui::FontId::proportional(9.0),
-            egui::Color32::from_gray(95),
-        );
-        if resp.clicked() {
-            picked = Some(base + semi);
+    for oi in 0..n_oct {
+        let base = (octave + oi) * 12;
+        for (i, &semi) in white.iter().enumerate() {
+            let wi = oi * 7 + i as i32; // global white-key index
+            let kr = egui::Rect::from_min_size(
+                rect.left_top() + egui::vec2(wi as f32 * ww, 0.0),
+                egui::vec2(ww, h),
+            );
+            let resp = ui.interact(kr.shrink(1.0), ui.id().with(("wk", wi)), egui::Sense::click());
+            let fill = if let Some(c) = lit(base + semi) {
+                c
+            } else if resp.is_pointer_button_down_on() {
+                egui::Color32::from_rgb(150, 180, 235)
+            } else {
+                egui::Color32::from_rgb(238, 238, 244)
+            };
+            p.rect_filled(kr.shrink(1.0), 2.0, fill);
+            p.rect_stroke(kr.shrink(1.0), 2.0, border, egui::StrokeKind::Inside);
+            // Label C with its octave (a marker), the rest with just the letter.
+            let label = if i == 0 {
+                midi_note_name((base + semi + 60).clamp(0, 127) as u8)
+            } else {
+                names[i].to_string()
+            };
+            p.text(
+                kr.center_bottom() - egui::vec2(0.0, 3.0),
+                egui::Align2::CENTER_BOTTOM,
+                label,
+                egui::FontId::proportional(9.0),
+                egui::Color32::from_gray(95),
+            );
+            if resp.clicked() {
+                picked = Some(base + semi);
+            }
         }
     }
     let (bw, bh) = (ww * 0.62, h * 0.6);
-    for &(semi, bnd) in &black {
-        let cx = rect.left() + bnd * ww;
-        let kr =
-            egui::Rect::from_min_size(egui::pos2(cx - bw / 2.0, rect.top()), egui::vec2(bw, bh));
-        let resp = ui.interact(kr, ui.id().with(("bk", semi)), egui::Sense::click());
-        let fill = if resp.is_pointer_button_down_on() {
-            egui::Color32::from_rgb(90, 110, 160)
-        } else {
-            egui::Color32::from_rgb(26, 26, 32)
-        };
-        p.rect_filled(kr, 2.0, fill);
-        if resp.clicked() {
-            picked = Some(base + semi);
+    for oi in 0..n_oct {
+        let base = (octave + oi) * 12;
+        let oct_left = rect.left() + (oi * 7) as f32 * ww;
+        for &(semi, bnd) in &black {
+            let cx = oct_left + bnd * ww;
+            let kr = egui::Rect::from_min_size(
+                egui::pos2(cx - bw / 2.0, rect.top()),
+                egui::vec2(bw, bh),
+            );
+            let resp = ui.interact(kr, ui.id().with(("bk", oi * 12 + semi)), egui::Sense::click());
+            let fill = if let Some(c) = lit(base + semi) {
+                c
+            } else if resp.is_pointer_button_down_on() {
+                egui::Color32::from_rgb(90, 110, 160)
+            } else {
+                egui::Color32::from_rgb(26, 26, 32)
+            };
+            p.rect_filled(kr, 2.0, fill);
+            if resp.clicked() {
+                picked = Some(base + semi);
+            }
         }
     }
     picked
@@ -15550,6 +17293,85 @@ mod tests {
         assert_eq!(ansi32_palette().len(), 32);
         assert_eq!(contrast_text([255, 255, 255]), egui::Color32::BLACK);
         assert_eq!(contrast_text([0, 0, 0]), egui::Color32::WHITE);
+    }
+
+    #[test]
+    fn blend_toward_endpoints_and_midpoint() {
+        let base = egui::Color32::from_rgb(0, 0, 0);
+        let accent = [200, 100, 40];
+        // t=0 → base, t=1 → accent, and a subtle tint stays close to base.
+        assert_eq!(blend_toward(base, accent, 0.0), base);
+        assert_eq!(blend_toward(base, accent, 1.0), egui::Color32::from_rgb(200, 100, 40));
+        let subtle = blend_toward(base, accent, 0.25);
+        assert_eq!(subtle, egui::Color32::from_rgb(50, 25, 10));
+        // A light base tints toward the accent from the other side.
+        let light = blend_toward(egui::Color32::from_rgb(240, 240, 240), accent, 0.25);
+        assert_eq!(light, egui::Color32::from_rgb(230, 205, 190));
+    }
+
+    #[test]
+    fn pad_metadata_record_roundtrip() {
+        // record()/from_record() must survive a round-trip and tolerate short rows.
+        let p = Pad {
+            name: "kick".into(),
+            note: Some(48),
+            volume: 0.7,
+            muted: true,
+            pitch: -12,
+            loop_on: true,
+            loop_type: 2,
+            ..Pad::empty()
+        };
+        let (r, has_audio) = Pad::from_record(&p.record());
+        assert!(!has_audio); // buf was None → flag "0"
+        assert_eq!(r.name, "kick");
+        assert_eq!(r.note, Some(48));
+        assert!((r.volume - 0.7).abs() < 1e-6);
+        assert!(r.muted && !r.soloed);
+        assert_eq!(r.pitch, -12);
+        assert!(r.loop_on);
+        assert_eq!(r.loop_type, 2); // ping-pong survives the round-trip
+        // A short/garbage row degrades gracefully to sane defaults.
+        let (d, _) = Pad::from_record(&["1".to_string()]);
+        assert_eq!(d.note, None);
+        assert_eq!(d.volume, 1.0);
+    }
+
+    #[test]
+    fn pad_solo_mute_truth_table() {
+        let mk = |muted, soloed| Pad {
+            muted,
+            soloed,
+            ..Pad::empty()
+        };
+        // No solo anywhere → everything unmuted is audible.
+        let none = vec![mk(false, false), mk(true, false)];
+        assert!(pad_is_audible(&none, 0));
+        assert!(!pad_is_audible(&none, 1)); // muted
+        assert!(!pad_is_audible(&none, 9)); // out of range
+        // Any solo present → only soloed pads sound (even unmuted non-solo goes silent).
+        let solo = vec![mk(false, true), mk(false, false), mk(true, true)];
+        assert!(pad_is_audible(&solo, 0)); // soloed
+        assert!(!pad_is_audible(&solo, 1)); // not soloed while a solo is active
+        assert!(!pad_is_audible(&solo, 2)); // soloed but also muted → mute wins
+    }
+
+    #[test]
+    fn pad_wav_roundtrip_via_decode() {
+        // Discharges the "reload persisted pads without a WAV reader" risk: wav_bytes_16 →
+        // disk → decode_sample_buf (reusing decode_audio) must recover rate/channels/length.
+        let samples: Vec<f32> = (0..800)
+            .map(|i| ((i as f32) * 0.05).sin() * 0.5)
+            .collect();
+        let wav = wav_bytes_16(&samples, 1, 8000);
+        let path = std::env::temp_dir().join("pv_pad_roundtrip_test.wav");
+        std::fs::write(&path, &wav).unwrap();
+        let buf = decode_sample_buf(&path).expect("decode the WAV we just wrote");
+        assert_eq!(buf.channels.get(), 1);
+        assert_eq!(buf.sample_rate.get(), 8000);
+        // Decoded frame count should match (mono → one sample per input sample).
+        assert!((buf.samples.len() as i64 - samples.len() as i64).abs() <= 2);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

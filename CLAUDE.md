@@ -162,7 +162,7 @@ cargo build --release
 cargo check              # fast type-check during edits
 cargo clippy             # lint
 cargo fmt                # format
-cargo test               # 180 tests (170 unit + 10 headless egui_kittest GUI tests; +11 ignored network/real-trash)
+cargo test               # 198 tests (188 unit + 10 headless egui_kittest GUI tests; +11 ignored network/real-trash)
 cargo test gui_tests     # just the egui_kittest UI tests; cargo test <name> for one
 ```
 
@@ -844,12 +844,50 @@ held** (the "Full song" row reverts). `write_wav_16` is a tiny dependency-free 1
 **Hardware MIDI input (`midir`).** Pick a controller in the big player's "MIDI in:" combo
 (`midi_input_port_names` enumerates with a throwaway `MidiInput`; `open_midi_port` connects — the
 callback runs on **midir's own thread** and sends `(note, vel, on)` over an mpsc `Sender` passed as
-the callback's data). `poll_midi` (called each frame in `ui()`) drains the receiver and calls
-`AudioPlayer::play_note_vel(note − 60, vel)` — MIDI middle C = the sample's native pitch, velocity
-scales gain, Note Off ignored (monophonic one-shot "preview"). `midi_conn` **must be kept alive**
-(drop = close); `connect_midi(None)` closes it. The chosen device persists (`MIDI_PORT_KEY`) and
-auto-reconnects on launch when still present. midir's ALSA-seq backend links the **same
-`libasound2`** rodio already needs — no new system dep.
+the callback's data). `poll_midi(now)` (called each frame in `ui()`) drains the receiver and routes
+each note-on through **`route_note_on(note, vel, now)`** (see the sample-pad grid below): a note
+matching a loaded pad triggers that pad, otherwise it auditions the editor sample via
+`AudioPlayer::play_note_vel(note − 60, vel)` (MIDI middle C = native pitch, velocity scales gain,
+Note Off ignored — monophonic one-shot "preview"). `midi_conn` **must be kept alive** (drop =
+close); `connect_midi(None)` closes it. The chosen device persists (`MIDI_PORT_KEY`), auto-reconnects
+on launch when still present, and shows a **✓** in the big player's "MIDI in:" row when connected.
+The callback also calls **`ctx.request_repaint()`** (via a stored `egui_ctx` clone passed to
+`open_midi_port`) — otherwise a note while the UI is idle isn't drained by `poll_midi` until the next
+repaint (a mouse move), which reads as "MIDI doesn't play until I move the mouse". midir's ALSA-seq
+backend links the **same `libasound2`** rodio already needs — no new system dep.
+
+**Sample-pad grid (a mini Battery) + kits.** The big audio player (`draw_audio_controls(.., big=true)`)
+splits below the waveform into a **fully resizable** layout — draggable dividers (`drag_h_divider`)
+set the **waveform height** (`AUDIO_WAVE_H_KEY`) and **keyboard height** (`AUDIO_KB_H_KEY`), and a
+vertical divider sets the **sample-list pane width** (`AUDIO_LEFT_W_KEY`). The right column has a
+**multi-octave keyboard** (`piano_keyboard` fits as many whole octaves as the pane width allows at
+~34 px/white-key, C keys labeled by octave) above a **4×4 pad grid** (`draw_pad_grid`) that **fills
+the remaining vertical space** (`cell_w`/`cell_h` divide the pane's width/leftover height, so the 16
+pads fit the bottom exactly — the dividers reshape them). The big audio view is a
+`ScrollArea(auto_shrink=[false;2])` so `available_height()` is real. Side docks set `min_size` so a
+drag can't shrink them into a black sliver. A `Pad` (`pads: Vec<Pad>`, always
+16) holds `buf: Option<Arc<SampleBuf>>`, an assigned MIDI `note`, `volume`/`muted`/`soloed`, and
+per-pad **pitch / loop region / loop_on / loop_type (Forward/Reverse/Ping-pong)**. Pads **auto-map
+chromatically from a base note** (`pad_base_note`, default 48 = C3, a header dropdown); `pad_note(i)`
+= the individual override (MIDI-learn) or `base + i`. Per pad: ⟲ load (captures the current editor
+selection → `load_pad`, WAV write-through to `<data>/pads/pad_NN.wav`), **e** drill-in editor
+(`focus_pad`/`focus_back`: re-points the main waveform at the pad's sample so its loop/pitch/type are
+set on the big editor, restored on Back — via `take_buffer`/`put_buffer` + an `EditorStash`, gated by
+`EditFocus::{Song,Sample,Pad}`), 🎹 MIDI-learn (`pad_assign` → next note assigns), ⬇ WAV download,
+× clear, **M/S** (`pad_is_audible` folds mute + kit-wide solo), a volume slider, and a painted vertical
+**VU** (`pad_levels`). A pad is triggered by clicking it, or a matching note (onscreen/MIDI) via
+`route_note_on`; **`AudioPlayer::trigger_pad_voice`** fires each hit as its own `rodio::Player` on the
+**shared `_stream.mixer()`** (`pad_voices: Vec<PadVoice>`, reaped each frame) — the mixer sums them,
+so pads are **polyphonic** (the base player is monophonic). Feedback (the user's ask): every played
+note lights its keyboard key (`note_flash`) — **red** if it routes to a pad, an accent otherwise — and
+the triggered **pad flashes green**. **Octave lock** (`octave_lock`) keeps the keyboard octave across
+drill-ins. The whole kit is a **persistent cross-file working set** (metadata in `PADS_KEY`, audio in
+`<data>/pads/*.wav`, reloaded in `new()` via `decode_audio`), plus **named kits**: Save/Load + a name
+field save the kit as a `.pvkit` (a zip — `manifest.txt` storing the kit name + **MIDI controller +
+base/octave + every pad's record** + `pad_NN.wav`s; `save_kit`/`load_kit` via the `zip` crate). Saved
+kits live in `<data>/kits/` and are browsable via a **🎵 Kits** entry in the Places dock; a `.pvkit`
+file (shown with a KIT badge) **loads on click** (`is_kit_ext` → `load_kit`, not the viewer). All of
+it is gated on `self.plugin_audio`.
 
 **Sample banks as folders (`soundfont.rs` / `sfz.rs` / `dls.rs`).** A `.sf2`, `.sfz`, or `.dls`
 is a **virtual folder** of its samples. `is_sample_bank(path)` folds all three into the
@@ -1013,7 +1051,7 @@ than assuming a logic bug. Already hit and migrated for 0.34.3:
 
 ## Testing
 
-`cargo test` runs 180 tests, all headless (170 unit + 10 GUI; plus 11 `#[ignore]`
+`cargo test` runs 198 tests, all headless (188 unit + 10 GUI; plus 11 `#[ignore]`
 network / real-trash tests that hit the live 16colo.rs API or the system trash):
 - **Unit tests** (`#[cfg(test)] mod tests` per module): PCX decode + sniff,
   `Registry` dispatch (incl. a real PNG via the `image` crate), `make_thumb` /
@@ -1021,7 +1059,10 @@ network / real-trash tests that hit the live 16colo.rs API or the system trash):
   guarded xattr round-trip, `sorted_filtered_view` (the sort/filter logic,
   extracted from `rebuild_view` so it's testable without a `PixelView`), `sauce`
   (record + COMNT parsing), `sixteen` (JSON → pieces + URL `#`-encoding), the RIP
-  rasterizer (golden-scene guards), and `viewdb` round-trips.
+  rasterizer (golden-scene guards), `viewdb` round-trips, the `blend_toward` tile-bg
+  mix, and the sample-pad grid (`Pad::record`/`from_record` round-trip incl.
+  loop/pitch/type, `pad_is_audible` solo/mute truth table, and a `wav_bytes_16` →
+  `decode_audio` round-trip proving pad-WAV reload needs no separate reader).
 - **GUI tests** (`gui_tests` in `app.rs`, via the `egui_kittest` dev-dep with its
   `eframe` feature): `Harness::builder().build_eframe(|cc| PixelView::new(cc,
   CliArgs::default()))` boots the real app with no window and drives menus through
