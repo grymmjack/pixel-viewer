@@ -1102,6 +1102,8 @@ impl PixelView {
     const MIDI_PORT_KEY: &'static str = "midi_port";
     /// General MIDI SoundFont path for rendering `.mid` files ("" = auto-detect a system one).
     const MIDI_SF_KEY: &'static str = "midi_soundfont";
+    /// User-overridden per-format tile colors (`"ext r g b"` records; defaults omitted).
+    const FORMAT_COLORS_KEY: &'static str = "format_colors";
     /// Storage key for the last-opened folder (reopened on launch).
     const FOLDER_KEY: &'static str = "last_folder";
     /// Storage keys for sort & filter state.
@@ -1206,6 +1208,14 @@ impl PixelView {
             .and_then(|s| eframe::get_value::<String>(s, Self::MIDI_SF_KEY))
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
+        // Prime the per-format tile colors from the user's overrides — before any thumbnail
+        // decodes, since the off-thread thumbnailer reads the global color map.
+        if let Some(recs) = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Vec<String>>(s, Self::FORMAT_COLORS_KEY))
+        {
+            crate::format_color::apply_records(&recs);
+        }
         registry.set_plugin("pdf", plugin_pdf);
         registry.set_plugin("audio", plugin_audio);
         registry.set_plugin("code", plugin_code);
@@ -2396,6 +2406,42 @@ impl PixelView {
         }
     }
 
+    /// Apply a per-format tile color (to `ext` and its aliases, e.g. ogg→oga, mid→midi/kar/rmi)
+    /// and re-thumbnail audio files so their waveform/note tiles pick it up.
+    fn set_format_color(&mut self, ext: &str, rgb: [u8; 3]) {
+        let aliases = crate::format_color::aliases(ext);
+        if aliases.is_empty() {
+            crate::format_color::set(ext, rgb);
+        } else {
+            for a in aliases {
+                crate::format_color::set(a, rgb);
+            }
+        }
+        self.rethumbnail_audio();
+    }
+
+    /// Reset every format tile color to its built-in default.
+    fn reset_format_colors(&mut self) {
+        crate::format_color::reset_all();
+        self.rethumbnail_audio();
+    }
+
+    /// Drop cached audio thumbnails so they re-decode with the current format colors.
+    fn rethumbnail_audio(&mut self) {
+        let keys: Vec<PathBuf> = self
+            .thumb_tex
+            .keys()
+            .filter(|p| is_audio_ext(p))
+            .cloned()
+            .collect();
+        for k in keys {
+            self.thumb_tex.remove(&k);
+            self.thumb_rgba.remove(&k);
+            self.thumbs.forget(&k);
+        }
+        self.want_repaint = true;
+    }
+
     /// Toggle master mute and push it to the live player immediately.
     fn toggle_audio_mute(&mut self) {
         self.audio_muted = !self.audio_muted;
@@ -2802,6 +2848,10 @@ impl PixelView {
                 0.0,
                 egui::Color32::from_rgba_unmultiplied(88, 196, 172, 34),
             );
+            // Waveform tinted by the file's format accent color (configurable in Preferences).
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let accent = crate::format_color::color32(ext);
+            let accent_dim = accent.gamma_multiply(0.5);
             let mid = rect.center().y;
             // Faint center baseline so near-silent stretches still read as a continuous
             // waveform (like the thumbnail), instead of dropping out to the background. The
@@ -2809,7 +2859,7 @@ impl PixelView {
             p.hline(
                 rect.x_range(),
                 mid,
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 74, 68)),
+                egui::Stroke::new(1.0, accent.gamma_multiply(0.32)),
             );
             let cols = w as usize;
             let n = ap.peaks.len().max(1);
@@ -2821,9 +2871,9 @@ impl PixelView {
                 let x = rect.left() + cx as f32;
                 let t = (cx as f32 / w) * dur;
                 let col = if t >= sel_lo && t <= sel_hi {
-                    egui::Color32::from_rgb(120, 220, 190)
+                    accent
                 } else {
-                    egui::Color32::from_rgb(66, 104, 96)
+                    accent_dim
                 };
                 p.line_segment(
                     [egui::pos2(x, mid - half), egui::pos2(x, mid + half)],
@@ -6834,25 +6884,14 @@ impl PixelView {
                                 egui::FontId::proportional(tile * 0.42),
                                 ui.visuals().text_color(),
                             );
-                            let fmt = path
-                                .extension()
-                                .and_then(|e| e.to_str())
-                                .unwrap_or("")
-                                .to_ascii_uppercase();
-                            if !fmt.is_empty() {
-                                let p = ui.painter_at(rect);
-                                let pos = rect.left_top() + egui::vec2(5.0, 4.0);
-                                let galley = p.layout_no_wrap(
-                                    fmt,
-                                    egui::FontId::proportional(11.0),
-                                    egui::Color32::WHITE,
+                            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                            if !ext.is_empty() {
+                                paint_format_badge(
+                                    &ui.painter_at(rect),
+                                    rect.left_top() + egui::vec2(5.0, 4.0),
+                                    ext,
+                                    crate::format_color::color32(ext),
                                 );
-                                p.rect_filled(
-                                    egui::Rect::from_min_size(pos, galley.size()).expand(2.0),
-                                    3.0,
-                                    egui::Color32::from_rgba_unmultiplied(90, 78, 30, 210),
-                                );
-                                p.galley(pos, galley, egui::Color32::WHITE);
                             }
                         } else if self.hover_anim.as_ref().is_some_and(|a| &a.path == path) {
                             // Play the hovered GIF in its own tile.
@@ -7652,16 +7691,16 @@ impl PixelView {
                                     fg,
                                 );
                                 if entry.is_archive {
-                                    let fmt = entry
+                                    let ext = entry
                                         .path
                                         .extension()
                                         .and_then(|e| e.to_str())
-                                        .unwrap_or("")
-                                        .to_ascii_uppercase();
-                                    if !fmt.is_empty() {
+                                        .unwrap_or("");
+                                    if !ext.is_empty() {
+                                        let accent = crate::format_color::color32(ext);
                                         let p = ui.painter_at(rect);
                                         let galley = p.layout_no_wrap(
-                                            fmt,
+                                            ext.to_ascii_uppercase(),
                                             egui::FontId::proportional(8.0),
                                             egui::Color32::WHITE,
                                         );
@@ -7669,13 +7708,19 @@ impl PixelView {
                                             rect.center().x - galley.size().x * 0.5,
                                             rect.bottom() - galley.size().y - 3.0,
                                         );
+                                        let bg = egui::Color32::from_rgba_unmultiplied(
+                                            (accent.r() as f32 * 0.35) as u8,
+                                            (accent.g() as f32 * 0.35) as u8,
+                                            (accent.b() as f32 * 0.35) as u8,
+                                            220,
+                                        );
                                         p.rect_filled(
                                             egui::Rect::from_min_size(pos, galley.size())
                                                 .expand(2.0),
                                             2.0,
-                                            egui::Color32::from_rgba_unmultiplied(90, 78, 30, 210),
+                                            bg,
                                         );
-                                        p.galley(pos, galley, egui::Color32::WHITE);
+                                        p.galley(pos, galley, accent.gamma_multiply(1.4));
                                     }
                                 }
                             } else if let Some(tex) = &tex {
@@ -11045,6 +11090,8 @@ impl eframe::App for PixelView {
         if self.show_prefs {
             let mut open = true;
             let mut prefs_refresh = false; // a plugin toggle → re-scan the folder after
+            let mut color_change: Option<(String, [u8; 3])> = None; // a format-color edit
+            let mut reset_colors = false; // "Reset" the format colors
             egui::Window::new("Preferences")
                 .open(&mut open)
                 .collapsible(false)
@@ -11260,6 +11307,39 @@ impl eframe::App for PixelView {
                     }
 
                     ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Format colors");
+                        if ui
+                            .small_button("Reset")
+                            .on_hover_text("Restore the default per-format colors")
+                            .clicked()
+                        {
+                            reset_colors = true;
+                        }
+                    });
+                    ui.weak("Accent color for each format's tile / waveform / badge.");
+                    let mut changed_color: Option<(&str, [u8; 3])> = None;
+                    egui::Grid::new("format_colors_grid")
+                        .spacing([14.0, 4.0])
+                        .show(ui, |ui| {
+                            for (i, (ext, label)) in
+                                crate::format_color::EDITABLE.iter().enumerate()
+                            {
+                                let mut rgb = crate::format_color::color(ext);
+                                if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                    changed_color = Some((ext, rgb));
+                                }
+                                ui.label(*label);
+                                if i % 2 == 1 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                    if let Some((ext, rgb)) = changed_color {
+                        color_change = Some((ext.to_string(), rgb));
+                    }
+
+                    ui.add_space(10.0);
                     ui.label("16colo.rs cache");
                     let (bytes, count) = crate::cache::stats();
                     ui.horizontal(|ui| {
@@ -11283,6 +11363,12 @@ impl eframe::App for PixelView {
             self.show_prefs = open;
             if prefs_refresh {
                 self.refresh();
+            }
+            if reset_colors {
+                self.reset_format_colors();
+            }
+            if let Some((ext, rgb)) = color_change {
+                self.set_format_color(&ext, rgb);
             }
         }
 
@@ -11447,6 +11533,11 @@ impl eframe::App for PixelView {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         );
+        eframe::set_value(
+            storage,
+            Self::FORMAT_COLORS_KEY,
+            &crate::format_color::overrides_record(),
+        );
         // Remember where we were. Save the *display* path, not `self.folder`: inside an
         // archive / downloaded 16colo pack, `self.folder` is a temp dir that's gone next
         // launch, whereas the display path (`pack.zip/…`, `<16colo.rs>/year/pack`) is
@@ -11540,25 +11631,33 @@ fn short_name(path: &std::path::Path) -> String {
 /// Paint a placeholder "audio" tile — a music-note glyph (+ a format badge on larger tiles) —
 /// for a 16colo piece that has no server-side render, so it shows a tile, not an endless spinner.
 fn paint_audio_tile(painter: &egui::Painter, rect: egui::Rect, ext: &str) {
+    let accent = crate::format_color::color32(ext);
     painter.text(
         rect.center() - egui::vec2(0.0, rect.height() * 0.04),
         egui::Align2::CENTER_CENTER,
         "🎵",
         egui::FontId::proportional((rect.height() * 0.42).clamp(14.0, 72.0)),
-        egui::Color32::from_rgb(120, 200, 235),
+        accent,
     );
     if rect.width() > 90.0 && !ext.is_empty() {
-        let up = ext.to_ascii_uppercase();
-        let pos = rect.left_top() + egui::vec2(5.0, 4.0);
-        let galley =
-            painter.layout_no_wrap(up, egui::FontId::proportional(11.0), egui::Color32::WHITE);
-        painter.rect_filled(
-            egui::Rect::from_min_size(pos, galley.size()).expand(2.0),
-            3.0,
-            egui::Color32::from_rgba_unmultiplied(30, 60, 80, 210),
-        );
-        painter.galley(pos, galley, egui::Color32::WHITE);
+        paint_format_badge(painter, rect.left_top() + egui::vec2(5.0, 4.0), ext, accent);
     }
+}
+
+/// Paint a small format badge ("WAV"/"SF2"/…) at `pos`, tinted by the format's accent color
+/// (a dark, translucent fill so the light-on-dark text reads on any tile).
+fn paint_format_badge(painter: &egui::Painter, pos: egui::Pos2, ext: &str, accent: egui::Color32) {
+    let up = ext.to_ascii_uppercase();
+    let galley = painter.layout_no_wrap(up, egui::FontId::proportional(11.0), egui::Color32::WHITE);
+    // Darken the accent for the badge background so white text stays legible.
+    let bg = egui::Color32::from_rgba_unmultiplied(
+        (accent.r() as f32 * 0.35) as u8,
+        (accent.g() as f32 * 0.35) as u8,
+        (accent.b() as f32 * 0.35) as u8,
+        220,
+    );
+    painter.rect_filled(egui::Rect::from_min_size(pos, galley.size()).expand(2.0), 3.0, bg);
+    painter.galley(pos, galley, accent.gamma_multiply(1.4));
 }
 
 /// Paint a small segmented VU meter into `rect`, `level` in 0..1 (green → yellow → red segments).

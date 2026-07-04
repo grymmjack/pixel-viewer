@@ -114,12 +114,9 @@ fn fmt_duration(secs: f32) -> String {
 // ---- Rendering ---------------------------------------------------------------------------
 
 const BG: [u8; 4] = [16, 18, 24, 255];
-const WAVE: [u8; 4] = [88, 196, 172, 255]; // teal waveform
-const WAVE_DIM: [u8; 4] = [52, 110, 100, 255];
 const AXIS: [u8; 4] = [40, 44, 54, 255];
 const LABEL: [u8; 4] = [210, 210, 216, 255];
-const ACCENT: [u8; 4] = [120, 190, 255, 255];
-const NOTE: [u8; 4] = [130, 200, 255, 255];
+// Waveform/note colors come from `crate::format_color::color(ext)` (see `accent`).
 
 const WAVE_W: usize = 900; // crisp waveform tile
 const WAVE_H: usize = 200;
@@ -200,11 +197,19 @@ fn peaks(bytes: &[u8], ext: &str) -> Option<Vec<f32>> {
 }
 
 /// Render a waveform tile (with a duration/format caption).
+/// The per-format waveform colors: a full-strength accent + a dimmer version for the bar body.
+fn accent(ext: &str) -> ([u8; 4], [u8; 4]) {
+    let [r, g, b] = crate::format_color::color(ext);
+    let dim = |v: u8| (v as u16 * 55 / 100) as u8;
+    ([r, g, b, 255], [dim(r), dim(g), dim(b), 255])
+}
+
 fn render_waveform(cols: &[f32], ext: &str, info: &Option<AudioInfo>) -> PixImage {
     let cap_h = 22usize;
     let w = WAVE_W;
     let h = WAVE_H + cap_h;
     let mut px = vec![BG; w * h];
+    let (wave, wave_dim) = accent(ext); // colored by file format
 
     // Center axis.
     let mid = WAVE_H / 2;
@@ -215,11 +220,11 @@ fn render_waveform(cols: &[f32], ext: &str, info: &Option<AudioInfo>) -> PixImag
     for (x, &c) in cols.iter().enumerate().take(w) {
         let half = ((c * (WAVE_H as f32 * 0.46)).round() as usize).max(1);
         for dy in 0..half {
-            let col = if dy > half * 3 / 4 { WAVE } else { WAVE_DIM };
+            let col = if dy > half * 3 / 4 { wave } else { wave_dim };
             set(&mut px, w, x, mid.saturating_sub(dy), col);
             set(&mut px, w, x, (mid + dy).min(WAVE_H - 1), col);
         }
-        set(&mut px, w, x, mid, WAVE);
+        set(&mut px, w, x, mid, wave);
     }
     // Caption: "EXT · m:ss · 44.1k · stereo".
     let mut caption = ext.to_ascii_uppercase();
@@ -244,11 +249,12 @@ fn render_waveform(cols: &[f32], ext: &str, info: &Option<AudioInfo>) -> PixImag
 fn render_icon(ext: &str) -> PixImage {
     let (w, h) = (320usize, 240usize);
     let mut px = vec![BG; w * h];
+    let (note, _) = accent(ext); // colored by file format
     // Big ♫ (CP437 0x0E) centered.
     let scale = 10usize;
     let gx = (w - 8 * scale) / 2;
     let gy = 40;
-    blit_glyph(&mut px, w, gx, gy, 0x0E, NOTE, scale);
+    blit_glyph(&mut px, w, gx, gy, 0x0E, note, scale);
     // Format band.
     let label = ext.to_ascii_uppercase();
     let tscale = 3usize;
@@ -259,7 +265,7 @@ fn render_icon(ext: &str) -> PixImage {
         (w.saturating_sub(tw)) / 2,
         gy + 16 * scale + 16,
         &label,
-        ACCENT,
+        note,
         tscale,
     );
     blit_text(

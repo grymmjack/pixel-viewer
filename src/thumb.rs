@@ -100,6 +100,12 @@ impl ThumbBuilder {
     pub fn drain(&self) -> Vec<ThumbResult> {
         self.results.try_iter().collect()
     }
+
+    /// Forget that `path` was requested, so a later `request` re-decodes it (e.g. after its
+    /// tile color changed). The caller also drops the cached texture.
+    pub fn forget(&mut self, path: &Path) {
+        self.requested.remove(path);
+    }
 }
 
 /// Count distinct colors among the **fully-opaque** pixels (alpha 255). This

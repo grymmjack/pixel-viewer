@@ -5,6 +5,7 @@ mod cache;
 mod colo_thumb;
 mod decode;
 mod dls;
+mod format_color;
 mod image_types;
 mod libxmp;
 mod palettes_builtin;
