@@ -86,6 +86,8 @@ src/
                      (.xrns/.xrni are ZIPs → handled by archive.rs's force-zip path)
   libxmp.rs          FFI to bundled libxmp (vendor/libxmp, built by build.rs) — plays the
                      tracker formats xmrs doesn't (669/far/okt/med/amf/ult/mtm/stm)
+  format_color.rs    per-format tile/waveform/badge accent colors — a process-global ext→RGB
+                     map (Preferences-editable, persisted), read by the grid AND thumbnailer
 build.rs             compiles vendor/libxmp (C) into a static lib via the cc crate
 vendor/libxmp/       vendored libxmp 4.6.3 source (MIT) — src/ + include/ + libxmp-sources.cmake
   decode/
