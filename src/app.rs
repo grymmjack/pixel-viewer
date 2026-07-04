@@ -808,6 +808,8 @@ pub struct PixelView {
     // a WAV under `<data_dir>/pads/` (write-through). Saveable/loadable as a named `.pvkit`.
     pads: Vec<Pad>,
     pad_base_note: i32, // base MIDI note for auto pad-mapping (default 48 = C3, chromatic up); persisted
+    kit_global_vel: bool, // kit-wide fixed velocity: overrides every pad's per-pad velocity setting
+    kit_global_vel_amt: u8, // the fixed velocity (0..127) used for all pads when global vel is on
     audio_left_w: f32,  // width of the resizable sample-list pane in the big audio view; persisted
     audio_wave_h: f32,  // height of the resizable waveform in the big audio view; persisted
     audio_kb_h: f32,    // height of the resizable onscreen keyboard in the big audio view; persisted
@@ -1142,6 +1144,8 @@ impl PixelView {
     const KIT_NAME_KEY: &'static str = "kit_name";
     const OCTAVE_LOCK_KEY: &'static str = "audio_octave_lock";
     const PAD_BASE_KEY: &'static str = "pad_base_note";
+    const KIT_GVEL_KEY: &'static str = "kit_global_vel";
+    const KIT_GVEL_AMT_KEY: &'static str = "kit_global_vel_amt";
     const AUDIO_LEFT_W_KEY: &'static str = "audio_left_w";
     const AUDIO_WAVE_H_KEY: &'static str = "audio_wave_h";
     const AUDIO_KB_H_KEY: &'static str = "audio_kb_h";
@@ -1499,6 +1503,12 @@ impl PixelView {
             .and_then(|s| eframe::get_value::<i32>(s, Self::PAD_BASE_KEY))
             .unwrap_or(48) // C3
             .clamp(0, 115);
+        let kit_global_vel = get_bool(Self::KIT_GVEL_KEY).unwrap_or(false);
+        let kit_global_vel_amt = cc
+            .storage
+            .and_then(|s| eframe::get_value::<u8>(s, Self::KIT_GVEL_AMT_KEY))
+            .unwrap_or(100)
+            .min(127);
         let audio_left_w = cc
             .storage
             .and_then(|s| eframe::get_value::<f32>(s, Self::AUDIO_LEFT_W_KEY))
@@ -1675,6 +1685,8 @@ impl PixelView {
             audio_muted,
             pads,
             pad_base_note,
+            kit_global_vel,
+            kit_global_vel_amt,
             audio_left_w,
             audio_wave_h,
             audio_kb_h,
@@ -2631,8 +2643,15 @@ impl PixelView {
         let (ls, le) = pad.loop_region(buf.duration);
         let region = build_pad_region(&buf, ls, le, pad.loop_type);
         let (pitch, loop_it) = (pad.pitch, pad.loop_on);
-        // Velocity sensitivity: track the incoming velocity, or ignore it (fixed 127) when off.
-        let vel = if pad.vel_track { vel } else { 127 };
+        // Velocity: a kit-wide fixed velocity (global) overrides everything; else the pad tracks
+        // the incoming velocity, or ignores it (fixed 127) when its own tracking is off.
+        let vel = if self.kit_global_vel {
+            self.kit_global_vel_amt
+        } else if pad.vel_track {
+            vel
+        } else {
+            127
+        };
         let gain = (if self.audio_muted || !self.pad_audible(i) {
             0.0
         } else {
@@ -2851,6 +2870,8 @@ impl PixelView {
         manifest.push_str(&format!("base\t{}\n", self.pad_base_note));
         manifest.push_str(&format!("octave\t{}\n", self.audio_octave));
         manifest.push_str(&format!("octlock\t{}\n", if self.octave_lock { 1 } else { 0 }));
+        manifest.push_str(&format!("gvel\t{}\n", if self.kit_global_vel { 1 } else { 0 }));
+        manifest.push_str(&format!("gvelamt\t{}\n", self.kit_global_vel_amt));
         for (i, p) in self.pads.iter().enumerate() {
             manifest.push_str(&format!("pad\t{}\t{}\n", i, p.record().join("\t")));
         }
@@ -2890,7 +2911,18 @@ impl PixelView {
     /// so it becomes the persistent working kit. Reconnects the saved MIDI controller if present.
     fn load_kit(&mut self, path: &Path) {
         use std::io::Read;
-        let parsed = (|| -> Result<(String, Vec<Pad>, Option<String>, i32, i32, bool), String> {
+        // Parsed manifest fields (named so the growing set stays readable vs. a wide tuple).
+        struct KitManifest {
+            name: String,
+            pads: Vec<Pad>,
+            midi: Option<String>,
+            base: i32,
+            octave: i32,
+            lock: bool,
+            gvel: bool,
+            gvelamt: u8,
+        }
+        let parsed = (|| -> Result<KitManifest, String> {
             let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
             let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
             let mut manifest = String::new();
@@ -2900,6 +2932,7 @@ impl PixelView {
             let mut name = "Untitled".to_string();
             let mut midi: Option<String> = None;
             let (mut base, mut octave, mut lock) = (48, 0, false);
+            let (mut gvel, mut gvelamt) = (false, 100u8);
             let mut pads = vec![Pad::empty(); PAD_COUNT];
             for line in manifest.lines() {
                 let f: Vec<&str> = line.split('\t').collect();
@@ -2909,6 +2942,8 @@ impl PixelView {
                     ["base", v] => base = v.parse().unwrap_or(48),
                     ["octave", v] => octave = v.parse().unwrap_or(0),
                     ["octlock", v] => lock = *v == "1",
+                    ["gvel", v] => gvel = *v == "1",
+                    ["gvelamt", v] => gvelamt = v.parse().unwrap_or(100),
                     ["pad", idx, rest @ ..] => {
                         if let Ok(i) = idx.parse::<usize>() {
                             if i < PAD_COUNT {
@@ -2942,15 +2977,17 @@ impl PixelView {
                     pads[i].buf = None; // manifest said audio but the WAV is missing → empty
                 }
             }
-            Ok((name, pads, midi, base, octave, lock))
+            Ok(KitManifest { name, pads, midi, base, octave, lock, gvel, gvelamt })
         })();
         match parsed {
-            Ok((name, pads, midi, base, octave, lock)) => {
+            Ok(KitManifest { name, pads, midi, base, octave, lock, gvel, gvelamt }) => {
                 self.kit_name = name;
                 self.pads = pads;
                 self.pad_base_note = base.clamp(0, 115);
                 self.audio_octave = octave.clamp(-4, 4);
                 self.octave_lock = lock;
+                self.kit_global_vel = gvel;
+                self.kit_global_vel_amt = gvelamt.min(127);
                 // Write the loaded audio through so it becomes the persistent working kit.
                 let _ = std::fs::create_dir_all(pads_dir(&self.data_dir));
                 for i in 0..PAD_COUNT {
@@ -3072,8 +3109,16 @@ impl PixelView {
             Some(i) => EditFocus::Sample(i),
             None => EditFocus::Song,
         };
+        // With the octave locked, preview the clicked *sample* at that octave (as a key would play
+        // it), not always native pitch — so the browser audition follows the keyboard transpose.
+        // The "Full song" (idx None) always plays native, else it'd speed the whole song up.
+        let semi = if self.octave_lock && idx.is_some() {
+            self.audio_octave * 12
+        } else {
+            0
+        };
         if let Some(ap) = &mut self.audio_player {
-            ap.select_sample(idx);
+            ap.select_sample(idx, semi);
         }
     }
 
@@ -3444,8 +3489,13 @@ impl PixelView {
                 want_stop = true;
             }
             if ui
-                .button(egui::RichText::new("⏹ Panic").color(egui::Color32::from_rgb(240, 120, 110)))
-                .on_hover_text("Stop ALL sound + MIDI notes, incl. looping pads (Shift+Esc)")
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new("PANIC").color(egui::Color32::BLACK).strong(),
+                    )
+                    .fill(egui::Color32::from_rgb(230, 40, 40)),
+                )
+                .on_hover_text("SHIFT+ESC — stop ALL sound + MIDI notes, incl. looping pads")
                 .clicked()
             {
                 want_panic = true;
@@ -3995,6 +4045,22 @@ impl PixelView {
                         }
                     }
                 });
+            ui.separator();
+            // Kit-wide fixed velocity: when on, every pad plays at the slider value (overrides
+            // each pad's own V toggle + the incoming MIDI velocity).
+            ui.checkbox(&mut self.kit_global_vel, "Global velocity tracking")
+                .on_hover_text("One fixed velocity for the whole kit (overrides each pad's V)");
+            if self.kit_global_vel {
+                let mut v = self.kit_global_vel_amt as f32;
+                ui.spacing_mut().slider_width = 90.0;
+                if ui
+                    .add(egui::Slider::new(&mut v, 0.0..=127.0).step_by(1.0))
+                    .on_hover_text("Velocity applied to every pad (0–127)")
+                    .changed()
+                {
+                    self.kit_global_vel_amt = v.round().clamp(0.0, 127.0) as u8;
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .button("⬇ zip")
@@ -11649,11 +11715,15 @@ impl PixelView {
                         audio_stop = true;
                     }
                     if ui
-                        .button(
-                            egui::RichText::new("Panic")
-                                .color(egui::Color32::from_rgb(240, 120, 110)),
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("PANIC")
+                                    .color(egui::Color32::BLACK)
+                                    .strong(),
+                            )
+                            .fill(egui::Color32::from_rgb(230, 40, 40)),
                         )
-                        .on_hover_text("Stop ALL sound + pad voices, incl. looping pads (Shift+Esc)")
+                        .on_hover_text("SHIFT+ESC — stop ALL sound + pad voices, incl. looping pads")
                         .clicked()
                     {
                         audio_panic_now = true;
@@ -12945,6 +13015,8 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::KIT_NAME_KEY, &self.kit_name);
         eframe::set_value(storage, Self::OCTAVE_LOCK_KEY, &self.octave_lock);
         eframe::set_value(storage, Self::PAD_BASE_KEY, &self.pad_base_note);
+        eframe::set_value(storage, Self::KIT_GVEL_KEY, &self.kit_global_vel);
+        eframe::set_value(storage, Self::KIT_GVEL_AMT_KEY, &self.kit_global_vel_amt);
         eframe::set_value(storage, Self::AUDIO_LEFT_W_KEY, &self.audio_left_w);
         eframe::set_value(storage, Self::AUDIO_WAVE_H_KEY, &self.audio_wave_h);
         eframe::set_value(storage, Self::AUDIO_KB_H_KEY, &self.audio_kb_h);
@@ -15138,8 +15210,10 @@ impl AudioPlayer {
 
     /// Load a tracker sample (`Some(i)`) or restore the full song (`None`) as the live buffer,
     /// then audition it. Swapping keeps only one song copy: the song is stashed in `song_backup`
-    /// on the first sample select and moved back when you return to it.
-    fn select_sample(&mut self, idx: Option<usize>) {
+    /// on the first sample select and moved back when you return to it. `semitone` transposes the
+    /// preview (0 = native pitch) — the caller passes the locked keyboard octave so a browser click
+    /// previews at the same octave a key would. The loop flag is honored (a pitched preview loops).
+    fn select_sample(&mut self, idx: Option<usize>, semitone: i32) {
         self.stop();
         match idx {
             Some(i) if i < self.tracker_samples.len() => {
@@ -15157,7 +15231,8 @@ impl AudioPlayer {
                 self.active_sample = None;
             }
         }
-        self.play_region();
+        self.play_speed = 2.0f32.powf(semitone as f32 / 12.0);
+        self.play_source(false);
     }
 
     /// The gain to hand rodio: 0 when muted, else the master volume.
@@ -17316,13 +17391,20 @@ const HOTKEYS: &[(&str, &str)] = &[
         "Viewer: scroll 25 lines (a screen of scene art)",
     ),
     ("Arrow Up / Down", "Viewer: scroll a long image"),
+    ("Z + 1 – 9 / 0", "Viewer: zoom 100 % – 1000 %"),
     ("/", "Grid: filter by filename"),
+    ("Ctrl + F", "Advanced recursive search"),
     ("Drag", "Pan the image"),
     ("F", "Fit to window + auto-fit new images (viewer)"),
-    ("T", "Tile preview — fill window (viewer)"),
+    ("T", "Tile preview — fill window (viewer) · Grid ↔ Table"),
+    ("F11", "Immersive fullscreen (hide all bars)"),
+    ("R", "Load a random 16colo.rs pack"),
     ("1 – 5", "Set star rating"),
     ("0", "Clear rating"),
-    ("Click", "Open image / enter folder"),
+    ("Space", "Audio: play / pause"),
+    ("Shift + Esc", "PANIC — stop ALL audio + sample-pad voices"),
+    ("Enter", "Viewer: open in default app"),
+    ("Click", "Open image / enter folder · trigger a sample pad"),
     ("Ctrl + Click", "Toggle selection"),
     ("Shift + Click", "Range-select"),
     ("Right-click", "Grid: file operations menu"),

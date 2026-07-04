@@ -874,17 +874,26 @@ selection → `load_pad`, WAV write-through to `<data>/pads/pad_NN.wav`), **e** 
 (`focus_pad`/`focus_back`: re-points the main waveform at the pad's sample so its loop/pitch/type are
 set on the big editor, restored on Back — via `take_buffer`/`put_buffer` + an `EditorStash`, gated by
 `EditFocus::{Song,Sample,Pad}`), 🎹 MIDI-learn (`pad_assign` → next note assigns), ⬇ WAV download,
-× clear, **M/S** (`pad_is_audible` folds mute + kit-wide solo), a volume slider, and a painted vertical
+× clear, **M/S** (`pad_is_audible` folds mute + kit-wide solo), a **V** velocity toggle (on = track
+the played note's velocity, off = fixed 127), a volume slider, and a painted vertical
 **VU** (`pad_levels`). A pad is triggered by clicking it, or a matching note (onscreen/MIDI) via
 `route_note_on`; **`AudioPlayer::trigger_pad_voice`** fires each hit as its own `rodio::Player` on the
 **shared `_stream.mixer()`** (`pad_voices: Vec<PadVoice>`, reaped each frame) — the mixer sums them,
 so pads are **polyphonic** (the base player is monophonic). Feedback (the user's ask): every played
 note lights its keyboard key (`note_flash`) — **red** if it routes to a pad, an accent otherwise — and
 the triggered **pad flashes green**. **Octave lock** (`octave_lock`) keeps the keyboard octave across
-drill-ins. The whole kit is a **persistent cross-file working set** (metadata in `PADS_KEY`, audio in
+drill-ins **and, while on, auditions a browser-clicked sample at that octave** (`select_sample` takes
+a `semitone` = `audio_octave * 12`; the "Full song" always plays native so it isn't sped up).
+**Global velocity tracking** (`kit_global_vel` + `kit_global_vel_amt`, a kit-wide checkbox + 0–127
+slider in the Pads header) overrides every pad's per-pad **V** with one fixed velocity for the whole
+kit. **PANIC** (**Shift+Esc**, `audio_panic` → `AudioPlayer::panic`; a bright-red button in the menu
+bar *and* both transport rows) stops all sound + pad voices + MIDI notes, incl. looping pads — the
+truly-global escape hatch (the plain back-to-grid Escape excludes Shift). The whole kit is a
+**persistent cross-file working set** (metadata in `PADS_KEY`, audio in
 `<data>/pads/*.wav`, reloaded in `new()` via `decode_audio`), plus **named kits**: Save/Load + a name
 field save the kit as a `.pvkit` (a zip — `manifest.txt` storing the kit name + **MIDI controller +
-base/octave + every pad's record** + `pad_NN.wav`s; `save_kit`/`load_kit` via the `zip` crate). Saved
+base/octave + global velocity + every pad's record** + `pad_NN.wav`s; `save_kit`/`load_kit` via the
+`zip` crate). Saved
 kits live in `<data>/kits/` and are browsable via a **🎵 Kits** entry in the Places dock; a `.pvkit`
 file (shown with a KIT badge) **loads on click** (`is_kit_ext` → `load_kit`, not the viewer). All of
 it is gated on `self.plugin_audio`.
