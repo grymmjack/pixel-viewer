@@ -3486,16 +3486,16 @@ impl PixelView {
             // Pin the transport glyph buttons to a fixed size: the ⏸/▶ glyphs have different
             // advance widths, so a bare button resizes on play/pause and shoves the row sideways
             // ("jiggle"). A shared min_size (widest of the three glyphs) makes every state one width.
-            let tbtn = fixed_btn_size(ui, &["⏸", "▶", "⏹"]);
+            let tbtn = fixed_btn_size(ui, &[icons::PAUSE, icons::PLAY, icons::STOP]);
             if ui
-                .add(egui::Button::new(if playing { "⏸" } else { "▶" }).min_size(tbtn))
+                .add(egui::Button::new(if playing { icons::PAUSE } else { icons::PLAY }).min_size(tbtn))
                 .on_hover_text("Play / pause (Space)")
                 .clicked()
             {
                 want_toggle = true;
             }
             if ui
-                .add(egui::Button::new("⏹").min_size(tbtn))
+                .add(egui::Button::new(icons::STOP).min_size(tbtn))
                 .on_hover_text("Stop")
                 .clicked()
             {
@@ -3515,7 +3515,7 @@ impl PixelView {
             }
             let mut lp = looping;
             if ui
-                .toggle_value(&mut lp, "🔁")
+                .toggle_value(&mut lp, icons::LOOP)
                 .on_hover_text("Loop the selection")
                 .changed()
             {
@@ -3845,7 +3845,7 @@ impl PixelView {
         ui.add_space(4.0);
         let oct = self.audio_octave;
         ui.horizontal(|ui| {
-            ui.weak("🎹");
+            ui.weak(icons::PIANO);
             if ui.small_button("Oct −").clicked() {
                 *want_octave = Some(oct - 1);
             }
@@ -3890,7 +3890,7 @@ impl PixelView {
         if big {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.weak("🎹 MIDI in:");
+                ui.weak(format!("{} MIDI in:", icons::PIANO));
                 let current = self.midi_port.clone();
                 let connected = self.midi_conn.is_some();
                 // ✓ once a controller is connected (the choice sticks across restarts).
@@ -3917,7 +3917,7 @@ impl PixelView {
                         }
                     });
                 if ui
-                    .small_button("⟲")
+                    .small_button(icons::REFRESH)
                     .on_hover_text("Re-scan MIDI devices")
                     .clicked()
                 {
@@ -3955,11 +3955,11 @@ impl PixelView {
         let active = self.audio_player.as_ref().and_then(|ap| ap.active_sample);
         ui.horizontal(|ui| {
             ui.strong(format!("Samples ({})", sample_list.len()));
-            ui.weak("· click to load · ⬇ WAV");
+            ui.weak(format!("· click to load · {} WAV", icons::DOWNLOAD));
         });
         ui.add_space(2.0);
         if ui
-            .selectable_label(active.is_none(), "🎵  Full song")
+            .selectable_label(active.is_none(), format!("{}  Full song", icons::MUSIC))
             .clicked()
         {
             *want_sample = Some(None);
@@ -3975,7 +3975,7 @@ impl PixelView {
                     ui.horizontal(|ui| {
                         ui.set_min_height(row_h);
                         if ui
-                            .add(egui::Button::new("⬇").small().frame(false))
+                            .add(egui::Button::new(icons::DOWNLOAD).small().frame(false))
                             .on_hover_text("Export this sample as WAV")
                             .clicked()
                         {
@@ -4076,7 +4076,7 @@ impl PixelView {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .button("⬇ zip")
+                    .button(format!("{} zip", icons::DOWNLOAD))
                     .on_hover_text("Export all pads as a .zip of WAVs")
                     .clicked()
                 {
@@ -4217,7 +4217,7 @@ impl PixelView {
                                 // MIDI-learn: arm this pad, then the next key (onscreen/hardware)
                                 // becomes its trigger note. Armed → the 🎹 button is highlighted.
                                 if ui
-                                    .add(egui::Button::new("🎹").small().selected(assigning))
+                                    .add(egui::Button::new(icons::PIANO).small().selected(assigning))
                                     .on_hover_text(
                                         "Assign a MIDI note: click, then press a key on your \
                                          controller or the onscreen keyboard",
@@ -4238,7 +4238,7 @@ impl PixelView {
                                         want_edit = Some(i);
                                     }
                                     if ui
-                                        .add(egui::Button::new("⬇").small())
+                                        .add(egui::Button::new(icons::DOWNLOAD).small())
                                         .on_hover_text("Download this pad as WAV")
                                         .clicked()
                                     {
@@ -5986,10 +5986,12 @@ impl PixelView {
             if wheel_cycle(ui, &cr.response, &mut ki, SortKey::COMMON.len()) {
                 key = SortKey::COMMON[ki];
             }
+            let asc_lbl = format!("{} Asc", icons::SORT_ASC);
+            let desc_lbl = format!("{} Desc", icons::SORT_DESC);
             if ui
                 .add(
-                    egui::Button::new(if desc { "↓ Desc" } else { "↑ Asc" })
-                        .min_size(fixed_btn_size(ui, &["↓ Desc", "↑ Asc"])),
+                    egui::Button::new(if desc { &desc_lbl } else { &asc_lbl })
+                        .min_size(fixed_btn_size(ui, &[&asc_lbl, &desc_lbl])),
                 )
                 .on_hover_text("Toggle ascending/descending")
                 .clicked()
@@ -6033,7 +6035,7 @@ impl PixelView {
     /// Vim-style filename filter bar (opened with '/'); live-filters the grid.
     fn ui_searchbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label("🔍 Filter:");
+            ui.label(format!("{} Filter:", icons::SEARCH));
             let mut q = self.search.take().unwrap_or_default();
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut q)
@@ -6076,7 +6078,7 @@ impl PixelView {
             r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
         };
         ui.horizontal_wrapped(|ui| {
-            ui.label("🔍 Find:");
+            ui.label(format!("{} Find:", icons::SEARCH));
             let first = ui.add(
                 egui::TextEdit::singleline(&mut self.search_spec.name)
                     .desired_width(150.0)
@@ -9556,10 +9558,17 @@ impl PixelView {
                 }
                 if !immersive {
                     ui.horizontal(|ui| {
+                        let anim_lbl = |p: bool| {
+                            if p {
+                                format!("{} Pause", icons::PAUSE)
+                            } else {
+                                format!("{} Play", icons::PLAY)
+                            }
+                        };
                         if ui
                             .add(
-                                egui::Button::new(if anim.playing { "⏸ Pause" } else { "▶ Play" })
-                                    .min_size(fixed_btn_size(ui, &["⏸ Pause", "▶ Play"])),
+                                egui::Button::new(anim_lbl(anim.playing))
+                                    .min_size(fixed_btn_size(ui, &[&anim_lbl(true), &anim_lbl(false)])),
                             )
                             .clicked()
                         {
@@ -9660,10 +9669,17 @@ impl PixelView {
                 let len = p.len;
                 if !immersive {
                     ui.horizontal(|ui| {
+                        let baud_lbl = |pl: bool| {
+                            if pl {
+                                format!("{} Pause", icons::PAUSE)
+                            } else {
+                                format!("{} Play", icons::PLAY)
+                            }
+                        };
                         if ui
                             .add(
-                                egui::Button::new(if p.playing { "⏸ Pause" } else { "▶ Play" })
-                                    .min_size(fixed_btn_size(ui, &["⏸ Pause", "▶ Play"])),
+                                egui::Button::new(baud_lbl(p.playing))
+                                    .min_size(fixed_btn_size(ui, &[&baud_lbl(true), &baud_lbl(false)])),
                             )
                             .clicked()
                         {
@@ -9673,7 +9689,7 @@ impl PixelView {
                             }
                             p.playing = !p.playing;
                         }
-                        if ui.button("⏮ Replay").clicked() {
+                        if ui.button(format!("{} Replay", icons::REPLAY)).clicked() {
                             p.pos = 0;
                             p.acc = 0.0;
                             p.playing = true;
@@ -9681,7 +9697,7 @@ impl PixelView {
                         // Baud picker, right by the transport controls: simulate a modem
                         // typing the art out. RIP and ANSI keep separate remembered speeds.
                         egui::ComboBox::from_id_salt("baud_pick")
-                            .selected_text(format!("⚡ {}", baud_choice.label()))
+                            .selected_text(format!("{} {}", icons::BOLT, baud_choice.label()))
                             .show_ui(ui, |ui| {
                                 for b in Baud::ALL {
                                     ui.selectable_value(&mut baud_choice, b, b.label());
@@ -11149,7 +11165,7 @@ impl PixelView {
     /// toggle. Pairs with auto ▶ + F11 for a real-scene-art screensaver.
     fn ui_shuffle_controls(&mut self, ui: &mut egui::Ui) {
         if ui
-            .button("🔀 Random pack")
+            .button(format!("{} Random pack", icons::SHUFFLE))
             .on_hover_text(
                 "Open a random 16colo.rs pack (any year). With Shuffle + auto ▶ (+ F11) it \
                  plays packs endlessly — a screensaver of real scene art.",
@@ -11723,7 +11739,7 @@ impl PixelView {
                         .iter()
                         .filter(|f| crate::sixteen::is_remote(f))
                     {
-                        let label = format!("🌐 {}", self.fav_label(fav));
+                        let label = format!("{} {}", icons::GLOBE, self.fav_label(fav));
                         let color = self.fav_colors.get(fav).copied();
                         if Self::colored_place_button(ui, &label, color) {
                             action = Some(MenuAction::Nav(fav.clone()));
@@ -11753,7 +11769,11 @@ impl PixelView {
                     {
                         audio_vol = Some(vol);
                     }
-                    if ui.button("⏹").on_hover_text("Stop audio").clicked() {
+                    if ui
+                        .button(icons::STOP)
+                        .on_hover_text("Stop audio")
+                        .clicked()
+                    {
                         audio_stop = true;
                     }
                     if ui
@@ -11771,14 +11791,17 @@ impl PixelView {
                         audio_panic_now = true;
                     }
                     let (icon, tip) = if self.audio_muted {
-                        ("🔇", "Unmute audio")
+                        (icons::MUTE, "Unmute audio")
                     } else {
-                        ("🔊", "Mute audio")
+                        (icons::VOLUME, "Mute audio")
                     };
-                    // Fixed width: 🔇/🔊 differ, and shrinking here would slide the VU + pill (added
-                    // after it in this right-to-left row) as you mute/unmute.
+                    // Fixed width: the mute/volume glyphs differ, and shrinking here would slide the
+                    // VU + pill (added after it in this right-to-left row) as you mute/unmute.
                     if ui
-                        .add(egui::Button::new(icon).min_size(fixed_btn_size(ui, &["🔇", "🔊"])))
+                        .add(
+                            egui::Button::new(icon)
+                                .min_size(fixed_btn_size(ui, &[icons::MUTE, icons::VOLUME])),
+                        )
                         .on_hover_text(tip)
                         .clicked()
                     {
@@ -11795,7 +11818,7 @@ impl PixelView {
                             ui.allocate_exact_size(egui::vec2(46.0, 12.0), egui::Sense::hover());
                         paint_vu_meter(ui.painter(), vrect, level);
                         if ui
-                            .button(format!("▶ {}", elide(&name, 22)))
+                            .button(format!("{} {}", icons::PLAY, elide(&name, 22)))
                             .on_hover_text("Playing — click to open the player")
                             .clicked()
                         {
@@ -11950,7 +11973,7 @@ impl PixelView {
                         }
                         // Sample-pad kits folder (only when the audio plugin is on). Browsing it
                         // shows saved `.pvkit` files; clicking one loads that kit into the grid.
-                        if self.plugin_audio && ui.button("🎵 Kits").clicked() {
+                        if self.plugin_audio && ui.button(format!("{} Kits", icons::MUSIC)).clicked() {
                             let d = self.kits_dir();
                             let _ = std::fs::create_dir_all(&d);
                             nav = Some(d);
@@ -11970,7 +11993,7 @@ impl PixelView {
                             ui.weak("Smart filters");
                             for (i, (name, _)) in self.saved_filters.iter().enumerate() {
                                 let r = ui
-                                    .button(format!("🔍 {name}"))
+                                    .button(format!("{} {name}", icons::SEARCH))
                                     .on_hover_text("Run this saved search · right-click to remove");
                                 if r.clicked() {
                                     recall = Some(i);
@@ -11986,14 +12009,14 @@ impl PixelView {
                     } else {
                         // 16colo.rs: the browse entry + pinned artists/groups/searches/packs.
                         if ui
-                            .button("🌐 16colo.rs")
+                            .button(format!("{} 16colo.rs", icons::GLOBE))
                             .on_hover_text("Browse the 16colo.rs ANSI art archive online")
                             .clicked()
                         {
                             nav = Some(PathBuf::from(crate::sixteen::ROOT));
                         }
                         if let Some(p) =
-                            self.favorites_buttons(ui, "🌐", crate::sixteen::is_remote, false)
+                            self.favorites_buttons(ui, icons::GLOBE, crate::sixteen::is_remote, false)
                         {
                             nav = Some(p);
                         }
@@ -12001,7 +12024,7 @@ impl PixelView {
                 } else {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.explorer_filter)
-                            .hint_text("🔍 filter folders")
+                            .hint_text(format!("{} filter folders", icons::SEARCH))
                             .desired_width(f32::INFINITY),
                     );
                     if let Some(folder) = self.folder.clone() {
@@ -13387,19 +13410,53 @@ fn blend_toward(base: egui::Color32, accent: [u8; 3], t: f32) -> egui::Color32 {
 fn install_fallback_font(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
+        "NerdFontSymbols".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/SymbolsNerdFont-Regular.ttf"
+        ))),
+    );
+    fonts.font_data.insert(
         "DejaVuSans".to_owned(),
         std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
             "../assets/DejaVuSans.ttf"
         ))),
     );
+    // Both appended as fallbacks. `icons::*` use Nerd Font's Material-Design range (U+F0xxx, plane
+    // 15) which no bundled text/emoji font touches, so appending last is safe (no shadowing); DejaVu
+    // backs every remaining standard-Unicode symbol. Between them, nothing we draw can tofu.
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .push("DejaVuSans".to_owned());
+        let fam = fonts.families.entry(family).or_default();
+        fam.push("NerdFontSymbols".to_owned());
+        fam.push("DejaVuSans".to_owned());
     }
     ctx.set_fonts(fonts);
+}
+
+/// Designed UI icons from the embedded **Symbols Nerd Font**. These use the **Material Design
+/// range (plane-15 PUA, U+F0xxx)** on purpose: unlike the low FontAwesome range (U+F0xx), it can
+/// never collide with a glyph in another stacked font — the text font stores the fi/fl ligatures
+/// at U+F001/F002 and egui's bundled emoji-icon-font is FontAwesome-based, so low codepoints get
+/// shadowed (a music note rendered as "fi"). Every codepoint below is verified present in
+/// `assets/SymbolsNerdFont-Regular.ttf` (fonttools cmap check — see git log). No more tofu.
+mod icons {
+    pub const PLAY: &str = "\u{f040a}"; // nf-md-play
+    pub const PAUSE: &str = "\u{f03e4}"; // nf-md-pause
+    pub const STOP: &str = "\u{f04db}"; // nf-md-stop
+    pub const REPLAY: &str = "\u{f0709}"; // nf-md-restart
+    pub const VOLUME: &str = "\u{f057e}"; // nf-md-volume_high
+    pub const MUTE: &str = "\u{f075f}"; // nf-md-volume_mute
+    pub const LOOP: &str = "\u{f0456}"; // nf-md-repeat
+    pub const SHUFFLE: &str = "\u{f049d}"; // nf-md-shuffle
+    pub const REFRESH: &str = "\u{f0450}"; // nf-md-refresh
+    pub const DOWNLOAD: &str = "\u{f01da}"; // nf-md-download
+    pub const SEARCH: &str = "\u{f0349}"; // nf-md-magnify
+    pub const BOLT: &str = "\u{f0241}"; // nf-md-flash (baud rate)
+    pub const SORT_ASC: &str = "\u{f04bb}"; // nf-md-sort_ascending
+    pub const SORT_DESC: &str = "\u{f04bc}"; // nf-md-sort_descending
+    pub const PIN: &str = "\u{f0403}"; // nf-md-pin
+    pub const GLOBE: &str = "\u{f01e7}"; // nf-md-earth
+    pub const MUSIC: &str = "\u{f0389}"; // nf-md-music_note
+    pub const PIANO: &str = "\u{f067d}"; // nf-md-piano
 }
 
 /// A `min_size` that fits the **widest** of `labels` at the current button style, so a button
@@ -16647,7 +16704,7 @@ fn entry_context_menu(
         if ui
             .add_enabled(
                 !already,
-                egui::Button::new(format!("📌 Pin “{label}” to Places")),
+                egui::Button::new(format!("{} Pin “{label}” to Places", icons::PIN)),
             )
             .on_hover_text("Bookmark this artist / group / search")
             .clicked()
@@ -16666,7 +16723,7 @@ fn entry_context_menu(
             }
         }
         if ui
-            .add_enabled(!pinned, egui::Button::new("📌 Pin to Places"))
+            .add_enabled(!pinned, egui::Button::new(format!("{} Pin to Places", icons::PIN)))
             .clicked()
         {
             pick = Some(TilePick::Pin);
@@ -16674,7 +16731,7 @@ fn entry_context_menu(
         }
         ui.separator();
     } else {
-        ui.menu_button("🔍 Smart filter on…", |ui| {
+        ui.menu_button(format!("{} Smart filter on…", icons::SEARCH), |ui| {
             let mut on = |ui: &mut egui::Ui, label: &str, c| {
                 if ui.button(label).clicked() {
                     pick = Some(TilePick::Smart(c));

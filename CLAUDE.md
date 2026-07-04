@@ -139,6 +139,7 @@ vendor/libxmp/       vendored libxmp 4.6.3 source (MIT) — src/ + include/ + li
 assets/pixelview.png   generated app icon (4×4 thumbnail grid)
 assets/palettes/       55 bundled .GPL palettes (embedded into the binary)
 assets/DejaVuSans.ttf  embedded UI fallback font (fills egui's tofu gaps; see Font gotcha)
+assets/SymbolsNerdFont-Regular.ttf  embedded icon font (the `icons::*` designed glyphs)
 pixelview.desktop      desktop entry (StartupWMClass=pixelview) for the task icon
 install-icon.sh        installs the .desktop + icon into ~/.local/share
 ```
@@ -657,21 +658,28 @@ rematch**, and the *order* of all of it is user-controlled.
   check excludes CR/LF, so an exactly-`wrap`-wide line + CRLF still occupies one row
   (no blank), keeping `full_width_line_plus_newline_has_no_blank_row`.
 
-## Font glyph gotcha (mostly solved — DejaVu fallback)
+## Font glyph gotcha (solved — two embedded fallbacks + an icon set)
 
-egui's *bundled* fonts (Ubuntu-Light + a small NotoEmoji subset) omit whole Unicode
-blocks — Geometric Shapes (`▲`/`▼`/`●`), some Arrows (`↑`/`↓`) — which historically
-rendered as tofu (`□`). **`install_fallback_font` (`app.rs`, called first thing in
-`PixelView::new`) now appends embedded DejaVu Sans (`assets/DejaVuSans.ttf`) as the
-last-resort fallback in the Proportional + Monospace families**, so any standard Unicode
-symbol DejaVu covers (Arrows U+2190–21FF, Geometric Shapes U+25A0–25FF, Misc Symbols,
-Box Drawing, …) now renders. It's appended *last*, so it only fills gaps — existing text
-and the color-emoji glyphs (`📁`/`🎹`/`🔊`/`★`) come from the earlier fonts unchanged.
-So: **prefer a plain Unicode symbol; it'll render.** Only reach for ASCII (`*`) or a
-*painted* shape (see `drag_handle`'s dots) if a glyph tofus even with DejaVu — i.e. it's
-outside Ubuntu-Light, the emoji subset, *and* DejaVu (very new emoji / CJK / niche
-pictographs). To widen coverage further, swap in a bigger fallback in `install_fallback_font`.
-When in doubt, test in the real app.
+egui's *bundled* fonts (Ubuntu-Light + a small NotoEmoji subset) omit whole Unicode blocks,
+so glyphs used to render as tofu (`□`). **`install_fallback_font` (`app.rs`, called first
+thing in `PixelView::new`) appends TWO embedded fallbacks** to the Proportional + Monospace
+families: **Symbols Nerd Font** (`assets/SymbolsNerdFont-Regular.ttf`) for designed UI icons,
+then **DejaVu Sans** (`assets/DejaVuSans.ttf`) to back every remaining standard-Unicode symbol
+(Arrows, Geometric Shapes, Misc Symbols, Box Drawing, …). Both are appended *last*, so they
+only fill gaps — existing text + color-emoji (`📁`/`🎹`/`🔊`/`★`) come from the earlier fonts
+unchanged. Between them, **nothing we draw tofus.**
+
+- **For a real icon, use `icons::*`** (the `mod icons` block near `install_fallback_font`) —
+  `PLAY`/`PAUSE`/`STOP`/`VOLUME`/`MUTE`/`LOOP`/`SHUFFLE`/`REFRESH`/`DOWNLOAD`/`SEARCH`/`BOLT`/
+  `SORT_ASC`/`SORT_DESC`/`PIN`/`GLOBE`/`MUSIC`/`PIANO`. **Codepoint rule (critical):** use Nerd
+  Font's **Material-Design range (U+F0xxx, plane 15)**, *not* the low FontAwesome range (U+F0xx) —
+  the text font stores the fi/fl ligatures at U+F001/F002 and egui's bundled emoji-icon-font is
+  FontAwesome-based, so a low codepoint gets **shadowed** (music note → "fi"). Plane-15 is
+  untouchable by any other stacked font. Verify a new codepoint is in the font's cmap first
+  (fonttools: `TTFont(path)['cmap']`; a venv one-liner — see git log).
+- **For a plain symbol**, a normal Unicode char (`·`/`…`/`×`/`★`) still just works via DejaVu.
+- Only ASCII (`*`) or a *painted* shape (see `drag_handle`'s dots) if something tofus even with
+  both fallbacks (very new emoji / CJK / niche pictographs). When in doubt, test in the real app.
 
 ## Button-jiggle gotcha (read before a button whose label swaps by state)
 
