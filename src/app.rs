@@ -2745,6 +2745,7 @@ impl PixelView {
         let mut want_select: Option<(f32, f32)> = None;
         let mut want_commit = false;
         let mut want_seek: Option<f32> = None;
+        let mut want_play_at: Option<f32> = None; // middle-click the waveform → play from here
         let mut want_note: Option<i32> = None;
         let mut want_octave: Option<i32> = None;
         let mut want_sample: Option<Option<usize>> = None; // Some(Some(i))=pick sample; Some(None)=full song
@@ -2840,12 +2841,19 @@ impl PixelView {
                 self.audio_drag = None;
                 want_commit = true;
             }
-            if resp.clicked() {
+            if resp.double_clicked() {
+                want_select = Some((0.0, dur)); // double-click → select the whole thing
+                want_commit = true;
+            } else if resp.middle_clicked() {
+                if let Some(pp) = resp.interact_pointer_pos() {
+                    want_play_at = Some(t_at(pp.x)); // middle-click → play from here
+                }
+            } else if resp.clicked() {
                 if let Some(pp) = resp.interact_pointer_pos() {
                     want_seek = Some(t_at(pp.x));
                 }
             }
-            ui.weak("drag: set loop region · click: seek");
+            ui.weak("drag: loop region · click: seek · dbl-click: all · middle-click: play here");
         }
 
         // Onscreen keyboard: audition the sample as a one-shot instrument.
@@ -2950,7 +2958,9 @@ impl PixelView {
                 want_sample = Some(None);
             }
             let row_h = if big { 22.0 } else { 18.0 };
-            let list_h = if big { 260.0 } else { 130.0 };
+            // Fill the remaining vertical space down to the bottom of the pane (so a big bank
+            // uses the whole viewer/dock instead of a stubby fixed box), with a sane floor.
+            let list_h = (ui.available_height() - 4.0).max(if big { 160.0 } else { 90.0 });
             egui::ScrollArea::vertical()
                 .id_salt("tracker_samples")
                 .max_height(list_h)
@@ -3025,6 +3035,11 @@ impl PixelView {
             if let Some(ap) = &self.audio_player {
                 let rel = (secs - ap.region_start).clamp(0.0, ap.region_len);
                 let _ = ap.player.try_seek(std::time::Duration::from_secs_f32(rel));
+            }
+        }
+        if let Some(secs) = want_play_at {
+            if let Some(ap) = &mut self.audio_player {
+                ap.play_from(secs);
             }
         }
         if let Some(idx) = want_sample {
@@ -8338,13 +8353,14 @@ impl PixelView {
                         ui.heading(short_name(&path));
                     });
                     ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.vertical(|ui| {
-                            ui.set_max_width((ui.available_width() - 16.0).max(200.0));
+                    // A margin frame (not a horizontal→vertical nest) keeps the vertical flow, so
+                    // `available_height()` inside reports the real space left down to the bottom —
+                    // which the sample list uses to fill the pane.
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(8, 0))
+                        .show(ui, |ui| {
                             self.draw_audio_controls(ui, &path, true, None);
                         });
-                    });
                 });
             return;
         }
@@ -13295,6 +13311,39 @@ impl AudioPlayer {
         let player = rodio::Player::connect_new(self._stream.mixer());
         player.set_volume(self.effective_volume()); // a fresh player defaults to full gain
         if self.looping && !one_shot {
+            player.append(buf.repeat_infinite());
+        } else {
+            player.append(buf);
+        }
+        player.play();
+        self.player = player;
+        self.region_start = s as f32 / ch as f32 / sr;
+        self.region_len = ((e - s) as f32 / ch as f32 / sr).max(0.0001);
+        self.started = true;
+    }
+
+    /// Start playback from `secs` (to the end of the selection, or the whole file if `secs` is
+    /// past it) without disturbing the loop region — for a middle-click "play from here".
+    fn play_from(&mut self, secs: f32) {
+        use rodio::Source;
+        self.play_speed = 1.0;
+        let ch = self.channels.get() as usize;
+        let sr = self.sample_rate.get() as f32;
+        let n = self.samples.len();
+        let start = secs.clamp(0.0, self.duration);
+        let end = if start < self.sel_end {
+            self.sel_end
+        } else {
+            self.duration
+        }
+        .clamp(start, self.duration);
+        let s = (((start * sr) as usize) * ch).min(n);
+        let e = (((end * sr) as usize) * ch).min(n).max(s);
+        let region: Vec<rodio::Sample> = self.samples[s..e].to_vec();
+        let buf = rodio::buffer::SamplesBuffer::new(self.channels, self.sample_rate, region);
+        let player = rodio::Player::connect_new(self._stream.mixer());
+        player.set_volume(self.effective_volume());
+        if self.looping {
             player.append(buf.repeat_infinite());
         } else {
             player.append(buf);
