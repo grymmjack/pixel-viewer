@@ -2538,6 +2538,17 @@ impl PixelView {
         }
     }
 
+    /// PANIC — stop the main player AND every sample-pad voice at once (all sound off, incl. a
+    /// runaway looping pad). Since MIDI keys only ever start pad voices, this is also the
+    /// "all notes off". Bound to the transport Panic button + Shift+Esc.
+    fn audio_panic(&mut self) {
+        self.pad_assign = None; // also cancel a pending MIDI-learn
+        if let Some(ap) = &mut self.audio_player {
+            ap.panic();
+        }
+        self.status = "Panic — all sound stopped".into();
+    }
+
     /// Whether pad `i` should be heard (per-pad mute folded with kit-wide solo). See
     /// [`pad_is_audible`] for the rule (extracted so it's unit-testable).
     fn pad_audible(&self, i: usize) -> bool {
@@ -2594,7 +2605,9 @@ impl PixelView {
 
     /// Fire pad `i`, applying its own pitch / loop region / loop-type, scaled by velocity and the
     /// pad's mix state, as a concurrent voice on the current player's mixer. Lights the pad
-    /// (`flash_t`) even when solo-silenced, so the routing is visible. No-op if empty/audio off.
+    /// (`flash_t`) even when solo-silenced, so the routing is visible. A **looping** pad toggles:
+    /// pressing it while it loops stops it (a one-shot pad always retriggers/stacks). No-op if
+    /// empty/audio off.
     fn trigger_pad(&mut self, i: usize, vel: u8, now: f32) {
         if !self.plugin_audio || i >= self.pads.len() {
             return;
@@ -2602,6 +2615,18 @@ impl PixelView {
         let Some(buf) = self.pads[i].buf.clone() else {
             return;
         };
+        // A looping pad that's already sounding → press again to stop it (there's no key-up for
+        // an onscreen/pad click, and MIDI Note-Off is ignored, so a re-press is the "off").
+        if self.pads[i].loop_on {
+            if let Some(ap) = &self.audio_player {
+                if ap.pad_has_voice(i) {
+                    if let Some(ap) = &mut self.audio_player {
+                        ap.stop_pad(i);
+                    }
+                    return;
+                }
+            }
+        }
         let pad = &self.pads[i];
         let (ls, le) = pad.loop_region(buf.duration);
         let region = build_pad_region(&buf, ls, le, pad.loop_type);
@@ -3376,6 +3401,7 @@ impl PixelView {
 
         let mut want_toggle = false;
         let mut want_stop = false;
+        let mut want_panic = false; // stop ALL sound (main + pads)
         let mut want_back = false; // leave a pad drill-in
         let mut want_loop: Option<bool> = None;
         let mut want_autoplay: Option<bool> = None;
@@ -3413,6 +3439,13 @@ impl PixelView {
             }
             if ui.button("⏹").on_hover_text("Stop").clicked() {
                 want_stop = true;
+            }
+            if ui
+                .button(egui::RichText::new("⏹ Panic").color(egui::Color32::from_rgb(240, 120, 110)))
+                .on_hover_text("Stop ALL sound + MIDI notes, incl. looping pads (Shift+Esc)")
+                .clicked()
+            {
+                want_panic = true;
             }
             let mut lp = looping;
             if ui
@@ -3689,6 +3722,9 @@ impl PixelView {
         }
         if want_back {
             self.focus_back();
+        }
+        if want_panic {
+            self.audio_panic();
         }
         if want_stop {
             self.stop_audio();
@@ -11907,6 +11943,15 @@ impl eframe::App for PixelView {
             }
             self.want_repaint = true;
         }
+        // Shift+Esc — PANIC: stop all audio + every pad voice (kills a runaway looping pad / all
+        // MIDI notes). Works globally when a player exists; plain Esc still goes Back to grid.
+        if !typing
+            && self.audio_player.is_some()
+            && ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::Escape))
+        {
+            self.audio_panic();
+            self.want_repaint = true;
+        }
         // Which chrome edges are visible: all of them normally; in immersive mode only the
         // edge the mouse is hovering (within EDGE px of the window border).
         let mut hide_cursor = false;
@@ -12090,7 +12135,7 @@ impl eframe::App for PixelView {
                     - i32::from(i.key_pressed(Minus));
                 (
                     rate,
-                    i.key_pressed(back_key),
+                    i.key_pressed(back_key) && !i.modifiers.shift, // Shift+Esc is Panic, not Back
                     i.key_pressed(parent_key),
                     z_held,
                     zoom_set,
@@ -15152,8 +15197,29 @@ impl AudioPlayer {
         self.pad_voices.retain(|v| !v.player.empty());
     }
 
+    /// Stop (and free) every live voice for pad `i`. Dropping the `rodio::Player` silences it —
+    /// this is how a looping pad is turned off (re-trigger toggle) or killed by panic.
+    fn stop_pad(&mut self, i: usize) {
+        self.pad_voices.retain(|v| v.pad != i);
+    }
+
+    /// Whether pad `i` currently has a live (playing) voice — used to toggle a looping pad off.
+    fn pad_has_voice(&self, i: usize) -> bool {
+        self.pad_voices
+            .iter()
+            .any(|v| v.pad == i && !v.player.empty())
+    }
+
+    /// PANIC: stop the main player + every pad voice at once (all sound off).
+    fn panic(&mut self) {
+        self.stop();
+        self.pad_voices.clear();
+    }
+
     /// Peak level (0..1) per pad from its live voice(s), for the 16 VU meters — mirrors
-    /// `current_level`: a ~20 ms window around each voice's (pitch-scaled) playhead.
+    /// `current_level`: a ~20 ms window around each voice's (pitch-scaled) playhead. The playhead
+    /// is wrapped modulo the buffer so a **looping** voice (whose `get_pos` runs past the end)
+    /// still reads a live level instead of dropping to 0.
     fn pad_levels(&self) -> [f32; PAD_COUNT] {
         let mut out = [0f32; PAD_COUNT];
         for v in &self.pad_voices {
@@ -15163,7 +15229,9 @@ impl AudioPlayer {
             let ch = v.buf.channels.get() as usize;
             let sr = v.buf.sample_rate.get() as f32;
             let n = v.buf.samples.len();
-            let center = ((v.player.get_pos().as_secs_f32() * v.speed * sr) as usize).saturating_mul(ch);
+            let n_frames = (n / ch.max(1)).max(1);
+            let pos_frames = (v.player.get_pos().as_secs_f32() * v.speed * sr) as usize;
+            let center = (pos_frames % n_frames) * ch; // wrap for looping voices
             let half = (sr as usize / 100).saturating_mul(ch); // ~10 ms each side
             let s = center.saturating_sub(half).min(n);
             let e = (center + half).min(n);
