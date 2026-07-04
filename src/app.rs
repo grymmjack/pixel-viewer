@@ -3480,8 +3480,8 @@ impl PixelView {
             }
             // Pin the transport glyph buttons to a fixed size: the ⏸/▶ glyphs have different
             // advance widths, so a bare button resizes on play/pause and shoves the row sideways
-            // ("jiggle"). A shared min_size makes both states occupy the same width.
-            let tbtn = egui::vec2(30.0, ui.spacing().interact_size.y);
+            // ("jiggle"). A shared min_size (widest of the three glyphs) makes every state one width.
+            let tbtn = fixed_btn_size(ui, &["⏸", "▶", "⏹"]);
             if ui
                 .add(egui::Button::new(if playing { "⏸" } else { "▶" }).min_size(tbtn))
                 .on_hover_text("Play / pause (Space)")
@@ -5982,7 +5982,10 @@ impl PixelView {
                 key = SortKey::COMMON[ki];
             }
             if ui
-                .button(if desc { "↓ Desc" } else { "↑ Asc" })
+                .add(
+                    egui::Button::new(if desc { "↓ Desc" } else { "↑ Asc" })
+                        .min_size(fixed_btn_size(ui, &["↓ Desc", "↑ Asc"])),
+                )
                 .on_hover_text("Toggle ascending/descending")
                 .clicked()
             {
@@ -9549,11 +9552,10 @@ impl PixelView {
                 if !immersive {
                     ui.horizontal(|ui| {
                         if ui
-                            .button(if anim.playing {
-                                "⏸ Pause"
-                            } else {
-                                "▶ Play"
-                            })
+                            .add(
+                                egui::Button::new(if anim.playing { "⏸ Pause" } else { "▶ Play" })
+                                    .min_size(fixed_btn_size(ui, &["⏸ Pause", "▶ Play"])),
+                            )
                             .clicked()
                         {
                             anim.playing = !anim.playing;
@@ -9654,7 +9656,10 @@ impl PixelView {
                 if !immersive {
                     ui.horizontal(|ui| {
                         if ui
-                            .button(if p.playing { "⏸ Pause" } else { "▶ Play" })
+                            .add(
+                                egui::Button::new(if p.playing { "⏸ Pause" } else { "▶ Play" })
+                                    .min_size(fixed_btn_size(ui, &["⏸ Pause", "▶ Play"])),
+                            )
                             .clicked()
                         {
                             if p.pos >= p.len {
@@ -11189,20 +11194,44 @@ impl PixelView {
                         // ("N×", always a whole step) — clearer than a fractional % on a
                         // scaled display (e.g. 308%). Free zoom still reads as a %.
                         let ppp = ui.ctx().pixels_per_point();
-                        if self.viewing_textmode || self.zoom_lock {
+                        let (zlabel, zhover) = if self.viewing_textmode || self.zoom_lock {
                             // N× when upscaling, 1/N× when zoomed out below 1:1.
                             let dev = pp_device_scale(self.zoom * ppp);
-                            let label = if dev >= 1.0 {
+                            let l = if dev >= 1.0 {
                                 format!("{}×", dev.round() as i32)
                             } else {
                                 format!("1/{}×", (1.0 / dev).round() as i32)
                             };
-                            ui.label(label).on_hover_text(
+                            (
+                                l,
                                 "Device pixels per source pixel — pixel-perfect whole steps \
                                  (1/N× when zoomed out below 1:1)",
-                            );
+                            )
                         } else {
-                            ui.label(format!("{:.0}%", self.zoom * 100.0));
+                            (format!("{:.0}%", self.zoom * 100.0), "")
+                        };
+                        // Fixed width for the readout so it can't shove Snap / Fit W sideways as the
+                        // value changes width while you zoom (e.g. "1×" → "1000%" → "1/16×").
+                        let body = egui::TextStyle::Body.resolve(ui.style());
+                        let zw = ["1000%", "1/16×"]
+                            .iter()
+                            .map(|s| {
+                                ui.painter()
+                                    .layout_no_wrap(
+                                        (*s).to_string(),
+                                        body.clone(),
+                                        egui::Color32::WHITE,
+                                    )
+                                    .size()
+                                    .x
+                            })
+                            .fold(0.0f32, f32::max);
+                        let zresp = ui.add_sized(
+                            egui::vec2(zw, ui.spacing().interact_size.y),
+                            egui::Label::new(zlabel),
+                        );
+                        if !zhover.is_empty() {
+                            zresp.on_hover_text(zhover);
                         }
                         if ui
                             .checkbox(&mut self.zoom_lock, "Snap")
@@ -11741,7 +11770,13 @@ impl PixelView {
                     } else {
                         ("🔊", "Mute audio")
                     };
-                    if ui.button(icon).on_hover_text(tip).clicked() {
+                    // Fixed width: 🔇/🔊 differ, and shrinking here would slide the VU + pill (added
+                    // after it in this right-to-left row) as you mute/unmute.
+                    if ui
+                        .add(egui::Button::new(icon).min_size(fixed_btn_size(ui, &["🔇", "🔊"])))
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
                         audio_mute = true;
                     }
                     // While something is playing, show a live VU meter + a clickable "PLAYING …"
@@ -13335,6 +13370,26 @@ fn blend_toward(base: egui::Color32, accent: [u8; 3], t: f32) -> egui::Color32 {
         mix(base.g(), accent[1]),
         mix(base.b(), accent[2]),
     )
+}
+
+/// A `min_size` that fits the **widest** of `labels` at the current button style, so a button
+/// whose text changes between states (▶/⏸, ↑ Asc/↓ Desc, 🔊/🔇, ▶ Play/⏸ Pause) renders at one
+/// fixed width in every state and never resizes to shove the rest of its row sideways ("jiggle").
+/// Measures the actual galleys (font-robust — no magic pixel widths). Height = the standard
+/// interactive-widget height so pinned buttons still align with their neighbours.
+fn fixed_btn_size(ui: &egui::Ui, labels: &[&str]) -> egui::Vec2 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let pad = ui.spacing().button_padding;
+    let w = labels
+        .iter()
+        .map(|s| {
+            ui.painter()
+                .layout_no_wrap((*s).to_string(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        })
+        .fold(0.0f32, f32::max);
+    egui::vec2(w + pad.x * 2.0, ui.spacing().interact_size.y.max(font.size + pad.y * 2.0))
 }
 
 /// A full-width horizontal drag handle (a row of dots) for resizing the region above it. Returns
