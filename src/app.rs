@@ -791,6 +791,7 @@ pub struct PixelView {
     pdf_cache: HashMap<PathBuf, Option<crate::decode::PdfMeta>>, // lazy PDF metadata for Details
     pdf_view: Option<PdfView>, // in-app multi-page PDF viewer state (None = not viewing a PDF)
     audio_cache: HashMap<PathBuf, Option<crate::decode::AudioInfo>>, // lazy audio metadata
+    tracker_cache: HashMap<PathBuf, Option<crate::libxmp::TrackerInfo>>, // lazy module structure
     sf_cache: HashMap<PathBuf, Option<crate::soundfont::SoundFontInfo>>, // lazy .sf2 directory info
     sfz_cache: HashMap<PathBuf, Option<crate::sfz::SfzInfo>>, // lazy .sfz directory info
     dls_cache: HashMap<PathBuf, Option<crate::dls::DlsInfo>>, // lazy .dls directory info
@@ -1676,6 +1677,7 @@ impl PixelView {
             pdf_cache: HashMap::new(),
             pdf_view: None,
             audio_cache: HashMap::new(),
+            tracker_cache: HashMap::new(),
             audio_decode_cache: Vec::new(),
             audio_loading: None,
             sf_cache: HashMap::new(),
@@ -2483,6 +2485,28 @@ impl PixelView {
             self.audio_cache.insert(path.to_path_buf(), info);
         }
         self.audio_cache.get(path).cloned().flatten()
+    }
+
+    /// Lazily parse + cache a tracker module's structure (channels / patterns / samples / length)
+    /// via libxmp — the metadata symphonia can't give for MOD/XM/S3M/IT/669/FAR/… Used by the grid
+    /// hover + Details pane so a module shows real info, not image dimensions.
+    fn tracker_info(&mut self, path: &Path) -> Option<crate::libxmp::TrackerInfo> {
+        if !self.tracker_cache.contains_key(path) {
+            let real = self.resolve_local(path);
+            let info = std::fs::read(&real)
+                .ok()
+                .and_then(|b| crate::libxmp::module_info(&b));
+            self.tracker_cache.insert(path.to_path_buf(), info);
+        }
+        self.tracker_cache.get(path).cloned().flatten()
+    }
+
+    /// True if `path` is a tracker module (any format libxmp can parse for structure metadata).
+    fn is_module_ext(path: &Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .is_some_and(|e| is_tracker_ext(&e) || is_libxmp_ext(&e))
     }
 
     /// Lazily parse + cache a SoundFont's directory (preset / instrument / sample counts) for
@@ -8364,7 +8388,21 @@ impl PixelView {
                         if resp.hovered() {
                             hovered = Some(idx);
                         }
-                        let resp = resp.on_hover_ui(|ui| hover_details(ui, &entry, meta));
+                        // Fetch audio / module metadata only for the hovered tile (cached after),
+                        // so the tooltip shows real audio info, not the placeholder's image dims.
+                        let (audio, tracker) = if resp.hovered() {
+                            let a = is_audio_ext(path)
+                                .then(|| self.audio_info(path))
+                                .flatten();
+                            let t = Self::is_module_ext(path)
+                                .then(|| self.tracker_info(path))
+                                .flatten();
+                            (a, t)
+                        } else {
+                            (None, None)
+                        };
+                        let resp = resp
+                            .on_hover_ui(|ui| hover_details(ui, &entry, meta, audio, tracker));
                         if resp.clicked() {
                             clicked = Some((idx, ui.input(|i| i.modifiers)));
                         }
@@ -9203,7 +9241,19 @@ impl PixelView {
                 }
 
                 if let Some(resp) = row_resp {
-                    let resp = resp.on_hover_ui(|ui| hover_details(ui, &entry, meta));
+                    let (audio, tracker) = if resp.hovered() {
+                        let a = is_audio_ext(&path)
+                            .then(|| self.audio_info(&path))
+                            .flatten();
+                        let t = Self::is_module_ext(&path)
+                            .then(|| self.tracker_info(&path))
+                            .flatten();
+                        (a, t)
+                    } else {
+                        (None, None)
+                    };
+                    let resp = resp
+                        .on_hover_ui(|ui| hover_details(ui, &entry, meta, audio, tracker));
                     if resp.hovered() {
                         hovered = Some(idx);
                     }
@@ -17053,7 +17103,13 @@ fn colo_walk(
     let _ = tx.send(ColoMsg::Done(count));
 }
 
-fn hover_details(ui: &mut egui::Ui, entry: &Entry, meta: Option<ImgMeta>) {
+fn hover_details(
+    ui: &mut egui::Ui,
+    entry: &Entry,
+    meta: Option<ImgMeta>,
+    audio: Option<crate::decode::AudioInfo>,
+    tracker: Option<crate::libxmp::TrackerInfo>,
+) {
     // Pin the tooltip to a consistent width. Without this, egui shrinks it to the
     // space available near a panel/screen edge (the leftmost grid column), which
     // wraps the long filename one word per line.
@@ -17070,7 +17126,51 @@ fn hover_details(ui: &mut egui::Ui, entry: &Entry, meta: Option<ImgMeta>) {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_uppercase();
-    if let Some(m) = meta {
+    let chan = |c: u16| match c {
+        1 => "Mono".to_string(),
+        2 => "Stereo".to_string(),
+        n => format!("{n} ch"),
+    };
+    if let Some(t) = tracker {
+        // Tracker module: show its real structure, never image dimensions.
+        if t.format.is_empty() {
+            ui.label(format!("{fmt} module"));
+        } else {
+            ui.label(format!("{fmt} · {}", t.format));
+        }
+        ui.label(format!("{} channels · {} patterns", t.channels, t.patterns));
+        ui.label(format!("{} instruments · {} samples", t.instruments, t.samples));
+        if t.duration_ms > 0 {
+            ui.label(format!(
+                "Length: {} · {} pos",
+                fmt_hms(t.duration_ms as f32 / 1000.0),
+                t.length
+            ));
+        } else if t.length > 0 {
+            ui.label(format!("{} positions", t.length));
+        }
+    } else if let Some(a) = audio {
+        // PCM/compressed audio (wav/mp3/ogg/flac): rate / channels / bit depth / length / samples.
+        ui.label(format!("{fmt}   {}", chan(a.channels)));
+        let depth = a
+            .bits_per_sample
+            .map(|b| format!(" · {b}-bit"))
+            .unwrap_or_default();
+        ui.label(format!("{} Hz{depth}", a.sample_rate));
+        if a.duration_secs > 0.0 {
+            ui.label(format!("Length: {}", fmt_hms(a.duration_secs)));
+        }
+        if a.frames > 0 {
+            ui.label(format!("{} samples", a.frames));
+        }
+    } else if is_audio_ext(&entry.path) {
+        // An audio file we can't parse (voc/au/midi) — still not an image, so no dims/colors.
+        ui.label(if fmt.is_empty() {
+            "Audio".to_string()
+        } else {
+            format!("{fmt} audio")
+        });
+    } else if let Some(m) = meta {
         ui.label(format!("{}×{}   {}", m.w, m.h, fmt));
         match m.colors {
             Some(c) => ui.label(format!("{c} colors")),
@@ -17083,6 +17183,16 @@ fn hover_details(ui: &mut egui::Ui, entry: &Entry, meta: Option<ImgMeta>) {
     ui.label(format!("Rating: {}", stars_label(entry.rating)));
     if let Some(t) = entry.mtime {
         ui.label(format!("Modified: {}", fmt_time(t)));
+    }
+}
+
+/// Format a duration in seconds as `M:SS` (or `H:MM:SS` past an hour).
+fn fmt_hms(secs: f32) -> String {
+    let s = secs.max(0.0).round() as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
     }
 }
 

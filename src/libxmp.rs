@@ -16,6 +16,19 @@ extern "C" {
     fn xmp_play_buffer(ctx: XmpContext, buffer: *mut c_void, size: c_int, loops: c_int) -> c_int;
     fn xmp_end_player(ctx: XmpContext);
     fn xmp_get_frame_info(ctx: XmpContext, info: *mut c_void);
+    fn xmp_get_module_info(ctx: XmpContext, info: *mut c_void);
+}
+
+/// Lightweight module metadata (no audio synthesis) for the Details pane + grid hover.
+#[derive(Clone, Default)]
+pub struct TrackerInfo {
+    pub channels: u32,
+    pub patterns: u32,
+    pub instruments: u32,
+    pub samples: u32,
+    pub length: u32,      // module length in patterns (positions in the order list)
+    pub duration_ms: i32, // libxmp's computed total replay time
+    pub format: String,   // module `type` string (e.g. "Protracker", "Scream Tracker 3")
 }
 
 /// libxmp's computed total replay time in ms (the `total_time` field at byte offset 32 of
@@ -90,4 +103,62 @@ unsafe fn render_into(ctx: XmpContext, bytes: &[u8], rate: c_int, cap: usize) ->
     } else {
         Some(out)
     }
+}
+
+/// Parse a module's structure (channels / patterns / instruments / samples / length + duration)
+/// **without** synthesizing audio — cheap enough for a grid-hover tooltip. Returns `None` if
+/// libxmp can't load the bytes. Reads the `xmp_module_info` / `xmp_module` C structs by field
+/// offset (like `total_time_ms`) to avoid declaring the full struct layout over FFI.
+pub fn module_info(bytes: &[u8]) -> Option<TrackerInfo> {
+    unsafe {
+        let ctx = xmp_create_context();
+        if ctx.is_null() {
+            return None;
+        }
+        let out = module_info_into(ctx, bytes);
+        xmp_free_context(ctx);
+        out
+    }
+}
+
+/// # Safety
+/// `ctx` must be a live context. Loads the module, reads its structure, and tears it down.
+unsafe fn module_info_into(ctx: XmpContext, bytes: &[u8]) -> Option<TrackerInfo> {
+    if xmp_load_module_from_memory(ctx, bytes.as_ptr() as *const c_void, bytes.len() as c_long) != 0
+    {
+        return None;
+    }
+    // start_player scans the sequence to compute its duration (no audio synthesis); it may fail on
+    // an odd module, in which case we still report the structure with duration 0.
+    let started = xmp_start_player(ctx, 44_100, 0) == 0;
+    let duration_ms = if started { total_time_ms(ctx) } else { 0 };
+    // `struct xmp_module_info`: the `struct xmp_module *mod` pointer sits at byte offset 24
+    // (md5[16] + int vol_base + 4 bytes padding to 8-align the pointer on LP64).
+    let mut mi = [0u64; 8]; // 64 bytes, 8-aligned — larger than the struct
+    xmp_get_module_info(ctx, mi.as_mut_ptr() as *mut c_void);
+    let mod_ptr = *(mi.as_ptr() as *const u8).add(24).cast::<usize>() as *const u8;
+    let info = if mod_ptr.is_null() {
+        None
+    } else {
+        // `struct xmp_module`: name[64], type[64], then int fields — pat@128, trk@132, chn@136,
+        // ins@140, smp@144, spd@148, bpm@152, len@156.
+        let read_i32 = |off: usize| mod_ptr.add(off).cast::<i32>().read_unaligned();
+        let type_bytes = std::slice::from_raw_parts(mod_ptr.add(64), 64);
+        let end = type_bytes.iter().position(|&b| b == 0).unwrap_or(64);
+        let format = String::from_utf8_lossy(&type_bytes[..end]).trim().to_string();
+        Some(TrackerInfo {
+            patterns: read_i32(128).max(0) as u32,
+            channels: read_i32(136).max(0) as u32,
+            instruments: read_i32(140).max(0) as u32,
+            samples: read_i32(144).max(0) as u32,
+            length: read_i32(156).max(0) as u32,
+            duration_ms,
+            format,
+        })
+    };
+    if started {
+        xmp_end_player(ctx);
+    }
+    xmp_release_module(ctx);
+    info
 }

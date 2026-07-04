@@ -33,6 +33,8 @@ pub struct AudioInfo {
     pub sample_rate: u32,
     pub channels: u16,
     pub codec: String,
+    pub bits_per_sample: Option<u32>, // None when the codec has no fixed bit depth (e.g. MP3)
+    pub frames: u64,                  // decoded sample frames (per channel), 0 if unknown
 }
 
 /// A byte-slice media source (symphonia impls `MediaSource` only for `File`).
@@ -94,11 +96,14 @@ pub fn audio_info(bytes: &[u8], ext: &str) -> Option<AudioInfo> {
         0.0
     };
     let codec = codec_label(ext);
+    let bits_per_sample = params.bits_per_sample;
     Some(AudioInfo {
         duration_secs,
         sample_rate,
         channels,
         codec,
+        bits_per_sample,
+        frames,
     })
 }
 
