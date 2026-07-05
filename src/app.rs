@@ -802,6 +802,7 @@ pub struct PixelView {
     audio_autoplay: bool,      // start playing on select + loop until stopped (persisted)
     wave_drag: Option<WaveDrag>, // active waveform-editor drag (transient)
     wave_view: Option<(f32, f32)>, // zoomed view window (start,end secs); None = whole file (transient)
+    zoom_edit_pct: u32, // "Zoom Edit %": magnification of the edge inset (0 = off); persisted
     audio_octave: i32,         // onscreen-keyboard octave offset (transient)
     audio_volume: f32,         // master playback volume 0..1 (menu-bar slider, persisted)
     audio_muted: bool,         // master mute (menu-bar speaker toggle, persisted)
@@ -1180,6 +1181,7 @@ impl PixelView {
     const TITLE_PATH_KEY: &'static str = "title_show_path";
     const WINDOW_GEOM_KEY: &'static str = "window_geom"; // [x, y, w, h]: restore last window place
     const SAMPLE_PLACES_KEY: &'static str = "sample_places"; // user Samples locations
+    const ZOOM_EDIT_KEY: &'static str = "zoom_edit_pct"; // waveform edge-inset magnification
     const RECOLOR_KEY: &'static str = "show_recolor";
     const RECOLOR_GRID_KEY: &'static str = "recolor_grid";
     const ZOOM_LOCK_KEY: &'static str = "zoom_lock";
@@ -1701,6 +1703,10 @@ impl PixelView {
             audio_autoplay,
             wave_drag: None,
             wave_view: None,
+            zoom_edit_pct: cc
+                .storage
+                .and_then(|s| eframe::get_value::<u32>(s, Self::ZOOM_EDIT_KEY))
+                .unwrap_or(1000),
             audio_octave: 0,
             audio_volume,
             audio_muted,
@@ -3752,24 +3758,61 @@ impl PixelView {
             // Mousewheel over the waveform (and NOT on a selection edge — Phase 3 nudges the edge
             // there) zooms the view around the cursor. Consume the scroll so the surrounding
             // ScrollArea doesn't also scroll. Wheel up = zoom in; zoom all the way out → full file.
-            if resp.hovered() && hovered_edge.is_none() && self.wave_drag.is_none() {
-                let (scroll, shift) = ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.shift));
-                if scroll.abs() > 0.1 {
-                    ui.input_mut(|i| {
-                        i.smooth_scroll_delta = egui::Vec2::ZERO;
-                    });
-                    if shift {
-                        // Shift+wheel pans the zoomed view left/right (no-op at full zoom-out).
-                        let delta = -(scroll / 120.0) * vspan * 0.5;
+            if resp.hovered() && self.wave_drag.is_none() {
+                // Discrete wheel notches (from raw events) so an edge nudges an exact sample count.
+                let (notches, shift, alt) = ui.input(|i| {
+                    let n: f32 = i
+                        .events
+                        .iter()
+                        .filter_map(|e| match e {
+                            egui::Event::MouseWheel { delta, .. } => Some(delta.y),
+                            _ => None,
+                        })
+                        .sum();
+                    (n, i.modifiers.shift, i.modifiers.alt)
+                });
+                if notches.abs() > 0.0 {
+                    ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO); // don't scroll the page
+                    let up = notches > 0.0;
+                    if let Some(edge) = hovered_edge {
+                        // Item 7: nudge the hovered edge. Wheel up = grow (edge outward, wider);
+                        // down = shrink (inward). Shift = 10 samples, Shift+Alt = zero crossing.
+                        let steps = (notches.abs().round() as i64).clamp(1, 8);
+                        let cur_t = if edge == Edge::Left { sel_lo } else { sel_hi };
+                        let cur_f =
+                            (cur_t * sr).round().clamp(0.0, nframes.saturating_sub(1) as f32) as usize;
+                        let outward: i64 = if edge == Edge::Left { -1 } else { 1 };
+                        let dir: i64 = if up { outward } else { -outward };
+                        let new_f: i64 = if shift && alt {
+                            let mut f = cur_f;
+                            for _ in 0..steps {
+                                f = next_zero_crossing(&ap.samples, ch, f, dir > 0);
+                            }
+                            f as i64
+                        } else {
+                            let per = if shift { 10 } else { 1 };
+                            cur_f as i64 + dir * per * steps
+                        };
+                        let new_t = new_f.clamp(0, nframes.saturating_sub(1) as i64) as f32 / sr;
+                        let (a, b) = if edge == Edge::Left {
+                            (new_t, sel_hi)
+                        } else {
+                            (sel_lo, new_t)
+                        };
+                        want_select = Some((a.min(b), a.max(b)));
+                        want_commit = true;
+                    } else if shift {
+                        // Shift+wheel pans the zoomed view (no-op at full zoom-out).
+                        let delta = -notches * vspan * 0.15;
                         let nvs = (vs + delta).clamp(0.0, (dur - vspan).max(0.0));
                         if self.wave_view.is_some() {
                             self.wave_view = Some((nvs, nvs + vspan));
                         }
                     } else {
-                        // Wheel zooms around the cursor. Zoom fully out → whole file.
+                        // Wheel zooms around the cursor; zoom fully out → whole file.
                         let cursor_t = hover_x.map(&t_at).unwrap_or((vs + ve) * 0.5);
-                        let min_span = (48.0 / sr).max(1e-4); // ≈48 frames wide at max zoom
-                        let factor = (-scroll * 0.004).exp(); // scroll up (+) → shrink span → zoom in
+                        let min_span = (48.0 / sr).max(1e-4);
+                        let factor = (1.0f32 / 1.3).powf(notches); // up (+) → shrink span → zoom in
                         let new_span = (vspan * factor).clamp(min_span, dur);
                         if new_span >= dur - 1e-4 {
                             self.wave_view = None;
@@ -3894,7 +3937,88 @@ impl PixelView {
                     egui::Color32::from_rgb(150, 220, 170),
                 );
             }
-            ui.weak("drag: select · edges: ↔ · inside: move · wheel: zoom · click: seek · dbl: all/reset zoom");
+            // Item 6: a zoomed edge inset — while hovering/dragging a selection edge, overlay a
+            // magnified strip around that edge (per-sample detail) so nudges are precise. The
+            // magnification is the "Zoom Edit %" preference (0 = off).
+            let inset_edge = active_edge.or(hovered_edge);
+            if self.zoom_edit_pct > 0 && nframes > 0 {
+                if let Some(edge) = inset_edge {
+                    let edge_t = if edge == Edge::Left { draw_lo } else { draw_hi };
+                    let half = (sr * 0.05 * 100.0 / self.zoom_edit_pct as f32).max(16.0);
+                    let ef = edge_t * sr;
+                    let ws = (ef - half).max(0.0);
+                    let we = (ef + half).min(nframes as f32).max(ws + 1.0);
+                    let span_f = we - ws;
+                    let inset_h = (h * 0.55).clamp(50.0, 150.0);
+                    let ir = egui::Rect::from_min_max(
+                        rect.left_top(),
+                        egui::pos2(rect.right(), rect.top() + inset_h),
+                    );
+                    p.rect_filled(ir, 3.0, egui::Color32::from_rgba_unmultiplied(8, 12, 20, 240));
+                    p.rect_stroke(ir, 3.0, egui::Stroke::new(1.0, GREEN), egui::StrokeKind::Inside);
+                    let iw = ir.width().max(1.0);
+                    let imid = ir.center().y;
+                    p.hline(ir.x_range(), imid, egui::Stroke::new(1.0, accent.gamma_multiply(0.3)));
+                    for cx in 0..(iw as usize) {
+                        let f0 = (ws + (cx as f32 / iw) * span_f) as usize;
+                        let f1 =
+                            ((ws + ((cx + 1) as f32 / iw) * span_f) as usize).clamp(f0 + 1, nframes);
+                        let mut mx = 0.0f32;
+                        for f in f0..f1 {
+                            let base = f * ch;
+                            for c in 0..ch {
+                                if let Some(&s) = ap.samples.get(base + c) {
+                                    mx = mx.max(s.abs());
+                                }
+                            }
+                        }
+                        let hh = (mx * (inset_h * 0.42)).max(0.5);
+                        let x = ir.left() + cx as f32;
+                        p.line_segment(
+                            [egui::pos2(x, imid - hh), egui::pos2(x, imid + hh)],
+                            egui::Stroke::new(1.0, accent),
+                        );
+                    }
+                    // The edge itself, centered-ish, in bright green.
+                    let ex = ir.left() + ((ef - ws) / span_f).clamp(0.0, 1.0) * iw;
+                    p.vline(ex, ir.y_range(), egui::Stroke::new(1.5, GREEN_HOT));
+                    p.text(
+                        ir.left_top() + egui::vec2(4.0, 2.0),
+                        egui::Align2::LEFT_TOP,
+                        format!(
+                            "edit ×{}  ·  {} edge @ {} smp",
+                            self.zoom_edit_pct,
+                            if edge == Edge::Left { "L" } else { "R" },
+                            ef.round() as i64
+                        ),
+                        egui::FontId::proportional(10.0),
+                        egui::Color32::from_rgb(150, 220, 170),
+                    );
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.weak("drag: select · edges: ↔ · wheel: zoom · over edge → wheel nudge ±1 (Shift 10, +Alt zero-x)");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("zoom_edit_pct")
+                        .selected_text(if self.zoom_edit_pct == 0 {
+                            "Zoom Edit: off".to_string()
+                        } else {
+                            format!("Zoom Edit: {}%", self.zoom_edit_pct)
+                        })
+                        .show_ui(ui, |ui| {
+                            for v in [0u32, 200, 400, 1000, 2000, 4000] {
+                                let label = if v == 0 {
+                                    "off".to_string()
+                                } else {
+                                    format!("{v}%")
+                                };
+                                ui.selectable_value(&mut self.zoom_edit_pct, v, label);
+                            }
+                        })
+                        .response
+                        .on_hover_text("Magnification of the edge-edit inset shown while adjusting a selection edge");
+                });
+            });
             // Resize the waveform height (big view only).
             if big {
                 let dy = drag_h_divider(ui, ui.available_width());
@@ -13527,6 +13651,7 @@ impl eframe::App for PixelView {
             eframe::set_value(storage, Self::WINDOW_GEOM_KEY, &g);
         }
         eframe::set_value(storage, Self::SAMPLE_PLACES_KEY, &self.sample_places);
+        eframe::set_value(storage, Self::ZOOM_EDIT_KEY, &self.zoom_edit_pct);
         eframe::set_value(storage, Self::ZOOM_KEY, &self.ui_zoom);
         eframe::set_value(storage, Self::THUMB_KEY, &self.thumb_size);
         eframe::set_value(storage, Self::FAV_KEY, &self.favorites);
@@ -15634,6 +15759,42 @@ fn reverse_frames(samples: &[f32], ch: usize) -> Vec<f32> {
         out.extend_from_slice(&samples[f * ch..f * ch + ch]);
     }
     out
+}
+
+/// The next frame (strictly past `from`) where the mono-summed signal changes sign — for
+/// snapping a selection edge to a zero crossing so a loop/slice doesn't click. `forward` scans
+/// toward the end; otherwise toward the start. Returns the file boundary if none is found.
+fn next_zero_crossing(samples: &[f32], ch: usize, from: usize, forward: bool) -> usize {
+    let ch = ch.max(1);
+    let nframes = samples.len() / ch;
+    if nframes == 0 {
+        return 0;
+    }
+    let mono = |f: usize| -> f32 {
+        let base = f * ch;
+        (0..ch).map(|c| samples.get(base + c).copied().unwrap_or(0.0)).sum::<f32>() / ch as f32
+    };
+    let start = from.min(nframes - 1);
+    let mut prev = mono(start);
+    if forward {
+        for f in (start + 1)..nframes {
+            let cur = mono(f);
+            if (prev <= 0.0 && cur > 0.0) || (prev >= 0.0 && cur < 0.0) {
+                return f;
+            }
+            prev = cur;
+        }
+        nframes - 1
+    } else {
+        for f in (0..start).rev() {
+            let cur = mono(f);
+            if (prev <= 0.0 && cur > 0.0) || (prev >= 0.0 && cur < 0.0) {
+                return f;
+            }
+            prev = cur;
+        }
+        0
+    }
 }
 
 /// Build the playable sample vec for a pad hit: the `[start,end)` region of `buf` with its
@@ -18227,6 +18388,25 @@ mod tests {
         // A light base tints toward the accent from the other side.
         let light = blend_toward(egui::Color32::from_rgb(240, 240, 240), accent, 0.25);
         assert_eq!(light, egui::Color32::from_rgb(230, 205, 190));
+    }
+
+    #[test]
+    fn zero_crossing_finds_sign_changes_both_ways() {
+        // Mono ramp crossing zero between frames 2→3 and 5→6 (+ → −).
+        let s = [0.3f32, 0.2, 0.1, -0.1, -0.2, 0.1, -0.3, -0.1];
+        // Forward from frame 0 → first crossing at frame 3 (0.1 → -0.1).
+        assert_eq!(next_zero_crossing(&s, 1, 0, true), 3);
+        // Forward from frame 3 → next crossing at frame 5 (-0.2 → 0.1).
+        assert_eq!(next_zero_crossing(&s, 1, 3, true), 5);
+        // Backward from frame 5 → the nearest crossing behind it (4→5) lands on frame 4.
+        assert_eq!(next_zero_crossing(&s, 1, 5, false), 4);
+        // Backward from frame 4 → the earlier crossing (2→3) lands on frame 2.
+        assert_eq!(next_zero_crossing(&s, 1, 4, false), 2);
+        // No crossing ahead → returns the last frame.
+        assert_eq!(next_zero_crossing(&[0.1f32, 0.2, 0.3], 1, 0, true), 2);
+        // Stereo (2ch) averages the pair; crossing between frame 1 and 2.
+        let st = [0.5f32, 0.5, 0.1, 0.1, -0.2, -0.2];
+        assert_eq!(next_zero_crossing(&st, 2, 0, true), 2);
     }
 
     #[test]
