@@ -5071,7 +5071,49 @@ impl PixelView {
                                         .size(10.0)
                                         .color(egui::Color32::from_gray(120)),
                                 );
-                                // Note first (right-aligned) so the name can take all the room left.
+                                // Name, left-aligned right after the number (fills the width).
+                                let renaming =
+                                    matches!(&self.pad_rename, Some((ri, _)) if *ri == i);
+                                if renaming {
+                                    let mut buf = self
+                                        .pad_rename
+                                        .as_ref()
+                                        .map(|(_, b)| b.clone())
+                                        .unwrap_or_default();
+                                    let r = ui.add(
+                                        egui::TextEdit::singleline(&mut buf)
+                                            .id(egui::Id::new(("pad_rename", i)))
+                                            .desired_width((cell_w - 66.0).max(40.0))
+                                            .font(egui::FontId::proportional(10.0)),
+                                    );
+                                    rename_buf = Some(buf.clone());
+                                    if r.lost_focus() {
+                                        if ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                                            rename_commit = Some((i, buf));
+                                        } else {
+                                            rename_cancel = true;
+                                        }
+                                    }
+                                } else if !empty {
+                                    // Fit as many chars of the name as the pad width allows.
+                                    let max_chars = ((cell_w - 66.0) / 5.5).max(4.0) as usize;
+                                    let lbl = ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(elide(&name, max_chars))
+                                                .size(10.0)
+                                                .color(egui::Color32::from_gray(215)),
+                                        )
+                                        .sense(egui::Sense::click())
+                                        .truncate(),
+                                    );
+                                    if lbl
+                                        .on_hover_text("Double-click to rename")
+                                        .double_clicked()
+                                    {
+                                        rename_start = Some(i);
+                                    }
+                                }
+                                // Assigned note, right-aligned.
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
@@ -5084,49 +5126,6 @@ impl PixelView {
                                                 },
                                             ),
                                         );
-                                        let renaming =
-                                            matches!(&self.pad_rename, Some((ri, _)) if *ri == i);
-                                        if renaming {
-                                            let mut buf = self
-                                                .pad_rename
-                                                .as_ref()
-                                                .map(|(_, b)| b.clone())
-                                                .unwrap_or_default();
-                                            let r = ui.add(
-                                                egui::TextEdit::singleline(&mut buf)
-                                                    .id(egui::Id::new(("pad_rename", i)))
-                                                    .desired_width(f32::INFINITY)
-                                                    .font(egui::FontId::proportional(10.0)),
-                                            );
-                                            rename_buf = Some(buf.clone());
-                                            if r.lost_focus() {
-                                                if ui.input(|inp| inp.key_pressed(egui::Key::Enter))
-                                                {
-                                                    rename_commit = Some((i, buf));
-                                                } else {
-                                                    rename_cancel = true;
-                                                }
-                                            }
-                                        } else if !empty {
-                                            // Fit as many chars of the name as the pad width allows.
-                                            let max_chars =
-                                                ((cell_w - 46.0) / 5.5).max(4.0) as usize;
-                                            let lbl = ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(elide(&name, max_chars))
-                                                        .size(10.0)
-                                                        .color(egui::Color32::from_gray(215)),
-                                                )
-                                                .sense(egui::Sense::click())
-                                                .truncate(),
-                                            );
-                                            if lbl
-                                                .on_hover_text("Double-click to rename")
-                                                .double_clicked()
-                                            {
-                                                rename_start = Some(i);
-                                            }
-                                        }
                                     },
                                 );
                             });
