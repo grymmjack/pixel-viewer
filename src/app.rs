@@ -803,6 +803,15 @@ pub struct PixelView {
     wave_drag: Option<WaveDrag>, // active waveform-editor drag (transient)
     wave_view: Option<(f32, f32)>, // zoomed view window (start,end secs); None = whole file (transient)
     zoom_edit_pct: u32, // "Zoom Edit %": magnification of the edge inset (0 = off); persisted
+    // Transient / BPM / musical-grid state (item 10). Marks are detected times (secs), cached for
+    // the current buffer and recomputed when the sensitivity or buffer changes.
+    transients_on: bool,        // detect + draw transient guideline markers (persisted)
+    transient_sens: f32,        // detection sensitivity 0..1 (persisted)
+    transient_marks: Vec<f32>,  // detected transient times (secs), for markers + Alt-snap
+    transient_dirty: bool,      // recompute marks next frame (buffer/sensitivity changed)
+    bpm: f32,                   // tempo for the musical grid (persisted)
+    musical_on: bool,           // draw a musical (beat-division) grid (persisted)
+    musical_div: u8,            // 0=whole 1=half 2=quarter 3=eighth 4=sixteenth 5=32nd (persisted)
     audio_octave: i32,         // onscreen-keyboard octave offset (transient)
     audio_volume: f32,         // master playback volume 0..1 (menu-bar slider, persisted)
     audio_muted: bool,         // master mute (menu-bar speaker toggle, persisted)
@@ -1182,6 +1191,11 @@ impl PixelView {
     const WINDOW_GEOM_KEY: &'static str = "window_geom"; // [x, y, w, h]: restore last window place
     const SAMPLE_PLACES_KEY: &'static str = "sample_places"; // user Samples locations
     const ZOOM_EDIT_KEY: &'static str = "zoom_edit_pct"; // waveform edge-inset magnification
+    const TRANSIENTS_KEY: &'static str = "transients_on";
+    const TRANSIENT_SENS_KEY: &'static str = "transient_sens";
+    const BPM_KEY: &'static str = "bpm";
+    const MUSICAL_KEY: &'static str = "musical_on";
+    const MUSICAL_DIV_KEY: &'static str = "musical_div";
     const RECOLOR_KEY: &'static str = "show_recolor";
     const RECOLOR_GRID_KEY: &'static str = "recolor_grid";
     const ZOOM_LOCK_KEY: &'static str = "zoom_lock";
@@ -1707,6 +1721,22 @@ impl PixelView {
                 .storage
                 .and_then(|s| eframe::get_value::<u32>(s, Self::ZOOM_EDIT_KEY))
                 .unwrap_or(1000),
+            transients_on: get_bool(Self::TRANSIENTS_KEY).unwrap_or(false),
+            transient_sens: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::TRANSIENT_SENS_KEY))
+                .unwrap_or(0.5),
+            transient_marks: Vec::new(),
+            transient_dirty: true,
+            bpm: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::BPM_KEY))
+                .unwrap_or(120.0),
+            musical_on: get_bool(Self::MUSICAL_KEY).unwrap_or(false),
+            musical_div: cc
+                .storage
+                .and_then(|s| eframe::get_value::<u8>(s, Self::MUSICAL_DIV_KEY))
+                .unwrap_or(2),
             audio_octave: 0,
             audio_volume,
             audio_muted,
@@ -2791,6 +2821,7 @@ impl PixelView {
             return;
         }
         self.wave_view = None; // drilling into a pad's sample resets the zoom
+        self.transient_dirty = true;
         let buf = self.pads[i].buf.clone().unwrap();
         {
             let ap = self.audio_player.as_mut().unwrap();
@@ -2829,6 +2860,7 @@ impl PixelView {
     /// stashed editor buffer + focus (the song / tracker sample you were on before).
     fn focus_back(&mut self) {
         self.wave_view = None; // leaving a pad drill-in resets the zoom
+        self.transient_dirty = true;
         if let (EditFocus::Pad(i), Some(ap)) = (self.edit_focus, self.audio_player.as_ref()) {
             if i < self.pads.len() {
                 self.pads[i].loop_start = ap.sel_start;
@@ -3180,6 +3212,7 @@ impl PixelView {
         // stale Pad focus can't linger (its stash held the *previous* buffer, not this one).
         self.editor_stash = None;
         self.wave_view = None; // a new buffer resets the zoom to the whole file
+        self.transient_dirty = true;
         self.edit_focus = match idx {
             Some(i) => EditFocus::Sample(i),
             None => EditFocus::Song,
@@ -3492,6 +3525,9 @@ impl PixelView {
                     ap.play_region();
                 }
                 self.audio_player = Some(ap);
+                // A freshly loaded buffer resets the editor zoom + transient marks.
+                self.wave_view = None;
+                self.transient_dirty = true;
                 if force_play {
                     self.status = format!("Playing {}", short_name(path));
                 }
@@ -3656,6 +3692,14 @@ impl PixelView {
             let sr = ap.sample_rate.get() as f32;
             let ch = ap.channels.get() as usize;
             let nframes = if ch > 0 { ap.samples.len() / ch } else { 0 };
+            // Recompute transient onset marks when needed (buffer or sensitivity changed).
+            if self.transients_on && self.transient_dirty {
+                self.transient_marks =
+                    detect_transients(&ap.samples, ch, ap.sample_rate.get(), self.transient_sens);
+                self.transient_dirty = false;
+            } else if !self.transients_on && !self.transient_marks.is_empty() {
+                self.transient_marks.clear();
+            }
             // Visible window (seconds). `wave_view` = a zoomed sub-range; None = the whole file.
             let (vs, ve) = {
                 let (a, b) = self.wave_view.unwrap_or((0.0, dur));
@@ -3714,7 +3758,23 @@ impl PixelView {
                             want_select = Some((anchor.min(t), anchor.max(t)));
                         }
                         WaveDrag::Move { width, grab_off } => {
-                            let lo = (t - grab_off).clamp(0.0, (dur - width).max(0.0));
+                            // Item 9: seamless shift; Alt+Shift snaps the leading edge to the
+                            // nearest zero crossing, Alt snaps it to the nearest transient.
+                            let (shift, alt) = ui.input(|i| (i.modifiers.shift, i.modifiers.alt));
+                            let lo0 = (t - grab_off).clamp(0.0, (dur - width).max(0.0));
+                            let lo = if alt && shift {
+                                let f = (lo0 * sr).round() as usize;
+                                let ff = next_zero_crossing(&ap.samples, ch, f, true) as i64;
+                                let fb = next_zero_crossing(&ap.samples, ch, f, false) as i64;
+                                let fi = f as i64;
+                                let nf = if (ff - fi).abs() <= (fi - fb).abs() { ff } else { fb };
+                                (nf.max(0) as f32 / sr).clamp(0.0, (dur - width).max(0.0))
+                            } else if alt && !self.transient_marks.is_empty() {
+                                nearest_mark(&self.transient_marks, lo0)
+                                    .clamp(0.0, (dur - width).max(0.0))
+                            } else {
+                                lo0
+                            };
                             want_select = Some((lo, lo + width));
                         }
                     }
@@ -3893,6 +3953,30 @@ impl PixelView {
                     egui::Stroke::new(1.0, col),
                 );
             }
+            // Musical (beat-division) grid — faint blue lines under everything else (item 10).
+            if self.musical_on && self.bpm > 1.0 {
+                let beats = [4.0f32, 2.0, 1.0, 0.5, 0.25, 0.125][self.musical_div.min(5) as usize];
+                let step = (60.0 / self.bpm) * beats;
+                if step > 1e-4 && step > vspan / (w * 0.5) {
+                    let gcol = egui::Color32::from_rgba_unmultiplied(120, 160, 255, 70);
+                    let mut g = (vs / step).floor() * step;
+                    while g <= ve {
+                        if g >= vs {
+                            p.vline(x_of(g), rect.y_range(), egui::Stroke::new(1.0, gcol));
+                        }
+                        g += step;
+                    }
+                }
+            }
+            // Transient onset markers — subtle amber guideline lines (item 10).
+            if self.transients_on {
+                let tcol = egui::Color32::from_rgba_unmultiplied(255, 176, 64, 150);
+                for &m in &self.transient_marks {
+                    if m >= vs && m <= ve {
+                        p.vline(x_of(m), rect.y_range(), egui::Stroke::new(1.0, tcol));
+                    }
+                }
+            }
             // Selection edge handles — bright green, brighter + thicker on the hovered/dragged edge.
             const GREEN: egui::Color32 = egui::Color32::from_rgb(120, 240, 150);
             const GREEN_HOT: egui::Color32 = egui::Color32::from_rgb(185, 255, 205);
@@ -4019,6 +4103,72 @@ impl PixelView {
                         .on_hover_text("Magnification of the edge-edit inset shown while adjusting a selection edge");
                 });
             });
+            // Transients + BPM + musical grid (item 10) — big view only (room).
+            if big {
+                ui.horizontal_wrapped(|ui| {
+                    let mut t_on = self.transients_on;
+                    if ui
+                        .checkbox(&mut t_on, "Transients")
+                        .on_hover_text("Detect + mark onset transients (guidelines)")
+                        .changed()
+                    {
+                        self.transients_on = t_on;
+                        self.transient_dirty = true;
+                    }
+                    if self.transients_on {
+                        let mut s = self.transient_sens;
+                        ui.spacing_mut().slider_width = 80.0;
+                        if ui
+                            .add(egui::Slider::new(&mut s, 0.0..=1.0).show_value(false))
+                            .on_hover_text("Sensitivity — right = more markers")
+                            .changed()
+                        {
+                            self.transient_sens = s;
+                            self.transient_dirty = true;
+                        }
+                        ui.weak(format!("{}", self.transient_marks.len()));
+                    }
+                    ui.separator();
+                    let mut m_on = self.musical_on;
+                    if ui.checkbox(&mut m_on, "Musical").changed() {
+                        self.musical_on = m_on;
+                    }
+                    if self.musical_on {
+                        const DIVS: [&str; 6] =
+                            ["whole", "half", "quarter", "eighth", "sixteenth", "32nd"];
+                        egui::ComboBox::from_id_salt("musical_div")
+                            .selected_text(DIVS[self.musical_div.min(5) as usize])
+                            .show_ui(ui, |ui| {
+                                for (i, name) in DIVS.iter().enumerate() {
+                                    ui.selectable_value(&mut self.musical_div, i as u8, *name);
+                                }
+                            });
+                    }
+                    ui.weak("BPM");
+                    ui.add(
+                        egui::DragValue::new(&mut self.bpm)
+                            .range(30.0..=300.0)
+                            .speed(0.5),
+                    );
+                    if ui
+                        .button("Detect")
+                        .on_hover_text("Estimate BPM from detected transients")
+                        .clicked()
+                    {
+                        if self.transient_marks.is_empty() {
+                            self.transient_marks = detect_transients(
+                                &ap.samples,
+                                ch,
+                                ap.sample_rate.get(),
+                                self.transient_sens,
+                            );
+                        }
+                        if let Some(b) = estimate_bpm(&self.transient_marks) {
+                            self.bpm = b;
+                        }
+                    }
+                });
+            }
             // Resize the waveform height (big view only).
             if big {
                 let dy = drag_h_divider(ui, ui.available_width());
@@ -13652,6 +13802,11 @@ impl eframe::App for PixelView {
         }
         eframe::set_value(storage, Self::SAMPLE_PLACES_KEY, &self.sample_places);
         eframe::set_value(storage, Self::ZOOM_EDIT_KEY, &self.zoom_edit_pct);
+        eframe::set_value(storage, Self::TRANSIENTS_KEY, &self.transients_on);
+        eframe::set_value(storage, Self::TRANSIENT_SENS_KEY, &self.transient_sens);
+        eframe::set_value(storage, Self::BPM_KEY, &self.bpm);
+        eframe::set_value(storage, Self::MUSICAL_KEY, &self.musical_on);
+        eframe::set_value(storage, Self::MUSICAL_DIV_KEY, &self.musical_div);
         eframe::set_value(storage, Self::ZOOM_KEY, &self.ui_zoom);
         eframe::set_value(storage, Self::THUMB_KEY, &self.thumb_size);
         eframe::set_value(storage, Self::FAV_KEY, &self.favorites);
@@ -15759,6 +15914,102 @@ fn reverse_frames(samples: &[f32], ch: usize) -> Vec<f32> {
         out.extend_from_slice(&samples[f * ch..f * ch + ch]);
     }
     out
+}
+
+/// Rough tempo estimate (BPM) from onset times: the median inter-onset interval, folded into a
+/// musical 70–180 BPM range. `None` if there aren't enough onsets. The user can nudge from here.
+fn estimate_bpm(marks: &[f32]) -> Option<f32> {
+    if marks.len() < 4 {
+        return None;
+    }
+    let mut ivals: Vec<f32> = marks
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|&d| d > 0.02)
+        .collect();
+    if ivals.is_empty() {
+        return None;
+    }
+    ivals.sort_by(f32::total_cmp);
+    let med = ivals[ivals.len() / 2];
+    if med <= 0.0 {
+        return None;
+    }
+    let mut bpm = 60.0 / med;
+    while bpm < 70.0 {
+        bpm *= 2.0;
+    }
+    while bpm > 180.0 {
+        bpm /= 2.0;
+    }
+    Some(bpm.clamp(30.0, 300.0))
+}
+
+/// The mark (seconds) closest to `t`. Returns `t` unchanged if the list is empty.
+fn nearest_mark(marks: &[f32], t: f32) -> f32 {
+    marks
+        .iter()
+        .copied()
+        .min_by(|a, b| (a - t).abs().total_cmp(&(b - t).abs()))
+        .unwrap_or(t)
+}
+
+/// Detect transient onsets (attack points) in interleaved audio, returning their times (seconds).
+/// A simple energy-flux detector: RMS per short window, then peaks where the rise in energy over
+/// the previous window exceeds a `sensitivity`-scaled threshold, with a small refractory gap so a
+/// single hit isn't marked twice. `sensitivity` 0..1 — higher marks more onsets.
+fn detect_transients(samples: &[f32], ch: usize, sample_rate: u32, sensitivity: f32) -> Vec<f32> {
+    let ch = ch.max(1);
+    let sr = sample_rate.max(1) as f32;
+    let nframes = samples.len() / ch;
+    if nframes < 16 {
+        return Vec::new();
+    }
+    // ~5 ms analysis windows, ~50 ms refractory gap between onsets.
+    let win = ((sr * 0.005) as usize).clamp(16, 4096);
+    let refractory = (sr * 0.05) as usize;
+    let nwin = nframes / win;
+    if nwin < 2 {
+        return Vec::new();
+    }
+    let mut energy = Vec::with_capacity(nwin);
+    for wi in 0..nwin {
+        let mut sum = 0.0f32;
+        for f in (wi * win)..((wi + 1) * win) {
+            let base = f * ch;
+            let mut mono = 0.0f32;
+            for c in 0..ch {
+                mono += samples.get(base + c).copied().unwrap_or(0.0);
+            }
+            mono /= ch as f32;
+            sum += mono * mono;
+        }
+        energy.push((sum / win as f32).sqrt());
+    }
+    // Positive energy flux (rise over the previous window).
+    let flux: Vec<f32> = (0..nwin)
+        .map(|i| if i == 0 { 0.0 } else { (energy[i] - energy[i - 1]).max(0.0) })
+        .collect();
+    let peak = flux.iter().copied().fold(0.0f32, f32::max);
+    if peak <= 1e-6 {
+        return Vec::new();
+    }
+    // Higher sensitivity → lower threshold. Map 0..1 → ~0.35..0.02 of the peak flux.
+    let thresh = peak * (0.35 - 0.33 * sensitivity.clamp(0.0, 1.0)).max(0.01);
+    let mut marks = Vec::new();
+    let mut last: i64 = -(refractory as i64);
+    for i in 1..(nwin - 1) {
+        let f = flux[i];
+        // A local maximum above threshold, respecting the refractory gap.
+        if f >= thresh && f >= flux[i - 1] && f >= flux[i + 1] {
+            let frame = i * win;
+            if frame as i64 - last >= refractory as i64 {
+                marks.push(frame as f32 / sr);
+                last = frame as i64;
+            }
+        }
+    }
+    marks
 }
 
 /// The next frame (strictly past `from`) where the mono-summed signal changes sign — for
@@ -18407,6 +18658,31 @@ mod tests {
         // Stereo (2ch) averages the pair; crossing between frame 1 and 2.
         let st = [0.5f32, 0.5, 0.1, 0.1, -0.2, -0.2];
         assert_eq!(next_zero_crossing(&st, 2, 0, true), 2);
+    }
+
+    #[test]
+    fn detect_transients_finds_onsets() {
+        // Build 44.1k mono: silence, then two loud bursts separated by silence.
+        let sr = 44_100u32;
+        let mut s = vec![0.0f32; sr as usize]; // 1s of silence baseline
+        let burst = |s: &mut Vec<f32>, at: usize| {
+            for i in 0..2205 {
+                // 50 ms of full-scale tone
+                let ph = i as f32 * 0.2;
+                if at + i < s.len() {
+                    s[at + i] = ph.sin();
+                }
+            }
+        };
+        burst(&mut s, sr as usize / 4); // ~0.25s
+        burst(&mut s, sr as usize / 2); // ~0.50s
+        let marks = detect_transients(&s, 1, sr, 0.5);
+        // At least the two onsets, near 0.25s and 0.50s.
+        assert!(marks.len() >= 2, "expected ≥2 onsets, got {}", marks.len());
+        assert!(marks.iter().any(|&m| (m - 0.25).abs() < 0.03), "no onset near 0.25s: {marks:?}");
+        assert!(marks.iter().any(|&m| (m - 0.50).abs() < 0.03), "no onset near 0.50s: {marks:?}");
+        // Silence detects nothing.
+        assert!(detect_transients(&vec![0.0f32; sr as usize], 1, sr, 0.5).is_empty());
     }
 
     #[test]
