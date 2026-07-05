@@ -832,6 +832,8 @@ pub struct PixelView {
     last_midi_t: f32,              // ctx time of the last hardware-MIDI event, for the activity LED (transient)
     kit_name: String,   // current kit's name ("Untitled" by default; persisted)
     kit_editor: bool,   // standalone Sample-Pads view (no audio file needed); transient
+    midi_follow: bool,  // note-triggered pads auto-drill into the editor (persisted)
+    kit_map_lock: bool, // lock the pad→MIDI-note map (MIDI-learn won't reassign); persisted
     octave_lock: bool,  // lock the onscreen-keyboard octave across editor views (persisted)
     data_dir: PathBuf,  // eframe data dir (pads WAVs + saved kits live under here)
     // Hardware MIDI controller → play the loaded sample. The callback runs on midir's thread
@@ -1197,6 +1199,8 @@ impl PixelView {
     const BPM_KEY: &'static str = "bpm";
     const MUSICAL_KEY: &'static str = "musical_on";
     const MUSICAL_DIV_KEY: &'static str = "musical_div";
+    const MIDI_FOLLOW_KEY: &'static str = "midi_follow";
+    const KIT_MAP_LOCK_KEY: &'static str = "kit_map_lock";
     const RECOLOR_KEY: &'static str = "show_recolor";
     const RECOLOR_GRID_KEY: &'static str = "recolor_grid";
     const ZOOM_LOCK_KEY: &'static str = "zoom_lock";
@@ -1769,6 +1773,8 @@ impl PixelView {
             folder_info: HashMap::new(),
             mode: Mode::Grid,
             kit_editor: false,
+            midi_follow: get_bool(Self::MIDI_FOLLOW_KEY).unwrap_or(false),
+            kit_map_lock: get_bool(Self::KIT_MAP_LOCK_KEY).unwrap_or(false),
             selected: 0,
             selection: HashSet::new(),
             anchor: None,
@@ -2702,9 +2708,11 @@ impl PixelView {
         self.note_flash.retain(|_, t| now - *t < 1.0); // bound the map
         self.note_flash.insert(midi, now);
         if let Some(i) = self.pad_assign.take() {
-            if i < self.pads.len() {
+            if i < self.pads.len() && !self.kit_map_lock {
                 self.pads[i].note = Some(midi);
                 self.status = format!("Pad {} → {}", i + 1, midi_note_name(midi as u8));
+            } else if self.kit_map_lock {
+                self.status = "Kit map is locked".into();
             }
             return true;
         }
@@ -2712,6 +2720,10 @@ impl PixelView {
             (0..self.pads.len()).find(|&i| !self.pads[i].is_empty() && self.pad_note(i) == midi)
         {
             self.trigger_pad(i, vel, now);
+            // Request D: MIDI Follow → drill the editor into the pad that a played note triggered.
+            if self.midi_follow && self.edit_focus != EditFocus::Pad(i) {
+                self.focus_pad(i);
+            }
             return true;
         }
         if let Some(ap) = &mut self.audio_player {
@@ -2788,6 +2800,13 @@ impl PixelView {
             .and_then(|s| ap.tracker_samples.get(s))
             .map(|s| s.name.clone())
             .unwrap_or_else(|| short_name(&ap.path));
+        // Remember where the sample came from (for the pad-list hover); skip the synthetic
+        // kit-editor path.
+        let source = if ap.path == kit_editor_path() {
+            None
+        } else {
+            Some(ap.path.to_string_lossy().into_owned())
+        };
         let _ = std::fs::create_dir_all(pads_dir(&self.data_dir));
         let _ = write_wav_16(
             &self.pad_wav_path(i),
@@ -2811,6 +2830,8 @@ impl PixelView {
             loop_end: 0.0,
             loop_type: if old.is_empty() { 0 } else { old.loop_type },
             vel_track: if old.is_empty() { true } else { old.vel_track },
+            color: old.color,
+            source,
             flash_t: -1.0,
         };
         self.status = format!("Loaded pad {}", i + 1);
@@ -2966,6 +2987,44 @@ impl PixelView {
     /// `<data_dir>/kits` — where named `.pvkit` files live (browsable in the Places dock).
     fn kits_dir(&self) -> PathBuf {
         self.data_dir.join("kits")
+    }
+
+    /// Save just the pad→MIDI-note map (base note + each pad's assigned note) to a `.pvmap` text
+    /// file — reusable across kits without touching samples.
+    fn save_kit_map(&mut self, path: &Path) {
+        let mut s = format!("base\t{}\n", self.pad_base_note);
+        for (i, p) in self.pads.iter().enumerate() {
+            let n = p.note.map(|n| n.to_string()).unwrap_or_default();
+            s.push_str(&format!("note\t{i}\t{n}\n"));
+        }
+        self.status = match std::fs::write(path, s) {
+            Ok(()) => format!("Saved kit map {}", short_name(path)),
+            Err(e) => format!("Save map failed: {e}"),
+        };
+    }
+
+    /// Apply a saved `.pvmap` to the current kit: sets `pad_base_note` + each pad's note (samples
+    /// untouched). Respects nothing — an explicit Load overrides even a locked map.
+    fn load_kit_map(&mut self, path: &Path) {
+        let Ok(txt) = std::fs::read_to_string(path) else {
+            self.status = "Load map failed".into();
+            return;
+        };
+        for line in txt.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            match f.as_slice() {
+                ["base", v] => self.pad_base_note = v.parse().unwrap_or(48).clamp(0, 115),
+                ["note", i, v] => {
+                    if let Ok(i) = i.parse::<usize>() {
+                        if i < self.pads.len() {
+                            self.pads[i].note = v.parse().ok();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.status = format!("Loaded kit map {}", short_name(path));
     }
 
     /// Save the whole kit to a `.pvkit` (a zip: `manifest.txt` with the kit name, chosen MIDI
@@ -3615,6 +3674,7 @@ impl PixelView {
         let mut want_export: Option<usize> = None; // export tracker sample i to WAV
         let mut want_midi: Option<Option<String>> = None; // choose MIDI in device (None = off)
         let mut want_midi_refresh = false; // re-scan MIDI devices
+        let mut want_kitmap: Option<bool> = None; // Some(false)=load / Some(true)=save the note map
 
         // Transport row (a "‹ Back" + "Editing pad N" prefix while drilled into a pad).
         ui.horizontal(|ui| {
@@ -3834,6 +3894,12 @@ impl PixelView {
                 }
             } else if resp.clicked() {
                 if let Some(pp) = resp.interact_pointer_pos() {
+                    // A plain click OUTSIDE a sub-selection deselects it (→ the whole file), so the
+                    // next drag can carve out a fresh selection of any size; inside just seeks.
+                    if has_sel && !inside_sel(pp.x) && near_edge(pp.x).is_none() {
+                        want_select = Some((0.0, dur));
+                        want_commit = true;
+                    }
                     want_seek = Some(t_at(pp.x));
                 }
             }
@@ -4282,6 +4348,7 @@ impl PixelView {
                                 &mut want_octave,
                                 &mut want_midi,
                                 &mut want_midi_refresh,
+                                &mut want_kitmap,
                             );
                             self.draw_pad_grid(ui, now, levels);
                         },
@@ -4297,6 +4364,7 @@ impl PixelView {
                     &mut want_octave,
                     &mut want_midi,
                     &mut want_midi_refresh,
+                    &mut want_kitmap,
                 );
                 self.audio_sample_list(ui, false, &mut want_sample, &mut want_export);
             }
@@ -4387,6 +4455,22 @@ impl PixelView {
         if let Some(port) = want_midi {
             self.connect_midi(port);
         }
+        if let Some(save) = want_kitmap {
+            if save {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("kit map", &["pvmap"])
+                    .set_file_name(&format!("{}.pvmap", sanitize_filename(&self.kit_name)))
+                    .save_file()
+                {
+                    self.save_kit_map(&p);
+                }
+            } else if let Some(p) = rfd::FileDialog::new()
+                .add_filter("kit map", &["pvmap"])
+                .pick_file()
+            {
+                self.load_kit_map(&p);
+            }
+        }
         if self.audio_player.as_ref().is_some_and(|ap| ap.has_active_audio()) {
             self.want_repaint = true;
         }
@@ -4403,6 +4487,7 @@ impl PixelView {
         want_octave: &mut Option<i32>,
         want_midi: &mut Option<Option<String>>,
         want_midi_refresh: &mut bool,
+        want_kitmap: &mut Option<bool>, // Some(false)=load, Some(true)=save the pad→note map
     ) {
         ui.add_space(4.0);
         let oct = self.audio_octave;
@@ -4488,6 +4573,29 @@ impl PixelView {
                 if connected {
                     ui.weak("· play pads / the sample from your keys");
                 }
+                ui.separator();
+                // MIDI Follow: a played note drills the editor into the pad it triggers.
+                ui.checkbox(&mut self.midi_follow, "MIDI Follow")
+                    .on_hover_text("A played note auto-loads the pad it triggers into the editor");
+                ui.separator();
+                // Kit Map: save/load just the pad→MIDI-note mapping (not the samples), + Lock.
+                ui.weak("Kit Map");
+                if ui
+                    .button("Load")
+                    .on_hover_text("Apply a saved pad→note map to the current kit")
+                    .clicked()
+                {
+                    *want_kitmap = Some(false);
+                }
+                if ui
+                    .button("Save")
+                    .on_hover_text("Save the current pad→note map")
+                    .clicked()
+                {
+                    *want_kitmap = Some(true);
+                }
+                ui.checkbox(&mut self.kit_map_lock, "Lock")
+                    .on_hover_text("Lock the note map: MIDI-learn won't reassign pads");
             });
         }
     }
@@ -4501,6 +4609,79 @@ impl PixelView {
         want_sample: &mut Option<Option<usize>>,
         want_export: &mut Option<usize>,
     ) {
+        // In the standalone kit editor the list shows the 16 pads' loaded samples (a Battery-style
+        // explorer): click a row to drill the editor into that pad, hover to see its source path.
+        if self.kit_editor && big {
+            let pads: Vec<(String, Option<String>, bool, Option<[u8; 3]>)> = self
+                .pads
+                .iter()
+                .map(|p| (p.name.clone(), p.source.clone(), p.buf.is_some(), p.color))
+                .collect();
+            let focused = if let EditFocus::Pad(i) = self.edit_focus {
+                Some(i)
+            } else {
+                None
+            };
+            ui.horizontal(|ui| {
+                ui.strong("Pads (16)");
+                ui.weak("· click to edit");
+            });
+            ui.add_space(2.0);
+            let list_h = (ui.available_height() - 4.0).max(160.0);
+            let mut pad_focus: Option<usize> = None;
+            let mut pad_export: Option<usize> = None;
+            egui::ScrollArea::vertical()
+                .id_salt("pad_sample_list")
+                .max_height(list_h)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (i, (name, source, has, color)) in pads.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.set_min_height(22.0);
+                            if *has
+                                && ui
+                                    .add(egui::Button::new(icons::DOWNLOAD).small().frame(false))
+                                    .on_hover_text("Export this pad as WAV")
+                                    .clicked()
+                            {
+                                pad_export = Some(i);
+                            }
+                            // A small color chip when the pad is tagged.
+                            if let Some(c) = color {
+                                let (cr, _) = ui.allocate_exact_size(
+                                    egui::vec2(9.0, 9.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(
+                                    cr,
+                                    1.0,
+                                    egui::Color32::from_rgb(c[0], c[1], c[2]),
+                                );
+                            }
+                            let label = if *has {
+                                format!("{:>2}. {}", i + 1, name)
+                            } else {
+                                format!("{:>2}. —", i + 1)
+                            };
+                            let mut r =
+                                ui.add_enabled(*has, egui::Button::selectable(focused == Some(i), label));
+                            if let Some(src) = source {
+                                r = r.on_hover_text(src.as_str());
+                            }
+                            if r.clicked() {
+                                pad_focus = Some(i);
+                            }
+                        });
+                    }
+                });
+            if let Some(i) = pad_focus {
+                self.focus_pad(i);
+            }
+            if let Some(i) = pad_export {
+                self.download_pad(i);
+            }
+            return;
+        }
         let sample_list: Vec<(String, f32)> = self
             .audio_player
             .as_ref()
@@ -4572,6 +4753,7 @@ impl PixelView {
         let mut want_base: Option<i32> = None;
         let mut want_assign: Option<usize> = None;
         let mut want_edit: Option<usize> = None;
+        let mut want_color: Option<(usize, Option<[u8; 3]>)> = None; // recolor pad i (None = clear)
         let mut want_zip = false;
         let mut want_save_kit = false;
         let mut want_load_kit = false;
@@ -4672,20 +4854,31 @@ impl PixelView {
                     let overridden = self.pads[i].note.is_some();
                     let note_name = midi_note_name(self.pad_note(i) as u8);
                     let assigning = self.pad_assign == Some(i); // MIDI-learn armed on this pad
+                    let color = self.pads[i].color;
 
                     let (rect, resp) = ui.allocate_exact_size(
                         egui::vec2(cell_w, cell_h),
                         egui::Sense::click(),
                     );
                     let flash = flash_t >= 0.0 && now - flash_t < 0.18;
-                    let bg = if flash {
-                        egui::Color32::from_rgb(40, 120, 55)
-                    } else if empty {
+                    let base_bg = if empty {
                         egui::Color32::from_rgb(26, 28, 34)
                     } else if resp.hovered() {
                         egui::Color32::from_rgb(46, 50, 62)
                     } else {
                         egui::Color32::from_rgb(38, 41, 50)
+                    };
+                    // A color-tagged pad blends its tag over the base (brighter on hover).
+                    let base_bg = match color {
+                        Some(c) if !empty => {
+                            blend_toward(base_bg, c, if resp.hovered() { 0.55 } else { 0.4 })
+                        }
+                        _ => base_bg,
+                    };
+                    let bg = if flash {
+                        egui::Color32::from_rgb(40, 120, 55)
+                    } else {
+                        base_bg
                     };
                     ui.painter().rect_filled(rect, 5.0, bg);
                     let border = if assigning {
@@ -4702,6 +4895,41 @@ impl PixelView {
                     if !empty && resp.clicked() {
                         want_trigger = Some(i);
                     }
+                    // Right-click a pad → colorize (ANSI32 swatches) / clear.
+                    resp.context_menu(|ui| {
+                        ui.label(format!("Pad {}", i + 1));
+                        ui.separator();
+                        if ui.button("× Clear color").clicked() {
+                            want_color = Some((i, None));
+                            ui.close();
+                        }
+                        egui::Grid::new(("pad_color_grid", i))
+                            .spacing([1.0, 1.0])
+                            .min_col_width(0.0)
+                            .show(ui, |ui| {
+                                for (n, &c) in ansi32_palette().iter().enumerate() {
+                                    if n > 0 && n % 8 == 0 {
+                                        ui.end_row();
+                                    }
+                                    let (cr, cresp) = ui
+                                        .allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                                    let col = egui::Color32::from_rgb(c[0], c[1], c[2]);
+                                    ui.painter().rect_filled(cr, 0.0, col);
+                                    let outline = if color == Some(c) {
+                                        egui::Stroke::new(2.0, egui::Color32::WHITE)
+                                    } else if cresp.hovered() {
+                                        egui::Stroke::new(1.0, egui::Color32::WHITE)
+                                    } else {
+                                        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(70))
+                                    };
+                                    ui.painter().rect_stroke(cr, 0.0, outline, egui::StrokeKind::Inside);
+                                    if cresp.clicked() {
+                                        want_color = Some((i, Some(c)));
+                                        ui.close();
+                                    }
+                                }
+                            });
+                    });
 
                     // Painted vertical VU strip on the right edge.
                     let vu = egui::Rect::from_min_max(
@@ -4873,6 +5101,13 @@ impl PixelView {
         }
         if let Some(i) = want_trigger {
             self.trigger_pad(i, 100, now);
+            // Request C: clicking a pad also loads it into the top waveform editor (implicit `e`),
+            // unless it's empty or already the focused pad.
+            if self.pads.get(i).is_some_and(|p| p.buf.is_some())
+                && self.edit_focus != EditFocus::Pad(i)
+            {
+                self.focus_pad(i);
+            }
         }
         if let Some(i) = want_mute {
             self.pads[i].muted = !self.pads[i].muted;
@@ -4888,6 +5123,11 @@ impl PixelView {
         }
         if let Some(i) = want_edit {
             self.focus_pad(i);
+        }
+        if let Some((i, c)) = want_color {
+            if i < self.pads.len() {
+                self.pads[i].color = c;
+            }
         }
         if let Some(i) = want_assign {
             // Toggle MIDI-learn on this pad (click again to cancel).
@@ -13892,6 +14132,8 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::BPM_KEY, &self.bpm);
         eframe::set_value(storage, Self::MUSICAL_KEY, &self.musical_on);
         eframe::set_value(storage, Self::MUSICAL_DIV_KEY, &self.musical_div);
+        eframe::set_value(storage, Self::MIDI_FOLLOW_KEY, &self.midi_follow);
+        eframe::set_value(storage, Self::KIT_MAP_LOCK_KEY, &self.kit_map_lock);
         eframe::set_value(storage, Self::ZOOM_KEY, &self.ui_zoom);
         eframe::set_value(storage, Self::THUMB_KEY, &self.thumb_size);
         eframe::set_value(storage, Self::FAV_KEY, &self.favorites);
@@ -15868,6 +16110,8 @@ struct Pad {
     loop_end: f32,    // loop region end (seconds; ≤ start ⇒ the whole sample)
     loop_type: u8,    // playback direction: 0 = forward, 1 = reverse, 2 = ping-pong
     vel_track: bool,  // track incoming MIDI velocity (on) vs. fixed max velocity 127 (off)
+    color: Option<[u8; 3]>, // optional tile color tag (right-click → colorize)
+    source: Option<String>, // original sample path (for the sample-list hover); "" if unknown
     flash_t: f32,     // ctx time of the last trigger (green flash); transient
 }
 
@@ -15927,6 +16171,8 @@ impl Pad {
             loop_end: 0.0,
             loop_type: 0,
             vel_track: true,
+            color: None,
+            source: None,
             flash_t: -1.0,
         }
     }
@@ -15961,6 +16207,10 @@ impl Pad {
             format!("{}", self.loop_end),
             self.loop_type.to_string(),
             if self.vel_track { "1" } else { "0" }.to_string(),
+            self.color
+                .map(|c| format!("{},{},{}", c[0], c[1], c[2]))
+                .unwrap_or_default(),
+            self.source.clone().unwrap_or_default(),
         ]
     }
 
@@ -15982,6 +16232,15 @@ impl Pad {
             loop_end: g(9).parse().unwrap_or(0.0),
             loop_type: g(10).parse().unwrap_or(0),
             vel_track: g(11) != "0", // default on (old records without the field track velocity)
+            color: {
+                let parts: Vec<u8> = g(12).split(',').filter_map(|s| s.parse().ok()).collect();
+                if parts.len() == 3 {
+                    Some([parts[0], parts[1], parts[2]])
+                } else {
+                    None
+                }
+            },
+            source: Some(g(13)).filter(|s| !s.is_empty()),
             flash_t: -1.0,
         };
         (pad, has_audio)
@@ -18787,6 +19046,8 @@ mod tests {
             pitch: -12,
             loop_on: true,
             loop_type: 2,
+            color: Some([200, 50, 90]),
+            source: Some("/samples/kick.wav".into()),
             ..Pad::empty()
         };
         let (r, has_audio) = Pad::from_record(&p.record());
@@ -18798,6 +19059,8 @@ mod tests {
         assert_eq!(r.pitch, -12);
         assert!(r.loop_on);
         assert_eq!(r.loop_type, 2); // ping-pong survives the round-trip
+        assert_eq!(r.color, Some([200, 50, 90]));
+        assert_eq!(r.source.as_deref(), Some("/samples/kick.wav"));
         // A short/garbage row degrades gracefully to sane defaults.
         let (d, _) = Pad::from_record(&["1".to_string()]);
         assert_eq!(d.note, None);
