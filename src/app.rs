@@ -1725,7 +1725,7 @@ impl PixelView {
             transient_sens: cc
                 .storage
                 .and_then(|s| eframe::get_value::<f32>(s, Self::TRANSIENT_SENS_KEY))
-                .unwrap_or(0.5),
+                .unwrap_or(0.35),
             transient_marks: Vec::new(),
             transient_dirty: true,
             bpm: cc
@@ -3968,12 +3968,19 @@ impl PixelView {
                     }
                 }
             }
-            // Transient onset markers — subtle amber guideline lines (item 10).
+            // Transient onset markers — subtle amber guideline lines (item 10). Cull markers that
+            // would land within a few px of the previous one so a dense track doesn't paint a
+            // solid wall at full-file zoom (they separate out as you zoom in).
             if self.transients_on {
-                let tcol = egui::Color32::from_rgba_unmultiplied(255, 176, 64, 150);
+                let tcol = egui::Color32::from_rgba_unmultiplied(255, 176, 64, 120);
+                let mut last_x = f32::NEG_INFINITY;
                 for &m in &self.transient_marks {
                     if m >= vs && m <= ve {
-                        p.vline(x_of(m), rect.y_range(), egui::Stroke::new(1.0, tcol));
+                        let mx = x_of(m);
+                        if mx - last_x >= 4.0 {
+                            p.vline(mx, rect.y_range(), egui::Stroke::new(1.0, tcol));
+                            last_x = mx;
+                        }
                     }
                 }
             }
