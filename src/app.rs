@@ -3647,7 +3647,11 @@ impl PixelView {
 
             // ---- Interaction (resolved BEFORE drawing so the edges/shade track the live drag) --
             const EDGE_PX: f32 = 6.0; // pointer-to-edge grab tolerance
-            let has_sel = sel_hi > sel_lo + 1e-4;
+            // A full-file selection (the default loop = play everything) is treated as "no
+            // selection" for interaction, so a drag anywhere starts a fresh sub-selection instead
+            // of uselessly trying to move/resize the whole thing.
+            let full_sel = |lo: f32, hi: f32| lo <= 1e-4 && hi >= dur - 1e-4;
+            let has_sel = sel_hi > sel_lo + 1e-4 && !full_sel(sel_lo, sel_hi);
             let (lo_x, hi_x) = (x_of(sel_lo), x_of(sel_hi));
             let near_edge = |x: f32| -> Option<Edge> {
                 if !has_sel {
@@ -3732,7 +3736,8 @@ impl PixelView {
 
             // ---- Drawing (uses the live drag selection so the shade + edges follow the pointer) -
             let (draw_lo, draw_hi) = want_select.unwrap_or((sel_lo, sel_hi));
-            let draw_has_sel = draw_hi > draw_lo + 1e-4;
+            // Shade + edge handles only for a real sub-selection (not the full-file default).
+            let draw_has_sel = draw_hi > draw_lo + 1e-4 && !full_sel(draw_lo, draw_hi);
             let p = ui.painter_at(rect);
             p.rect_filled(rect, 3.0, egui::Color32::from_rgb(16, 18, 24));
             if draw_has_sel {
@@ -3763,7 +3768,8 @@ impl PixelView {
                 let half = (peak * (h * 0.44)).max(0.5);
                 let x = rect.left() + cx as f32;
                 let t = (cx as f32 / w) * dur;
-                let col = if draw_has_sel && t >= draw_lo && t <= draw_hi {
+                // No sub-selection → the whole file reads bright; a sub-selection dims outside it.
+                let col = if !draw_has_sel || (t >= draw_lo && t <= draw_hi) {
                     accent
                 } else {
                     accent_dim
