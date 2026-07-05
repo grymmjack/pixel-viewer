@@ -808,6 +808,7 @@ pub struct PixelView {
     // Transient / BPM / musical-grid state (item 10). Marks are detected times (secs), cached for
     // the current buffer and recomputed when the sensitivity or buffer changes.
     transients_on: bool,        // detect + draw transient guideline markers (persisted)
+    snap_transient: bool,       // snap selection edges to the nearest transient (persisted)
     transient_sens: f32,        // detection sensitivity 0..1 (persisted)
     transient_marks: Vec<f32>,  // detected transient times (secs), for markers + Alt-snap
     transient_dirty: bool,      // recompute marks next frame (buffer/sensitivity changed)
@@ -1201,6 +1202,7 @@ impl PixelView {
     const ZOOM_EDIT_KEY: &'static str = "zoom_edit_pct"; // waveform edge-inset magnification
     const WAVE_AMP_KEY: &'static str = "wave_amp"; // waveform vertical magnification
     const TRANSIENTS_KEY: &'static str = "transients_on";
+    const SNAP_TRANSIENT_KEY: &'static str = "snap_transient";
     const TRANSIENT_SENS_KEY: &'static str = "transient_sens";
     const BPM_KEY: &'static str = "bpm";
     const MUSICAL_KEY: &'static str = "musical_on";
@@ -1739,6 +1741,7 @@ impl PixelView {
                 .unwrap_or(1.0)
                 .clamp(1.0, 8.0),
             transients_on: get_bool(Self::TRANSIENTS_KEY).unwrap_or(false),
+            snap_transient: get_bool(Self::SNAP_TRANSIENT_KEY).unwrap_or(false),
             transient_sens: cc
                 .storage
                 .and_then(|s| eframe::get_value::<f32>(s, Self::TRANSIENT_SENS_KEY))
@@ -2828,6 +2831,16 @@ impl PixelView {
             };
             (name, source)
         };
+        self.set_pad(i, buf, name, source);
+    }
+
+    /// Install `buf` into pad `i`: write its WAV through to disk and build the `Pad`, keeping the
+    /// replaced pad's note / mix / pitch / loop-type (a fresh load resets the sample-relative loop
+    /// region). Shared by the editor "⟲ load", a dropped sample file, and a dropped tracker sample.
+    fn set_pad(&mut self, i: usize, buf: SampleBuf, name: String, source: Option<String>) {
+        if i >= self.pads.len() {
+            return;
+        }
         let _ = std::fs::create_dir_all(pads_dir(&self.data_dir));
         let _ = write_wav_16(
             &self.pad_wav_path(i),
@@ -2836,8 +2849,6 @@ impl PixelView {
             buf.sample_rate.get(),
         );
         let old = self.pads[i].clone();
-        // Loading fresh audio resets the loop region (it's sample-relative), but keeps the pad's
-        // note / mix / pitch / loop-type when replacing a non-empty pad.
         self.pads[i] = Pad {
             name,
             buf: Some(std::sync::Arc::new(buf)),
@@ -2856,6 +2867,50 @@ impl PixelView {
             flash_t: -1.0,
         };
         self.status = format!("Loaded pad {}", i + 1);
+    }
+
+    /// Decode a sample file straight into pad `i` (drag-and-drop from the Samples explorer). Does
+    /// NOT touch the editor buffer — only the pad is set.
+    fn load_pad_from_file(&mut self, i: usize, path: &Path) {
+        let real = self.resolve_local(path);
+        let bytes = match std::fs::read(&real) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = format!("Read failed: {e}");
+                return;
+            }
+        };
+        match decode_audio(&real, bytes, None) {
+            Ok(d) => {
+                let buf = SampleBuf {
+                    samples: d.samples,
+                    channels: d.channels,
+                    sample_rate: d.sample_rate,
+                    duration: d.duration,
+                    peaks: d.peaks,
+                };
+                self.set_pad(
+                    i,
+                    buf,
+                    short_name(path),
+                    Some(path.to_string_lossy().into_owned()),
+                );
+            }
+            Err(e) => self.status = format!("Can't decode: {e}"),
+        }
+    }
+
+    /// Copy a tracker/bank sample (by index in the current player) into pad `i` (drag-and-drop
+    /// from the "Samples (N)" list).
+    fn load_pad_from_tracker(&mut self, i: usize, idx: usize) {
+        let picked = self.audio_player.as_ref().and_then(|ap| {
+            ap.tracker_samples
+                .get(idx)
+                .map(|s| (s.buf.clone(), s.name.clone()))
+        });
+        if let Some((buf, name)) = picked {
+            self.set_pad(i, buf, name, None);
+        }
     }
 
     /// Drill the main waveform/transport editor into pad `i`: stash what it was showing, load the
@@ -3475,6 +3530,7 @@ impl PixelView {
                 return;
             }
         };
+        let autoplay = self.audio_autoplay;
         match decode_audio(&real, bytes, None) {
             Ok(d) => {
                 if let Some(ap) = &mut self.audio_player {
@@ -3489,6 +3545,10 @@ impl PixelView {
                         duration: d.duration,
                         peaks: d.peaks,
                     });
+                    // Audition on click (like the tracker sample list) — loop only if Autoplay is
+                    // on, so a clicked sample is actually heard. This is the "autoplay on select".
+                    ap.looping = autoplay;
+                    ap.play_region();
                 }
                 self.editor_source = Some(path.to_path_buf());
                 self.edit_focus = EditFocus::Song;
@@ -3732,6 +3792,7 @@ impl PixelView {
         let mut want_commit = false;
         let mut want_seek: Option<f32> = None;
         let mut want_play_at: Option<f32> = None; // middle-click the waveform → play from here
+        let mut want_play_region = false; // play the current selection now (middle-click transient slice)
         let mut want_note: Option<i32> = None;
         let mut want_octave: Option<i32> = None;
         let mut want_sample: Option<Option<usize>> = None; // Some(Some(i))=pick sample; Some(None)=full song
@@ -3861,12 +3922,15 @@ impl PixelView {
             let sr = ap.sample_rate.get() as f32;
             let ch = ap.channels.get() as usize;
             let nframes = if ch > 0 { ap.samples.len() / ch } else { 0 };
-            // Recompute transient onset marks when needed (buffer or sensitivity changed).
-            if self.transients_on && self.transient_dirty {
+            // Recompute transient onset marks when needed (buffer or sensitivity changed). Marks
+            // are needed both to DRAW guidelines (Transients) and to SNAP selections / middle-click
+            // slice (snap_transient), so compute them if either is on.
+            let need_marks = self.transients_on || self.snap_transient;
+            if need_marks && self.transient_dirty {
                 self.transient_marks =
                     detect_transients(&ap.samples, ch, ap.sample_rate.get(), self.transient_sens);
                 self.transient_dirty = false;
-            } else if !self.transients_on && !self.transient_marks.is_empty() {
+            } else if !need_marks && !self.transient_marks.is_empty() {
                 self.transient_marks.clear();
             }
             // Visible window (seconds). `wave_view` = a zoomed sub-range; None = the whole file.
@@ -3901,6 +3965,17 @@ impl PixelView {
             let inside_sel = |x: f32| has_sel && x > lo_x + EDGE_PX && x < hi_x - EDGE_PX;
             let hover_x = resp.hover_pos().map(|pp| pp.x);
             let hovered_edge = hover_x.and_then(near_edge);
+            // "Snap to transient" — when on (and marks exist), a fresh selection's anchor snaps at
+            // drag-start and its moving edge snaps while dragging, so selections land on transient
+            // boundaries. (Edge-adjust snaps only the moving edge; the fixed opposite edge stays.)
+            let snap_t = self.snap_transient && !self.transient_marks.is_empty();
+            let snap_to = |t: f32| {
+                if snap_t {
+                    nearest_mark(&self.transient_marks, t)
+                } else {
+                    t
+                }
+            };
 
             if resp.drag_started() {
                 if let Some(pp) = resp.interact_pointer_pos() {
@@ -3914,8 +3989,8 @@ impl PixelView {
                             width: sel_hi - sel_lo,
                             grab_off: t_at(x) - sel_lo,
                         },
-                        // Empty area → start a fresh selection anchored here.
-                        None => WaveDrag::Select { anchor: t_at(x), edge: Edge::Right },
+                        // Empty area → start a fresh selection anchored here (snapped if enabled).
+                        None => WaveDrag::Select { anchor: snap_to(t_at(x)), edge: Edge::Right },
                     });
                 }
             }
@@ -3924,6 +3999,7 @@ impl PixelView {
                     let t = t_at(pp.x);
                     match drag {
                         WaveDrag::Select { anchor, .. } => {
+                            let t = snap_to(t);
                             want_select = Some((anchor.min(t), anchor.max(t)));
                         }
                         WaveDrag::Move { width, grab_off } => {
@@ -3959,7 +4035,28 @@ impl PixelView {
                 self.wave_view = None;
             } else if resp.middle_clicked() {
                 if let Some(pp) = resp.interact_pointer_pos() {
-                    want_play_at = Some(t_at(pp.x)); // middle-click → play from here
+                    let t = t_at(pp.x);
+                    if self.transients_on && !self.transient_marks.is_empty() {
+                        // Middle-click a transient slice: select from the transient boundary at/
+                        // before the click to the next one after it, and play just that slice.
+                        let lo = self
+                            .transient_marks
+                            .iter()
+                            .copied()
+                            .filter(|&m| m <= t + 1e-4)
+                            .fold(0.0f32, f32::max);
+                        let hi = self
+                            .transient_marks
+                            .iter()
+                            .copied()
+                            .filter(|&m| m > t + 1e-4)
+                            .fold(dur, f32::min);
+                        want_select = Some((lo, hi));
+                        want_commit = true;
+                        want_play_region = true;
+                    } else {
+                        want_play_at = Some(t); // no transients → play from here
+                    }
                 }
             } else if resp.clicked() {
                 if let Some(pp) = resp.interact_pointer_pos() {
@@ -4152,8 +4249,9 @@ impl PixelView {
             }
             // Transient onset markers — subtle amber guideline lines (item 10). Cull markers that
             // would land within a few px of the previous one so a dense track doesn't paint a
-            // solid wall at full-file zoom (they separate out as you zoom in).
-            if self.transients_on {
+            // solid wall at full-file zoom (they separate out as you zoom in). Shown when the
+            // Transients display OR Snap is on (so you can see where a selection will snap).
+            if self.transients_on || self.snap_transient {
                 let tcol = egui::Color32::from_rgba_unmultiplied(255, 176, 64, 120);
                 let mut last_x = f32::NEG_INFINITY;
                 for &m in &self.transient_marks {
@@ -4380,6 +4478,19 @@ impl PixelView {
                         }
                         ui.weak(format!("{}", self.transient_marks.len()));
                     }
+                    // Snap selections to transient boundaries (works whenever marks exist; turning
+                    // it on force-detects them even if the guideline display is off).
+                    let mut snap = self.snap_transient;
+                    if ui
+                        .checkbox(&mut snap, "Snap")
+                        .on_hover_text(
+                            "Snap selection edges to the nearest transient · middle-click a slice to play it",
+                        )
+                        .changed()
+                    {
+                        self.snap_transient = snap;
+                        self.transient_dirty = true;
+                    }
                     ui.separator();
                     let mut m_on = self.musical_on;
                     if ui.checkbox(&mut m_on, "Musical").changed() {
@@ -4558,6 +4669,12 @@ impl PixelView {
                 if ap.is_playing() || self.audio_autoplay {
                     ap.play_region();
                 }
+            }
+        }
+        // Middle-click transient slice: always play the just-selected region (explicit "hear this").
+        if want_play_region {
+            if let Some(ap) = &mut self.audio_player {
+                ap.play_region();
             }
         }
         if want_toggle {
@@ -4875,7 +4992,16 @@ impl PixelView {
                         let mm = format!("{:.2}s", dur);
                         let label = format!("{:>2}. {}", i + 1, name);
                         let sel = active == Some(i);
-                        if ui.selectable_label(sel, label).clicked() {
+                        // Click = load into the editor; DRAG = drop onto a pad (payload read by the
+                        // pad grid on release).
+                        let r = ui
+                            .selectable_label(sel, label)
+                            .interact(egui::Sense::click_and_drag());
+                        if r.dragged() {
+                            egui::DragAndDrop::set_payload(ui.ctx(), PadDrop::Tracker(i));
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                        }
+                        if r.clicked() {
                             *want_sample = Some(Some(i));
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4893,7 +5019,7 @@ impl PixelView {
         let mut want_load: Option<usize> = None;
         let mut want_clear: Option<usize> = None;
         let mut want_download: Option<usize> = None;
-        let mut want_trigger: Option<usize> = None;
+        let mut want_trigger: Option<(usize, u8)> = None; // (pad, click-position velocity)
         let mut want_mute: Option<usize> = None;
         let mut want_solo: Option<usize> = None;
         let mut want_vel_track: Option<usize> = None;
@@ -4909,6 +5035,7 @@ impl PixelView {
         let mut want_zip = false;
         let mut want_save_kit = false;
         let mut want_load_kit = false;
+        let mut want_drop: Option<(usize, PadDrop)> = None; // a sample dropped onto pad i
 
         ui.add_space(8.0);
         ui.separator();
@@ -5012,6 +5139,12 @@ impl PixelView {
                         egui::vec2(cell_w, cell_h),
                         egui::Sense::click(),
                     );
+                    // Drag-and-drop a sample onto this pad (from the Samples explorer / tracker
+                    // list): highlight while a payload hovers, load it on release.
+                    let drop_hover = resp.dnd_hover_payload::<PadDrop>().is_some();
+                    if let Some(payload) = resp.dnd_release_payload::<PadDrop>() {
+                        want_drop = Some((i, (*payload).clone()));
+                    }
                     let flash = flash_t >= 0.0 && now - flash_t < 0.18;
                     let base_bg = if empty {
                         egui::Color32::from_rgb(26, 28, 34)
@@ -5033,7 +5166,9 @@ impl PixelView {
                         base_bg
                     };
                     ui.painter().rect_filled(rect, 5.0, bg);
-                    let border = if assigning {
+                    let border = if drop_hover {
+                        egui::Stroke::new(2.5, egui::Color32::from_rgb(90, 180, 255)) // drop target
+                    } else if assigning {
                         egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 190, 70)) // MIDI-learn
                     } else if soloed {
                         egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 220, 110)) // solo = green
@@ -5049,7 +5184,15 @@ impl PixelView {
                         egui::StrokeKind::Inside,
                     );
                     if !empty && resp.clicked() {
-                        want_trigger = Some(i);
+                        // Velocity from click X-position: far left = soft (10), far right = 127.
+                        // `trigger_pad` gates this — it's only heard when the pad's V (vel_track) is
+                        // on; a fixed 127 when V is off; the kit-wide Global velocity overrides both.
+                        let frac = resp
+                            .interact_pointer_pos()
+                            .map(|p| ((p.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0))
+                            .unwrap_or(1.0);
+                        let vel = (10.0 + frac * 117.0).round().clamp(1.0, 127.0) as u8;
+                        want_trigger = Some((i, vel));
                     }
                     // Right-click a pad → colorize (ANSI32 swatches) / clear.
                     resp.context_menu(|ui| {
@@ -5291,8 +5434,14 @@ impl PixelView {
         if let Some(i) = want_download {
             self.download_pad(i);
         }
-        if let Some(i) = want_trigger {
-            self.trigger_pad(i, 100, now);
+        if let Some((i, drop)) = want_drop {
+            match drop {
+                PadDrop::File(p) => self.load_pad_from_file(i, &p),
+                PadDrop::Tracker(idx) => self.load_pad_from_tracker(i, idx),
+            }
+        }
+        if let Some((i, vel)) = want_trigger {
+            self.trigger_pad(i, vel, now);
             // Request C: clicking a pad also loads it into the top waveform editor (implicit `e`),
             // unless it's empty or already the focused pad.
             if self.pads.get(i).is_some_and(|p| p.buf.is_some())
@@ -13295,18 +13444,31 @@ impl PixelView {
                                         }
                                     }
                                     for f in &files {
-                                        if ui
+                                        // Click = load into the editor; DRAG = drop onto a pad to
+                                        // load it there (payload read by the pad grid on release).
+                                        let resp = ui
                                             .add(
                                                 egui::Button::new(format!(
                                                     "{} {}",
                                                     icons::MUSIC,
                                                     elide(&short_name(f), 24)
                                                 ))
-                                                .frame(false),
+                                                .frame(false)
+                                                .sense(egui::Sense::click_and_drag()),
                                             )
-                                            .on_hover_text(f.display().to_string())
-                                            .clicked()
-                                        {
+                                            .on_hover_text(format!(
+                                                "{}\n(drag onto a pad to load it)",
+                                                f.display()
+                                            ));
+                                        if resp.dragged() {
+                                            egui::DragAndDrop::set_payload(
+                                                ui.ctx(),
+                                                PadDrop::File(f.clone()),
+                                            );
+                                            ui.ctx()
+                                                .set_cursor_icon(egui::CursorIcon::Grabbing);
+                                        }
+                                        if resp.clicked() {
                                             load_into_editor = Some(f.clone());
                                         }
                                     }
@@ -14417,6 +14579,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::ZOOM_EDIT_KEY, &self.zoom_edit_pct);
         eframe::set_value(storage, Self::WAVE_AMP_KEY, &self.wave_amp);
         eframe::set_value(storage, Self::TRANSIENTS_KEY, &self.transients_on);
+        eframe::set_value(storage, Self::SNAP_TRANSIENT_KEY, &self.snap_transient);
         eframe::set_value(storage, Self::TRANSIENT_SENS_KEY, &self.transient_sens);
         eframe::set_value(storage, Self::BPM_KEY, &self.bpm);
         eframe::set_value(storage, Self::MUSICAL_KEY, &self.musical_on);
@@ -16422,6 +16585,15 @@ enum EditFocus {
 enum Edge {
     Left,
     Right,
+}
+
+/// A drag-and-drop payload for loading a sample onto a pad — set on the drag source (a Samples-
+/// explorer file row or a "Samples (N)" tracker row), read when released over a pad tile. Stored
+/// in egui's global `DragAndDrop` slot, so it survives crossing from the left dock to the pad grid.
+#[derive(Clone)]
+enum PadDrop {
+    File(PathBuf),  // a sample file (Samples explorer)
+    Tracker(usize), // a tracker/bank sample index in the current player
 }
 
 /// An in-progress waveform-editor drag. The selection itself lives on `AudioPlayer`
