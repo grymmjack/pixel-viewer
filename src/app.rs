@@ -806,6 +806,7 @@ pub struct PixelView {
     sel_undo: Vec<(f32, f32)>,   // selection history: previous (start,end)s for undo (transient)
     sel_redo: Vec<(f32, f32)>,   // undone selections, for redo (transient)
     sel_undo_pending: Option<(f32, f32)>, // pre-change selection, pushed to sel_undo on commit
+    play_from_mark: Option<f32>, // where the last middle-click started playback (neon ▶ marker)
     zoom_edit_pct: u32, // "Zoom Edit %": magnification of the edge inset (0 = off); persisted
     wave_amp: f32,      // waveform vertical magnification (1 = normal); persisted
     // Transient / BPM / musical-grid state (item 10). Marks are detected times (secs), cached for
@@ -1737,6 +1738,7 @@ impl PixelView {
             sel_undo: Vec::new(),
             sel_redo: Vec::new(),
             sel_undo_pending: None,
+            play_from_mark: None,
             nudge_lock: None,
             wave_view: None,
             zoom_edit_pct: cc
@@ -2928,6 +2930,7 @@ impl PixelView {
         self.sel_undo.clear();
         self.sel_redo.clear();
         self.sel_undo_pending = None;
+        self.play_from_mark = None;
     }
 
     /// Drill the main waveform/transport editor into pad `i`: stash what it was showing, load the
@@ -4164,8 +4167,10 @@ impl PixelView {
                         want_select = Some((lo, hi));
                         want_commit = true;
                         want_play_region = true;
+                        self.play_from_mark = Some(lo); // neon ▶ marker at the slice start
                     } else {
                         want_play_at = Some(t); // no boundaries → play from here
+                        self.play_from_mark = Some(t); // neon ▶ marker where playback begins
                     }
                 }
             } else if resp.clicked() {
@@ -4416,6 +4421,22 @@ impl PixelView {
                         x,
                         rect.y_range(),
                         egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 215, 120)),
+                    );
+                }
+            }
+            // Play-from marker (neon green ▶): where the last middle-click started playback, so you
+            // can see the origin even after the playhead moves on. Tagged like the S/E edges.
+            if let Some(pf) = self.play_from_mark {
+                if pf >= vs - 1e-6 && pf <= ve + 1e-6 {
+                    let neon = egui::Color32::from_rgb(57, 255, 20);
+                    let px = x_of(pf);
+                    p.vline(px, rect.y_range(), egui::Stroke::new(1.5, neon));
+                    p.text(
+                        egui::pos2(px + 3.0, rect.top() + 2.0),
+                        egui::Align2::LEFT_TOP,
+                        "▶",
+                        egui::FontId::proportional(11.0),
+                        neon,
                     );
                 }
             }
@@ -9460,7 +9481,13 @@ impl PixelView {
             scroll_area = scroll_area.vertical_scroll_offset(off);
             forced_scroll = true;
         }
-        let grid_out = scroll_area.show_rows(ui, row_h, rows, |ui, row_range| {
+        // `show_rows` adds `item_spacing.y` on top of the row height for the between-row pitch, so
+        // the vertical gap must live in `item_spacing.y` (= `gap_y`) and the row height passed must
+        // be the *content* height (`cell_h`). Passing `cell_h + gap_y` with the default spacing left
+        // `gap_y` reserved-but-never-rendered — the slider looked dead. (`row_h` = the full pitch,
+        // still used for scroll-offset math, and matches show_rows' internal `cell_h + gap_y`.)
+        ui.spacing_mut().item_spacing.y = gap_y;
+        let grid_out = scroll_area.show_rows(ui, cell_h, rows, |ui, row_range| {
             for row in row_range {
                 ui.horizontal(|ui| {
                     // Match the spacing the per_row math assumed (else the row's real
@@ -13636,10 +13663,14 @@ impl PixelView {
                             }
                             subdirs.sort();
                             files.sort();
+                            // Fill the rest of the dock (auto_shrink false + the remaining height),
+                            // so the file list doesn't stop at a fixed 320 px and leave a big blank
+                            // area below it.
+                            let avail_h = ui.available_height().max(80.0);
                             egui::ScrollArea::vertical()
                                 .id_salt("sample_explorer")
-                                .auto_shrink([false, true])
-                                .max_height(320.0)
+                                .auto_shrink([false, false])
+                                .max_height(avail_h)
                                 .show(ui, |ui| {
                                     for d in &subdirs {
                                         if ui
