@@ -210,7 +210,12 @@ each tile is a `tile`-square thumbnail plus a configurable caption strip below
 (`caption_lines`, `caption_fields` bitmask; independent `grid_gap`/`grid_gap_y`).
 An optional per-tile **border** (`grid_tile_border`, Preferences → "Tile borders",
 persisted, default on) frames each tile as a card (brighter on hover/selection),
-painted **last** so it sits over the thumbnail edges.
+painted **last** so it sits over the thumbnail edges. **`show_rows` gotcha:** it adds
+`item_spacing.y` on top of the row height you pass to get the between-row pitch, so the
+**vertical gap must live in `item_spacing.y`** (set it to `grid_gap_y` before `show_rows`)
+and the row height passed is the *content* height (`cell_h`) — passing `cell_h + gap_y`
+with default spacing reserved the gap but never rendered it (the vertical-spacing slider
+looked dead).
 `want_repaint` drives `ctx.request_repaint()` while thumbnails are pending.
 
 File ops (`copy_selection`/`cut_selection`/`paste`/`new_folder`/`start_rename`/
@@ -846,10 +851,13 @@ inside `caught(||…)` (the same panic guard as `decode_caught`). Both always re
   wrapping arithmetic, bounds-guarded so a malformed file returns `None`/never panics). Ported (not
   the GPL `opl-emu` crate) so pixelview stays MIT.
 
-Both player surfaces also have an **onscreen piano keyboard** (`piano_keyboard(ui, octave, h)`
-— `h` sizes it big vs compact) + Oct −/+ to audition the sample as a one-shot instrument — a
-key plays the selected region pitch-shifted via rodio `speed()` (2^(semitone/12));
-`AudioPlayer::play_note` / `play_speed` keep the playhead correct at a pitched tempo.
+Both player surfaces also have an **onscreen piano keyboard** (`piano_keyboard(ui, octave, h,
+highlights, pad_keys) -> (picked, hovered)` — `h` sizes it big vs compact) + Oct −/+ to audition
+the sample as a one-shot instrument — a key plays the selected region pitch-shifted via rodio
+`speed()` (2^(semitone/12)); `AudioPlayer::play_note` / `play_speed` keep the playhead correct at a
+pitched tempo. Keys a **pad** is mapped to get a little **pad chip** (in the pad's tag colour);
+**hovering a mapped key** returns that key so the caller sets `kb_hover_pad` and `draw_pad_grid`
+gives that pad a **light outline** — so you can see which key drives which pad.
 
 **Master audio controls** live flush-right in the **menu bar**, shown only while the audio
 plugin is on (`self.plugin_audio`): a **🔊/🔇 mute** speaker toggle, a **global ⏹ stop**, and a
@@ -975,7 +983,9 @@ play-from-here (`want_play_at`/`play_from`). **Off-editor drag:** an active drag
 ties to the widget), so dragging past the editor edge stays clamped at the far left/right instead of
 being dropped; it ends on the global button release. **Undo/redo selections** (`sel_undo`/`sel_redo`
 stacks, ↶/↷ in the Transients row): every commit pushes the pre-change selection; cleared by
-`clear_sel_history()` when the editor's sample changes. Selection edges are tagged **S** / **E**. When a
+`clear_sel_history()` when the editor's sample changes. A middle-click also drops a **neon-green ▶
+play-from marker** (`play_from_mark`) at the slice/seek origin so you can see where playback began
+after the playhead moves on. Selection edges are tagged **S** / **E**. When a
 Samples-browser file is being edited, an **"Editing: <name> ↻ <dir>"** row shows under the transport —
 the name links to that file's folder in the Samples explorer (`want_reveal_source` → `sample_browse` +
 Samples tab), the ↻ reloads it fresh from disk (`want_reload_source` → `load_sample_into_editor`). A
