@@ -3676,8 +3676,9 @@ impl PixelView {
         let mut want_midi_refresh = false; // re-scan MIDI devices
         let mut want_kitmap: Option<bool> = None; // Some(false)=load / Some(true)=save the note map
 
-        // Transport row (a "‹ Back" + "Editing pad N" prefix while drilled into a pad).
-        ui.horizontal(|ui| {
+        // Transport row (a "‹ Back" + "Editing pad N" prefix while drilled into a pad). Wrapped so
+        // it can't force the narrow Details pane / left dock wide.
+        ui.horizontal_wrapped(|ui| {
             if let EditFocus::Pad(i) = self.edit_focus {
                 if ui
                     .button("‹ Back")
@@ -7679,7 +7680,8 @@ impl PixelView {
                     ui.add_space(8.0);
                     // Audio preview player (transport + interactive waveform + onscreen
                     // keyboard) — the compact Details version; the main viewer shows a big one.
-                    if is_audio {
+                    // Skipped in the standalone kit editor (the big player is already on screen).
+                    if is_audio && !self.kit_editor {
                         self.draw_audio_controls(
                             ui,
                             &entry.path,
