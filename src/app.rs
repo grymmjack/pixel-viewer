@@ -803,6 +803,9 @@ pub struct PixelView {
     wave_drag: Option<WaveDrag>, // active waveform-editor drag (transient)
     nudge_lock: Option<(Edge, f32)>, // (edge, last wheel-nudge time): keep nudging it as it drifts
     wave_view: Option<(f32, f32)>, // zoomed view window (start,end secs); None = whole file (transient)
+    sel_undo: Vec<(f32, f32)>,   // selection history: previous (start,end)s for undo (transient)
+    sel_redo: Vec<(f32, f32)>,   // undone selections, for redo (transient)
+    sel_undo_pending: Option<(f32, f32)>, // pre-change selection, pushed to sel_undo on commit
     zoom_edit_pct: u32, // "Zoom Edit %": magnification of the edge inset (0 = off); persisted
     wave_amp: f32,      // waveform vertical magnification (1 = normal); persisted
     // Transient / BPM / musical-grid state (item 10). Marks are detected times (secs), cached for
@@ -1729,6 +1732,9 @@ impl PixelView {
             audio_player: None,
             audio_autoplay,
             wave_drag: None,
+            sel_undo: Vec::new(),
+            sel_redo: Vec::new(),
+            sel_undo_pending: None,
             nudge_lock: None,
             wave_view: None,
             zoom_edit_pct: cc
@@ -2913,6 +2919,14 @@ impl PixelView {
         }
     }
 
+    /// Drop the waveform selection undo/redo history — call whenever the editor's underlying
+    /// sample changes, so an undo can't restore a stale selection from a different sample.
+    fn clear_sel_history(&mut self) {
+        self.sel_undo.clear();
+        self.sel_redo.clear();
+        self.sel_undo_pending = None;
+    }
+
     /// Drill the main waveform/transport editor into pad `i`: stash what it was showing, load the
     /// pad's audio, and seed the selection from the pad's loop region — so you can shape the pad's
     /// loop/pitch on the big editor. [`focus_back`] restores the previous view (committing edits).
@@ -2922,6 +2936,7 @@ impl PixelView {
         }
         self.wave_view = None; // drilling into a pad's sample resets the zoom
         self.transient_dirty = true;
+        self.clear_sel_history();
         self.editor_source = self.pads[i].source.clone().map(PathBuf::from);
         let buf = self.pads[i].buf.clone().unwrap();
         {
@@ -2962,6 +2977,7 @@ impl PixelView {
     fn focus_back(&mut self) {
         self.wave_view = None; // leaving a pad drill-in resets the zoom
         self.transient_dirty = true;
+        self.clear_sel_history();
         if let (EditFocus::Pad(i), Some(ap)) = (self.edit_focus, self.audio_player.as_ref()) {
             if i < self.pads.len() {
                 self.pads[i].loop_start = ap.sel_start;
@@ -3355,6 +3371,7 @@ impl PixelView {
         self.editor_stash = None;
         self.wave_view = None; // a new buffer resets the zoom to the whole file
         self.transient_dirty = true;
+        self.clear_sel_history();
         self.editor_source = None; // a tracker sample has no external file path
         self.edit_focus = match idx {
             Some(i) => EditFocus::Sample(i),
@@ -3554,6 +3571,7 @@ impl PixelView {
                 self.edit_focus = EditFocus::Song;
                 self.wave_view = None;
                 self.transient_dirty = true;
+                self.clear_sel_history();
                 self.status = format!("Loaded {}", short_name(path));
             }
             Err(e) => self.status = format!("Can't decode: {e}"),
@@ -3759,6 +3777,39 @@ impl PixelView {
         }
     }
 
+    /// The set of boundary times (secs, sorted) that selections **snap** to and that middle-click
+    /// **slices** between. Unifies two sources so the Musical grid can stand in for transients:
+    /// - detected **transient** onsets — but only when the Transients display is on AND the
+    ///   sensitivity slider is above zero (all the way left = "off");
+    /// - the **Musical** beat-division grid lines (whole…32nd from BPM), when Musical is on.
+    /// So dragging the Transients sensitivity to zero drops the transients, and if Musical is on it
+    /// takes over as the snap/slice grid (e.g. middle-click a quarter-note's worth).
+    fn snap_boundaries(&self, dur: f32) -> Vec<f32> {
+        let mut b: Vec<f32> = Vec::new();
+        if self.transients_on && self.transient_sens > 0.0 {
+            b.extend(
+                self.transient_marks
+                    .iter()
+                    .copied()
+                    .filter(|&m| m >= 0.0 && m <= dur),
+            );
+        }
+        if self.musical_on && self.bpm > 1.0 {
+            let beats = [4.0f32, 2.0, 1.0, 0.5, 0.25, 0.125][self.musical_div.min(5) as usize];
+            let step = (60.0 / self.bpm) * beats;
+            if step > 1e-3 {
+                let mut g = 0.0;
+                while g <= dur + 1e-4 {
+                    b.push(g);
+                    g += step;
+                }
+            }
+        }
+        b.sort_by(|a, c| a.total_cmp(c));
+        b.dedup();
+        b
+    }
+
     /// Draw the audio player — transport + interactive waveform + onscreen keyboard — for
     /// `path`, and apply its actions. `big` = the roomy main-viewer layout; `false` = the
     /// compact Details-pane strip. `meta_dur` is the parsed duration (a fallback before the
@@ -3793,6 +3844,8 @@ impl PixelView {
         let mut want_seek: Option<f32> = None;
         let mut want_play_at: Option<f32> = None; // middle-click the waveform → play from here
         let mut want_play_region = false; // play the current selection now (middle-click transient slice)
+        let mut want_sel_undo = false; // restore the previous selection from the undo stack
+        let mut want_sel_redo = false; // reapply an undone selection
         let mut want_note: Option<i32> = None;
         let mut want_octave: Option<i32> = None;
         let mut want_sample: Option<Option<usize>> = None; // Some(Some(i))=pick sample; Some(None)=full song
@@ -3925,7 +3978,9 @@ impl PixelView {
             // Recompute transient onset marks when needed (buffer or sensitivity changed). Marks
             // are needed both to DRAW guidelines (Transients) and to SNAP selections / middle-click
             // slice (snap_transient), so compute them if either is on.
-            let need_marks = self.transients_on || self.snap_transient;
+            // Detect transient marks only when the Transients display is on AND the sensitivity is
+            // above zero (fully left = "off"). Snap/middle-click then fall back to the Musical grid.
+            let need_marks = self.transients_on && self.transient_sens > 0.0;
             if need_marks && self.transient_dirty {
                 self.transient_marks =
                     detect_transients(&ap.samples, ch, ap.sample_rate.get(), self.transient_sens);
@@ -3965,13 +4020,15 @@ impl PixelView {
             let inside_sel = |x: f32| has_sel && x > lo_x + EDGE_PX && x < hi_x - EDGE_PX;
             let hover_x = resp.hover_pos().map(|pp| pp.x);
             let hovered_edge = hover_x.and_then(near_edge);
-            // "Snap to transient" — when on (and marks exist), a fresh selection's anchor snaps at
-            // drag-start and its moving edge snaps while dragging, so selections land on transient
-            // boundaries. (Edge-adjust snaps only the moving edge; the fixed opposite edge stays.)
-            let snap_t = self.snap_transient && !self.transient_marks.is_empty();
+            // "Snap" — when on (and boundaries exist: transients and/or the Musical grid), a fresh
+            // selection's anchor snaps at drag-start and its moving edge snaps while dragging, so
+            // selections land on those boundaries. (Edge-adjust snaps only the moving edge; the
+            // fixed opposite edge stays.) Moving a whole selection also snaps its start (below).
+            let boundaries = self.snap_boundaries(dur);
+            let snap_on = self.snap_transient && !boundaries.is_empty();
             let snap_to = |t: f32| {
-                if snap_t {
-                    nearest_mark(&self.transient_marks, t)
+                if snap_on {
+                    nearest_mark(&boundaries, t)
                 } else {
                     t
                 }
@@ -3992,10 +4049,21 @@ impl PixelView {
                         // Empty area → start a fresh selection anchored here (snapped if enabled).
                         None => WaveDrag::Select { anchor: snap_to(t_at(x)), edge: Edge::Right },
                     });
+                    // Remember the pre-drag selection so the commit can push it to the undo stack.
+                    self.sel_undo_pending = Some((sel_lo, sel_hi));
                 }
             }
-            if resp.dragged() {
-                if let (Some(drag), Some(pp)) = (self.wave_drag, resp.interact_pointer_pos()) {
+            // Drive an ACTIVE drag from the GLOBAL pointer (our own `wave_drag` state), not from
+            // `resp.dragged()`/`interact_pointer_pos()` — egui ties those to the widget's own
+            // interaction, so when the cursor leaves the editor rect the drag was "forgotten".
+            // `t_at` clamps x to the visible range, so the selection stays pinned at the far
+            // left/right edge instead. End on the global button release, wherever the pointer is.
+            if self.wave_drag.is_some() {
+                let ptr = resp
+                    .interact_pointer_pos()
+                    .or_else(|| ui.input(|i| i.pointer.interact_pos()))
+                    .or_else(|| ui.input(|i| i.pointer.latest_pos()));
+                if let (Some(drag), Some(pp)) = (self.wave_drag, ptr) {
                     let t = t_at(pp.x);
                     match drag {
                         WaveDrag::Select { anchor, .. } => {
@@ -4003,8 +4071,9 @@ impl PixelView {
                             want_select = Some((anchor.min(t), anchor.max(t)));
                         }
                         WaveDrag::Move { width, grab_off } => {
-                            // Item 9: seamless shift; Alt+Shift snaps the leading edge to the
-                            // nearest zero crossing, Alt snaps it to the nearest transient.
+                            // Item 9: seamless shift. Snap the moved selection's START to a boundary
+                            // when Snap is on (or Alt is held); Alt+Shift snaps to the nearest zero
+                            // crossing instead (sample-accurate).
                             let (shift, alt) = ui.input(|i| (i.modifiers.shift, i.modifiers.alt));
                             let lo0 = (t - grab_off).clamp(0.0, (dur - width).max(0.0));
                             let lo = if alt && shift {
@@ -4014,9 +4083,8 @@ impl PixelView {
                                 let fi = f as i64;
                                 let nf = if (ff - fi).abs() <= (fi - fb).abs() { ff } else { fb };
                                 (nf.max(0) as f32 / sr).clamp(0.0, (dur - width).max(0.0))
-                            } else if alt && !self.transient_marks.is_empty() {
-                                nearest_mark(&self.transient_marks, lo0)
-                                    .clamp(0.0, (dur - width).max(0.0))
+                            } else if (snap_on || alt) && !boundaries.is_empty() {
+                                nearest_mark(&boundaries, lo0).clamp(0.0, (dur - width).max(0.0))
                             } else {
                                 lo0
                             };
@@ -4024,29 +4092,31 @@ impl PixelView {
                         }
                     }
                 }
-            }
-            if resp.drag_stopped() {
-                self.wave_drag = None;
-                want_commit = true;
+                if !ui.input(|i| i.pointer.primary_down()) {
+                    self.wave_drag = None;
+                    want_commit = true;
+                }
             }
             if resp.double_clicked() {
+                self.sel_undo_pending = Some((sel_lo, sel_hi));
                 want_select = Some((0.0, dur)); // double-click → select all + reset the zoom
                 want_commit = true;
                 self.wave_view = None;
             } else if resp.middle_clicked() {
                 if let Some(pp) = resp.interact_pointer_pos() {
                     let t = t_at(pp.x);
-                    if self.transients_on && !self.transient_marks.is_empty() {
-                        // Middle-click a transient slice: select from the transient boundary at/
-                        // before the click to the next one after it, and play just that slice.
-                        let lo = self
-                            .transient_marks
+                    if !boundaries.is_empty() {
+                        self.sel_undo_pending = Some((sel_lo, sel_hi));
+                        // Middle-click a slice: select from the boundary at/before the click to the
+                        // next one after, and play just that slice. Boundaries are transients and/or
+                        // the Musical grid — so with Musical on this plays one division (e.g. a
+                        // quarter-note's worth).
+                        let lo = boundaries
                             .iter()
                             .copied()
                             .filter(|&m| m <= t + 1e-4)
                             .fold(0.0f32, f32::max);
-                        let hi = self
-                            .transient_marks
+                        let hi = boundaries
                             .iter()
                             .copied()
                             .filter(|&m| m > t + 1e-4)
@@ -4055,7 +4125,7 @@ impl PixelView {
                         want_commit = true;
                         want_play_region = true;
                     } else {
-                        want_play_at = Some(t); // no transients → play from here
+                        want_play_at = Some(t); // no boundaries → play from here
                     }
                 }
             } else if resp.clicked() {
@@ -4063,6 +4133,7 @@ impl PixelView {
                     // A plain click OUTSIDE a sub-selection deselects it (→ the whole file), so the
                     // next drag can carve out a fresh selection of any size; inside just seeks.
                     if has_sel && !inside_sel(pp.x) && near_edge(pp.x).is_none() {
+                        self.sel_undo_pending = Some((sel_lo, sel_hi));
                         want_select = Some((0.0, dur));
                         want_commit = true;
                     }
@@ -4138,6 +4209,7 @@ impl PixelView {
                         } else {
                             (sel_lo, new_t)
                         };
+                        self.sel_undo_pending.get_or_insert((sel_lo, sel_hi));
                         want_select = Some((a.min(b), a.max(b)));
                         want_commit = true;
                     } else if shift {
@@ -4275,7 +4347,7 @@ impl PixelView {
                     active_edge == Some(e) || (active_edge.is_none() && hovered_edge == Some(e))
                 };
                 // Only draw an edge handle when it falls inside the visible (zoomed) window.
-                for (e, et, tag) in [(Edge::Left, draw_lo, "s"), (Edge::Right, draw_hi, "e")] {
+                for (e, et, tag) in [(Edge::Left, draw_lo, "S"), (Edge::Right, draw_hi, "E")] {
                     if et >= vs - 1e-6 && et <= ve + 1e-6 {
                         let (col, wdt) = if hot(e) { (GREEN_HOT, 2.5) } else { (GREEN, 1.5) };
                         let ex = x_of(et);
@@ -4530,6 +4602,22 @@ impl PixelView {
                             self.bpm = b;
                         }
                     }
+                    // Selection undo / redo.
+                    ui.separator();
+                    if ui
+                        .add_enabled(!self.sel_undo.is_empty(), egui::Button::new("↶"))
+                        .on_hover_text("Undo selection")
+                        .clicked()
+                    {
+                        want_sel_undo = true;
+                    }
+                    if ui
+                        .add_enabled(!self.sel_redo.is_empty(), egui::Button::new("↷"))
+                        .on_hover_text("Redo selection")
+                        .clicked()
+                    {
+                        want_sel_redo = true;
+                    }
                 });
             }
             // Resize the waveform height (big view only).
@@ -4665,6 +4753,23 @@ impl PixelView {
             }
         }
         if want_commit {
+            // Record the pre-change selection on the undo stack (if the commit actually moved it),
+            // and clear the redo stack — a new edit forks the history.
+            if let Some(origin) = self.sel_undo_pending.take() {
+                let cur = self
+                    .audio_player
+                    .as_ref()
+                    .map(|ap| (ap.sel_start, ap.sel_end));
+                if let Some(cur) = cur {
+                    if (origin.0 - cur.0).abs() > 1e-4 || (origin.1 - cur.1).abs() > 1e-4 {
+                        self.sel_undo.push(origin);
+                        if self.sel_undo.len() > 128 {
+                            self.sel_undo.remove(0);
+                        }
+                        self.sel_redo.clear();
+                    }
+                }
+            }
             if let Some(ap) = &mut self.audio_player {
                 if ap.is_playing() || self.audio_autoplay {
                     ap.play_region();
@@ -4675,6 +4780,35 @@ impl PixelView {
         if want_play_region {
             if let Some(ap) = &mut self.audio_player {
                 ap.play_region();
+            }
+        }
+        // Selection undo / redo: swap the current selection with the top of the opposite stack.
+        if want_sel_undo || want_sel_redo {
+            let from_top = if want_sel_undo {
+                self.sel_undo.pop()
+            } else {
+                self.sel_redo.pop()
+            };
+            if let Some((lo, hi)) = from_top {
+                if let Some(ap) = &mut self.audio_player {
+                    let cur = (ap.sel_start, ap.sel_end);
+                    if want_sel_undo {
+                        self.sel_redo.push(cur);
+                    } else {
+                        self.sel_undo.push(cur);
+                    }
+                    ap.sel_start = lo;
+                    ap.sel_end = hi;
+                    if ap.is_playing() {
+                        ap.play_region();
+                    }
+                }
+                if let EditFocus::Pad(i) = self.edit_focus {
+                    if i < self.pads.len() {
+                        self.pads[i].loop_start = lo;
+                        self.pads[i].loop_end = hi;
+                    }
+                }
             }
         }
         if want_toggle {
@@ -6433,6 +6567,7 @@ impl PixelView {
         }
         // Opening an image in the viewer counts as a view (bumps its count + last-viewed).
         self.mark_viewed(&path);
+        self.clear_sel_history(); // a new file's editor starts with no selection history
         self.osd_t = 0.0; // restart the metadata OSD fade-in for the new image
         self.osd_dismissed = false; // a fresh image un-hides the OSD ([×] is per-view only)
         let _ = self.cached_sauce(&path); // populate SAUCE (columns/lines/font/comment) for the OSD
@@ -16799,14 +16934,21 @@ fn detect_transients(samples: &[f32], ch: usize, sample_rate: u32, sensitivity: 
     if peak <= 1e-6 {
         return Vec::new();
     }
-    // Higher sensitivity → lower threshold. Map 0..1 → ~0.35..0.02 of the peak flux.
-    let thresh = peak * (0.35 - 0.33 * sensitivity.clamp(0.0, 1.0)).max(0.01);
+    let epeak = energy.iter().copied().fold(0.0f32, f32::max);
+    // Nonlinear sensitivity: the slider's left half stays sparse (only the strongest onsets),
+    // opening up toward the right. Threshold as a fraction of the peak flux (~0.45 → 0.02). The
+    // caller treats a fully-left (zero) slider as "off" and doesn't even call this.
+    let s = sensitivity.clamp(0.0, 1.0);
+    let thresh = peak * (0.45 - 0.43 * s.powf(1.3)).max(0.02);
+    // Near-silence floor: don't mark onsets in windows below ~7% of the loudest window's energy,
+    // so quiet-section ripples / decay tails aren't marked (a big source of spurious marks).
+    let floor = epeak * 0.07;
     let mut marks = Vec::new();
     let mut last: i64 = -(refractory as i64);
     for i in 1..(nwin - 1) {
         let f = flux[i];
-        // A local maximum above threshold, respecting the refractory gap.
-        if f >= thresh && f >= flux[i - 1] && f >= flux[i + 1] {
+        // A local maximum above threshold, out of near-silence, respecting the refractory gap.
+        if f >= thresh && energy[i] >= floor && f >= flux[i - 1] && f >= flux[i + 1] {
             let frame = i * win;
             if frame as i64 - last >= refractory as i64 {
                 marks.push(frame as f32 / sr);
