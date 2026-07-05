@@ -1117,6 +1117,16 @@ than assuming a logic bug. Already hit and migrated for 0.34.3:
   global key handler's `typing` guard so hotkeys (ratings, Backspace→ParentDir, R→random
   pack) are suppressed while a text field is focused — the explicit `path_edit`/`search`
   flags don't cover the 16colo search box / advanced-search fields, only this does.
+- **`ui.put(rect, widget)` advances the layout cursor** — it isn't a pure "draw at this
+  rect" overlay. `put` runs `scope_builder` → `advance_cursor_after_rect(child.min_rect())`,
+  and for a widget that **doesn't stretch to fill** its `max_rect` (a *vertical* `Slider`,
+  in `put`'s `centered_and_justified` layout) the child `min_rect` is *shorter* than `rect`,
+  so the cursor is **set** to that shorter bottom — which can be **above** where you already
+  parked it, making the *next* row overdraw earlier content. Bit the waveform amplitude
+  slider (drawn in a right strip beside an `allocate_exact_size`d wave): the drag hint +
+  Transients row painted over the wave's lower half. Fix: draw absolute-positioned widgets
+  that must NOT disturb layout in a **non-advancing `ui.new_child(UiBuilder::new().max_rect(r)
+  .layout(..))`**, not `ui.put`.
 
 ## Testing
 
