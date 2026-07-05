@@ -869,7 +869,11 @@ pub struct PixelView {
     explorer_filter: String,                 // folder-tree search box (runtime only)
     colo_search: String,                     // 16colo.rs nav-bar search box (runtime only)
     explorer_tab: u8,                        // 0 = Places, 1 = Folders
-    places_tab: u8,                          // Places sub-tab: 0 = Local, 1 = 16colo.rs
+    places_tab: u8,                          // Places sub-tab: 0 = Local, 1 = 16colo.rs, 2 = Kits, 3 = Samples
+    // User-managed "Samples" locations (name, dir, optional color tag) — quick jumps to sample
+    // folders to drag/assign into pads. Add/rename/colorize/remove from the Samples sub-tab.
+    sample_places: Vec<(String, PathBuf, Option<[u8; 3]>)>,
+    sample_rename: Option<(usize, String)>, // inline-rename buffer for a Samples place (transient)
     show_hotkeys: bool,
     show_prefs: bool,
     show_associations: bool, // the View → Associations editor window is open
@@ -1173,6 +1177,7 @@ impl PixelView {
     /// Show the open path/file in the window title bar (zoom % is always appended when ≠100%).
     const TITLE_PATH_KEY: &'static str = "title_show_path";
     const WINDOW_GEOM_KEY: &'static str = "window_geom"; // [x, y, w, h]: restore last window place
+    const SAMPLE_PLACES_KEY: &'static str = "sample_places"; // user Samples locations
     const RECOLOR_KEY: &'static str = "show_recolor";
     const RECOLOR_GRID_KEY: &'static str = "recolor_grid";
     const ZOOM_LOCK_KEY: &'static str = "zoom_lock";
@@ -1745,6 +1750,16 @@ impl PixelView {
             colo_search: String::new(),
             explorer_tab: 0,
             places_tab: 0,
+            sample_places: cc
+                .storage
+                .and_then(|s| {
+                    eframe::get_value::<Vec<(String, PathBuf, Option<[u8; 3]>)>>(
+                        s,
+                        Self::SAMPLE_PLACES_KEY,
+                    )
+                })
+                .unwrap_or_default(),
+            sample_rename: None,
             show_hotkeys: false,
             show_prefs: false,
             show_associations: false,
@@ -12091,6 +12106,13 @@ impl PixelView {
         let mut nav: Option<PathBuf> = None;
         let mut recall: Option<usize> = None; // smart filter to run
         let mut remove_filter: Option<usize> = None;
+        // Kits / Samples sub-tab actions (deferred — the closure can't borrow self twice).
+        let mut load_kit: Option<PathBuf> = None;
+        let mut add_sample = false;
+        let mut remove_sample: Option<usize> = None;
+        let mut color_sample: Option<(usize, Option<[u8; 3]>)> = None;
+        let mut rename_start: Option<usize> = None;
+        let mut rename_commit: Option<(usize, String)> = None;
         // Tabs: Places | Folders (one at a time, to save vertical room).
         ui.horizontal(|ui| {
             if ui
@@ -12111,29 +12133,21 @@ impl PixelView {
             .auto_shrink([false; 2])
             .show(ui, |ui| {
                 if self.explorer_tab == 0 {
-                    // Sub-tabs split favorites/pins by kind: Local folders vs 16colo.rs.
-                    ui.horizontal(|ui| {
-                        if ui.selectable_label(self.places_tab == 0, "Local").clicked() {
-                            self.places_tab = 0;
-                        }
-                        if ui
-                            .selectable_label(self.places_tab == 1, "16colo.rs")
-                            .clicked()
-                        {
-                            self.places_tab = 1;
+                    // Sub-tabs: Local folders · 16colo.rs · Kits · Samples (last two audio-plugin only).
+                    ui.horizontal_wrapped(|ui| {
+                        for (idx, label) in [(0u8, "Local"), (1, "16colo"), (2, "Kits"), (3, "Samples")] {
+                            if (idx == 2 || idx == 3) && !self.plugin_audio {
+                                continue;
+                            }
+                            if ui.selectable_label(self.places_tab == idx, label).clicked() {
+                                self.places_tab = idx;
+                            }
                         }
                     });
                     if self.places_tab == 0 {
                         // Local: Home + on-disk favorites + smart filters (local searches).
                         if ui.button("🏠 Home").clicked() {
                             nav = home_dir();
-                        }
-                        // Sample-pad kits folder (only when the audio plugin is on). Browsing it
-                        // shows saved `.pvkit` files; clicking one loads that kit into the grid.
-                        if self.plugin_audio && ui.button(format!("{} Kits", icons::MUSIC)).clicked() {
-                            let d = self.kits_dir();
-                            let _ = std::fs::create_dir_all(&d);
-                            nav = Some(d);
                         }
                         if let Some(p) = self.favorites_buttons(
                             ui,
@@ -12163,7 +12177,7 @@ impl PixelView {
                                 });
                             }
                         }
-                    } else {
+                    } else if self.places_tab == 1 {
                         // 16colo.rs: the browse entry + pinned artists/groups/searches/packs.
                         if ui
                             .button(format!("{} 16colo.rs", icons::GLOBE))
@@ -12176,6 +12190,131 @@ impl PixelView {
                             self.favorites_buttons(ui, icons::GLOBE, crate::sixteen::is_remote, false)
                         {
                             nav = Some(p);
+                        }
+                    } else if self.places_tab == 2 {
+                        // Kits: click a saved `.pvkit` to LOAD it into the current pad kit (it does
+                        // NOT navigate into the file — the pads stay put and just adopt the kit).
+                        ui.weak("Click a kit to load it into the pads");
+                        let dir = self.kits_dir();
+                        let _ = std::fs::create_dir_all(&dir);
+                        let mut kits: Vec<PathBuf> = std::fs::read_dir(&dir)
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                            .map(|e| e.path())
+                            .filter(|p| is_kit_ext(p))
+                            .collect();
+                        kits.sort();
+                        if kits.is_empty() {
+                            ui.weak("(no saved kits — Save one from the pad grid)");
+                        }
+                        for kf in &kits {
+                            let name = kf
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("kit")
+                                .to_string();
+                            let sel = self.kit_name == name;
+                            if ui
+                                .selectable_label(sel, format!("{} {name}", icons::MUSIC))
+                                .clicked()
+                            {
+                                load_kit = Some(kf.clone());
+                            }
+                        }
+                    } else {
+                        // Samples: user-managed sample folders — quick jumps to browse + drag/assign
+                        // into pads. Add / rename / colorize / remove.
+                        if ui
+                            .button("＋ Add location…")
+                            .on_hover_text("Pick a folder of samples to add as a place")
+                            .clicked()
+                        {
+                            add_sample = true;
+                        }
+                        ui.separator();
+                        if self.sample_places.is_empty() {
+                            ui.weak("(no sample locations yet)");
+                        }
+                        let places = self.sample_places.clone();
+                        for (i, (name, path, color)) in places.iter().enumerate() {
+                            // Inline rename in place of the button while this row is being renamed.
+                            if matches!(&self.sample_rename, Some((ri, _)) if *ri == i) {
+                                let mut buf = match &self.sample_rename {
+                                    Some((_, b)) => b.clone(),
+                                    None => String::new(),
+                                };
+                                let r = ui.add(
+                                    egui::TextEdit::singleline(&mut buf)
+                                        .desired_width(f32::INFINITY),
+                                );
+                                self.sample_rename = Some((i, buf.clone()));
+                                if r.lost_focus()
+                                    && ui.input(|inp| inp.key_pressed(egui::Key::Enter))
+                                {
+                                    rename_commit = Some((i, buf));
+                                }
+                                continue;
+                            }
+                            let mut btn = egui::Button::new(elide(name, 22));
+                            if let Some(c) = color {
+                                btn = btn.fill(egui::Color32::from_rgb(c[0], c[1], c[2]));
+                            }
+                            let r = ui.add(btn).on_hover_text(path.display().to_string());
+                            if r.clicked() {
+                                nav = Some(path.clone());
+                            }
+                            r.context_menu(|ui| {
+                                if ui.button("Rename").clicked() {
+                                    rename_start = Some(i);
+                                    ui.close();
+                                }
+                                if ui.button("× Remove").clicked() {
+                                    remove_sample = Some(i);
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui.button("× Clear color").clicked() {
+                                    color_sample = Some((i, None));
+                                    ui.close();
+                                }
+                                egui::Grid::new(("sample_color_grid", i))
+                                    .spacing([1.0, 1.0])
+                                    .min_col_width(0.0)
+                                    .show(ui, |ui| {
+                                        for (n, &c) in ansi32_palette().iter().enumerate() {
+                                            if n > 0 && n % 8 == 0 {
+                                                ui.end_row();
+                                            }
+                                            let (rect, resp) = ui.allocate_exact_size(
+                                                egui::vec2(18.0, 18.0),
+                                                egui::Sense::click(),
+                                            );
+                                            let col = egui::Color32::from_rgb(c[0], c[1], c[2]);
+                                            ui.painter().rect_filled(rect, 0.0, col);
+                                            let outline = if *color == Some(c) {
+                                                egui::Stroke::new(2.0, egui::Color32::WHITE)
+                                            } else if resp.hovered() {
+                                                egui::Stroke::new(1.0, egui::Color32::WHITE)
+                                            } else {
+                                                egui::Stroke::new(
+                                                    1.0,
+                                                    egui::Color32::from_black_alpha(70),
+                                                )
+                                            };
+                                            ui.painter().rect_stroke(
+                                                rect,
+                                                0.0,
+                                                outline,
+                                                egui::StrokeKind::Inside,
+                                            );
+                                            if resp.clicked() {
+                                                color_sample = Some((i, Some(c)));
+                                                ui.close();
+                                            }
+                                        }
+                                    });
+                            });
                         }
                     }
                 } else {
@@ -12207,7 +12346,48 @@ impl PixelView {
                 self.saved_filters.remove(i);
             }
         }
-        if let Some(i) = recall {
+        // Samples-place edits.
+        if add_sample {
+            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                let name = dir
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Samples")
+                    .to_string();
+                self.sample_places.push((name, dir, None));
+            }
+        }
+        if let Some(i) = remove_sample {
+            if i < self.sample_places.len() {
+                self.sample_places.remove(i);
+                self.sample_rename = None;
+            }
+        }
+        if let Some((i, c)) = color_sample {
+            if let Some(sp) = self.sample_places.get_mut(i) {
+                sp.2 = c;
+            }
+        }
+        if let Some(i) = rename_start {
+            let cur = self
+                .sample_places
+                .get(i)
+                .map(|s| s.0.clone())
+                .unwrap_or_default();
+            self.sample_rename = Some((i, cur));
+        }
+        if let Some((i, name)) = rename_commit {
+            if let Some(sp) = self.sample_places.get_mut(i) {
+                if !name.trim().is_empty() {
+                    sp.0 = name.trim().to_string();
+                }
+            }
+            self.sample_rename = None;
+        }
+        // Load a kit (item 14): adopt it into the pads without navigating into the file.
+        if let Some(kf) = load_kit {
+            self.load_kit(&kf);
+        } else if let Some(i) = recall {
             self.recall_filter(i);
         } else if let Some(p) = nav {
             self.open_folder(p);
@@ -13222,6 +13402,7 @@ impl eframe::App for PixelView {
         if let Some(g) = self.win_geom {
             eframe::set_value(storage, Self::WINDOW_GEOM_KEY, &g);
         }
+        eframe::set_value(storage, Self::SAMPLE_PLACES_KEY, &self.sample_places);
         eframe::set_value(storage, Self::ZOOM_KEY, &self.ui_zoom);
         eframe::set_value(storage, Self::THUMB_KEY, &self.thumb_size);
         eframe::set_value(storage, Self::FAV_KEY, &self.favorites);
