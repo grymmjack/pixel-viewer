@@ -836,6 +836,7 @@ pub struct PixelView {
     edit_focus: EditFocus,     // what the waveform editor is pointed at (Song / Sample / a Pad drill-in)
     editor_stash: Option<EditorStash>, // saved editor state during a pad drill-in (restored on Back)
     note_flash: HashMap<i32, f32>, // MIDI note → last-played ctx time, for the keyboard key lights (transient)
+    kb_hover_pad: Option<usize>,   // pad whose mapped key is hovered on the keyboard → outline it (transient)
     last_midi_t: f32,              // ctx time of the last hardware-MIDI event, for the activity LED (transient)
     kit_name: String,   // current kit's name ("Untitled" by default; persisted)
     kit_editor: bool,   // standalone Sample-Pads view (no audio file needed); transient
@@ -1781,6 +1782,7 @@ impl PixelView {
             edit_focus: EditFocus::Song,
             editor_stash: None,
             note_flash: HashMap::new(),
+            kb_hover_pad: None,
             last_midi_t: -10.0,
             kit_name,
             octave_lock,
@@ -4989,10 +4991,26 @@ impl PixelView {
                 (midi - 60, c)
             })
             .collect();
+        // Keys that a (non-empty) pad is mapped to → a little pad chip in the pad's tag colour.
+        let pad_keys: Vec<(i32, egui::Color32)> = (0..self.pads.len())
+            .filter(|&i| !self.pads[i].is_empty())
+            .map(|i| {
+                let c = self.pads[i]
+                    .color
+                    .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
+                    .unwrap_or(egui::Color32::from_rgb(90, 150, 235));
+                (self.pad_note(i) - 60, c)
+            })
+            .collect();
         let kb_h = if big { self.audio_kb_h } else { 66.0 };
-        if let Some(semi) = piano_keyboard(ui, oct, kb_h, &highlights) {
+        let (picked, hovered) = piano_keyboard(ui, oct, kb_h, &highlights, &pad_keys);
+        if let Some(semi) = picked {
             *want_note = Some(semi);
         }
+        // Hovering a mapped key outlines its pad (draw_pad_grid reads `kb_hover_pad`).
+        self.kb_hover_pad = hovered.and_then(|s| {
+            (0..self.pads.len()).find(|&i| !self.pads[i].is_empty() && self.pad_note(i) == s + 60)
+        });
         if big {
             // Resize the keyboard height (pads below get the remaining space).
             let dy = drag_h_divider(ui, ui.available_width());
@@ -5374,6 +5392,10 @@ impl PixelView {
                     ui.painter().rect_filled(rect, 5.0, bg);
                     let border = if drop_hover {
                         egui::Stroke::new(2.5, egui::Color32::from_rgb(90, 180, 255)) // drop target
+                    } else if self.kb_hover_pad == Some(i) && !empty {
+                        // Hovering this pad's key on the keyboard → light outline so you can see
+                        // the key↔pad mapping.
+                        egui::Stroke::new(2.5, egui::Color32::from_rgb(225, 230, 245))
                     } else if assigning {
                         egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 190, 70)) // MIDI-learn
                     } else if soloed {
@@ -18068,12 +18090,17 @@ fn compose_side_by_side(
 /// clicked semitone (`oct*12 + semi`, relative to native pitch), or `None`. `highlights` are
 /// `(semitone, color)` in that same relative space — a "lit" (played) key: red when routed to a
 /// pad, an accent color for a plain audition. Black keys are drawn/hit-tested last so they win.
+/// Draw the onscreen piano. `highlights` (semi, colour) light recently-played keys; `pad_keys`
+/// (semi, pad colour) mark keys that a pad is mapped to with a little pad chip. Returns
+/// `(picked, hovered)` semitones (both in `midi - 60` space): the clicked key and the key under
+/// the pointer (so the caller can outline the pad that key maps to).
 fn piano_keyboard(
     ui: &mut egui::Ui,
     octave: i32,
     h: f32,
     highlights: &[(i32, egui::Color32)],
-) -> Option<i32> {
+    pad_keys: &[(i32, egui::Color32)],
+) -> (Option<i32>, Option<i32>) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
     let p = ui.painter_at(rect);
@@ -18085,8 +18112,32 @@ fn piano_keyboard(
     let n_oct = ((rect.width() / (7.0 * 34.0)).round() as i32).clamp(1, 11);
     let ww = rect.width() / (7 * n_oct) as f32;
     let lit = |semi: i32| highlights.iter().find(|(s, _)| *s == semi).map(|(_, c)| *c);
+    let pad_of = |semi: i32| pad_keys.iter().find(|(s, _)| *s == semi).map(|(_, c)| *c);
     let border = egui::Stroke::new(1.0, egui::Color32::from_gray(60));
     let mut picked = None;
+    let mut hovered = None;
+    // Little pad chip on a mapped key (top of the key so it clears the letter label at the bottom).
+    let pad_chip = |p: &egui::Painter, kr: egui::Rect, col: egui::Color32, dark_key: bool| {
+        let cw = (kr.width() * 0.62).min(11.0);
+        let cr = egui::Rect::from_center_size(
+            egui::pos2(kr.center().x, kr.top() + 7.0),
+            egui::vec2(cw, cw * 0.7),
+        );
+        p.rect_filled(cr, 1.5, col);
+        p.rect_stroke(
+            cr,
+            1.5,
+            egui::Stroke::new(
+                1.0,
+                if dark_key {
+                    egui::Color32::from_gray(230)
+                } else {
+                    egui::Color32::from_gray(40)
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+    };
     for oi in 0..n_oct {
         let base = (octave + oi) * 12;
         for (i, &semi) in white.iter().enumerate() {
@@ -18105,6 +18156,9 @@ fn piano_keyboard(
             };
             p.rect_filled(kr.shrink(1.0), 2.0, fill);
             p.rect_stroke(kr.shrink(1.0), 2.0, border, egui::StrokeKind::Inside);
+            if let Some(c) = pad_of(base + semi) {
+                pad_chip(&p, kr, c, false);
+            }
             // Label C with its octave (a marker), the rest with just the letter.
             let label = if i == 0 {
                 midi_note_name((base + semi + 60).clamp(0, 127) as u8)
@@ -18120,6 +18174,9 @@ fn piano_keyboard(
             );
             if resp.clicked() {
                 picked = Some(base + semi);
+            }
+            if resp.hovered() {
+                hovered = Some(base + semi);
             }
         }
     }
@@ -18142,12 +18199,18 @@ fn piano_keyboard(
                 egui::Color32::from_rgb(26, 26, 32)
             };
             p.rect_filled(kr, 2.0, fill);
+            if let Some(c) = pad_of(base + semi) {
+                pad_chip(&p, kr, c, true);
+            }
             if resp.clicked() {
                 picked = Some(base + semi);
             }
+            if resp.hovered() {
+                hovered = Some(base + semi); // black keys are on top → override a white hover
+            }
         }
     }
-    picked
+    (picked, hovered)
 }
 
 /// A mono peak envelope (0..1), `buckets` wide, from interleaved samples — for drawing the
