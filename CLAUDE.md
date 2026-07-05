@@ -907,7 +907,13 @@ set on the big editor, restored on Back — via `take_buffer`/`put_buffer` + an 
 × clear, **M/S** (`pad_is_audible` folds mute + kit-wide solo), a **V** velocity toggle (on = track
 the played note's velocity, off = fixed 127), a volume slider, and a painted vertical
 **VU** (`pad_levels`). A pad is triggered by clicking it, or a matching note (onscreen/MIDI) via
-`route_note_on`; **`AudioPlayer::trigger_pad_voice`** fires each hit as its own `rodio::Player` on the
+`route_note_on`. **A pad click's X-position sets its velocity** (far left = soft 10 → far right =
+127), passed to `trigger_pad` which still gates it — only heard with the pad's **V** on (fixed 127
+when off; Global velocity wins). **Drop a sample onto a pad to load it**: the Samples-explorer file
+rows + the tracker "Samples (N)" rows are drag sources (`PadDrop::File(PathBuf)` / `::Tracker(usize)`
+set via `egui::DragAndDrop::set_payload`); a pad tile highlights while a payload hovers
+(`dnd_hover_payload`) and loads it on release (`dnd_release_payload` → `load_pad_from_file` /
+`load_pad_from_tracker`, both via the shared `set_pad`). **`AudioPlayer::trigger_pad_voice`** fires each hit as its own `rodio::Player` on the
 **shared `_stream.mixer()`** (`pad_voices: Vec<PadVoice>`, reaped each frame) — the mixer sums them,
 so pads are **polyphonic** (the base player is monophonic). Feedback (the user's ask): every played
 note lights its keyboard key (`note_flash`) — **red** if it routes to a pad, an accent otherwise — and
@@ -951,7 +957,13 @@ magnified **edge inset** (the `zoom_edit_pct` "Zoom Edit %" pref) overlays per-s
 `@ smp` readout. Move-drag snapping: **Alt+Shift** → nearest zero crossing (`next_zero_crossing`),
 **Alt** → nearest transient. **Transients** (`detect_transients`: RMS energy-flux + refractory gap,
 sensitivity slider; drawn as culled amber guideline markers) + **BPM** (`estimate_bpm` Detect) + a
-**Musical** beat-division grid. `next_zero_crossing`/`detect_transients` are unit-tested. A `.pvkit`
+**Musical** beat-division grid. `next_zero_crossing`/`detect_transients` are unit-tested. **Snap to
+transient** (`snap_transient`, a Transients-row checkbox, persisted): a fresh selection's anchor
+snaps at drag-start and its moving edge snaps while dragging (edge-adjust snaps only the moving
+edge); markers are drawn + detected whenever Snap **or** Transients is on. **Middle-click a transient
+slice**: with Transients on, a middle-click selects from the transient boundary at/before the click
+to the next one after, and plays just that slice (`want_play_region`); no transients → play-from-here
+(`want_play_at`/`play_from`). A `.pvkit`
 file (shown with a KIT badge) **loads on click** (`is_kit_ext` → `load_kit`, not the viewer).
 
 **Window geometry** persists (`WINDOW_GEOM_KEY` = `[x,y,w,h]`, captured each frame, restored on the
