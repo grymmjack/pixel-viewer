@@ -804,6 +804,7 @@ pub struct PixelView {
     nudge_lock: Option<(Edge, f32)>, // (edge, last wheel-nudge time): keep nudging it as it drifts
     wave_view: Option<(f32, f32)>, // zoomed view window (start,end secs); None = whole file (transient)
     zoom_edit_pct: u32, // "Zoom Edit %": magnification of the edge inset (0 = off); persisted
+    wave_amp: f32,      // waveform vertical magnification (1 = normal); persisted
     // Transient / BPM / musical-grid state (item 10). Marks are detected times (secs), cached for
     // the current buffer and recomputed when the sensitivity or buffer changes.
     transients_on: bool,        // detect + draw transient guideline markers (persisted)
@@ -1198,6 +1199,7 @@ impl PixelView {
     const WINDOW_GEOM_KEY: &'static str = "window_geom"; // [x, y, w, h]: restore last window place
     const SAMPLE_PLACES_KEY: &'static str = "sample_places"; // user Samples locations
     const ZOOM_EDIT_KEY: &'static str = "zoom_edit_pct"; // waveform edge-inset magnification
+    const WAVE_AMP_KEY: &'static str = "wave_amp"; // waveform vertical magnification
     const TRANSIENTS_KEY: &'static str = "transients_on";
     const TRANSIENT_SENS_KEY: &'static str = "transient_sens";
     const BPM_KEY: &'static str = "bpm";
@@ -1731,6 +1733,11 @@ impl PixelView {
                 .storage
                 .and_then(|s| eframe::get_value::<u32>(s, Self::ZOOM_EDIT_KEY))
                 .unwrap_or(1000),
+            wave_amp: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::WAVE_AMP_KEY))
+                .unwrap_or(1.0)
+                .clamp(1.0, 8.0),
             transients_on: get_bool(Self::TRANSIENTS_KEY).unwrap_or(false),
             transient_sens: cc
                 .storage
@@ -3844,11 +3851,13 @@ impl PixelView {
         // Interactive waveform: hi-res bars, shaded loop region, moving playhead.
         if let Some(ap) = self.audio_player.as_ref().filter(|_| loaded) {
             let h = if big { self.audio_wave_h } else { 96.0 };
+            let amp_w = if big { 18.0 } else { 0.0 }; // reserve a strip for the vertical amp slider
             let (rect, resp) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), h),
+                egui::vec2((ui.available_width() - amp_w).max(1.0), h),
                 egui::Sense::click_and_drag(),
             );
             let w = rect.width().max(1.0);
+            let amp = self.wave_amp.clamp(1.0, 8.0);
             let sr = ap.sample_rate.get() as f32;
             let ch = ap.channels.get() as usize;
             let nframes = if ch > 0 { ap.samples.len() / ch } else { 0 };
@@ -4112,7 +4121,7 @@ impl PixelView {
                     let b = (((t1 / dur) * np as f32) as usize).clamp(a + 1, np);
                     ap.peaks[a..b].iter().copied().fold(0.0, f32::max)
                 };
-                let half = (peak * (h * 0.44)).max(0.5);
+                let half = (peak * (h * 0.44) * amp).max(0.5).min(h * 0.49);
                 let x = rect.left() + cx as f32;
                 let t = t0;
                 // No sub-selection → the whole file reads bright; a sub-selection dims outside it.
@@ -4160,15 +4169,32 @@ impl PixelView {
             // Selection edge handles — bright green, brighter + thicker on the hovered/dragged edge.
             const GREEN: egui::Color32 = egui::Color32::from_rgb(120, 240, 150);
             const GREEN_HOT: egui::Color32 = egui::Color32::from_rgb(185, 255, 205);
-            if draw_has_sel {
+            // Show the edges for a real sub-selection, or always while editing a pad (so the pad's
+            // start/end bounds are visible even when it's the whole sample).
+            let editing_pad = matches!(self.edit_focus, EditFocus::Pad(_));
+            if draw_has_sel || editing_pad {
                 let hot = |e: Edge| {
                     active_edge == Some(e) || (active_edge.is_none() && hovered_edge == Some(e))
                 };
                 // Only draw an edge handle when it falls inside the visible (zoomed) window.
-                for (e, et) in [(Edge::Left, draw_lo), (Edge::Right, draw_hi)] {
+                for (e, et, tag) in [(Edge::Left, draw_lo, "s"), (Edge::Right, draw_hi, "e")] {
                     if et >= vs - 1e-6 && et <= ve + 1e-6 {
                         let (col, wdt) = if hot(e) { (GREEN_HOT, 2.5) } else { (GREEN, 1.5) };
-                        p.vline(x_of(et), rect.y_range(), egui::Stroke::new(wdt, col));
+                        let ex = x_of(et);
+                        p.vline(ex, rect.y_range(), egui::Stroke::new(wdt, col));
+                        // 's'/'e' tag just inside the selection at each edge.
+                        let (align, dx) = if e == Edge::Left {
+                            (egui::Align2::LEFT_TOP, 3.0)
+                        } else {
+                            (egui::Align2::RIGHT_TOP, -3.0)
+                        };
+                        p.text(
+                            egui::pos2(ex + dx, rect.top() + 2.0),
+                            align,
+                            tag,
+                            egui::FontId::proportional(11.0),
+                            col,
+                        );
                     }
                 }
             }
@@ -4242,7 +4268,7 @@ impl PixelView {
                                 }
                             }
                         }
-                        let hh = (mx * (inset_h * 0.42)).max(0.5);
+                        let hh = (mx * (inset_h * 0.42) * amp).max(0.5).min(inset_h * 0.47);
                         let x = ir.left() + cx as f32;
                         p.line_segment(
                             [egui::pos2(x, imid - hh), egui::pos2(x, imid + hh)],
@@ -4273,6 +4299,26 @@ impl PixelView {
                         egui::FontId::proportional(10.0),
                         egui::Color32::from_rgb(150, 220, 170),
                     );
+                }
+            }
+            // Vertical amplitude ("waveform height") slider in the reserved right strip.
+            if big && amp_w > 0.0 {
+                let amp_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.right() + 3.0, rect.top() + 2.0),
+                    egui::pos2(rect.right() + amp_w, rect.bottom() - 2.0),
+                );
+                let mut v = self.wave_amp;
+                if ui
+                    .put(
+                        amp_rect,
+                        egui::Slider::new(&mut v, 1.0..=8.0)
+                            .vertical()
+                            .show_value(false),
+                    )
+                    .on_hover_text(format!("Waveform height ×{:.1}", self.wave_amp))
+                    .changed()
+                {
+                    self.wave_amp = v.clamp(1.0, 8.0);
                 }
             }
             ui.horizontal(|ui| {
@@ -4736,18 +4782,19 @@ impl PixelView {
                             {
                                 pad_export = Some(i);
                             }
-                            // A small color chip when the pad is tagged.
-                            if let Some(c) = color {
-                                let (cr, _) = ui.allocate_exact_size(
-                                    egui::vec2(9.0, 9.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().rect_filled(
-                                    cr,
-                                    1.0,
-                                    egui::Color32::from_rgb(c[0], c[1], c[2]),
-                                );
-                            }
+                            // A color chip on every row (default when untagged) so the names align.
+                            let chip = color.unwrap_or(if *has {
+                                [90, 100, 120]
+                            } else {
+                                [42, 45, 54]
+                            });
+                            let (cr, _) =
+                                ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                            ui.painter().rect_filled(
+                                cr,
+                                1.0,
+                                egui::Color32::from_rgb(chip[0], chip[1], chip[2]),
+                            );
                             let label = if *has {
                                 format!("{:>2}. {}", i + 1, name)
                             } else {
@@ -14357,6 +14404,7 @@ impl eframe::App for PixelView {
         }
         eframe::set_value(storage, Self::SAMPLE_PLACES_KEY, &self.sample_places);
         eframe::set_value(storage, Self::ZOOM_EDIT_KEY, &self.zoom_edit_pct);
+        eframe::set_value(storage, Self::WAVE_AMP_KEY, &self.wave_amp);
         eframe::set_value(storage, Self::TRANSIENTS_KEY, &self.transients_on);
         eframe::set_value(storage, Self::TRANSIENT_SENS_KEY, &self.transient_sens);
         eframe::set_value(storage, Self::BPM_KEY, &self.bpm);
