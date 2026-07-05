@@ -921,6 +921,7 @@ pub struct PixelView {
     theme: u8,                                              // 0 = dark, 1 = light
     grid_gap: f32,           // horizontal spacing between grid tiles, in points
     grid_gap_y: f32,         // vertical spacing between grid rows, in points
+    grid_tile_border: bool,  // draw a border + padding around each grid tile (persisted)
     caption_fields: u16,     // bitmask: what to show under each grid thumbnail
     // Per-category grid-tile backgrounds: a subtle accent behind folder / archive /
     // sample-bank tiles so container kinds read at a glance. Accents are blended into
@@ -1238,6 +1239,7 @@ impl PixelView {
     const THEME_KEY: &'static str = "theme";
     const GAP_KEY: &'static str = "grid_gap";
     const GAP_Y_KEY: &'static str = "grid_gap_y";
+    const TILE_BORDER_KEY: &'static str = "grid_tile_border";
     const CAPTION_KEY: &'static str = "caption_fields";
     /// Per-category tile backgrounds, stored as one record: `(enabled, folder, archive, container)`.
     const TILE_BG_KEY: &'static str = "tile_backgrounds";
@@ -1847,6 +1849,7 @@ impl PixelView {
             theme,
             grid_gap,
             grid_gap_y,
+            grid_tile_border: get_bool(Self::TILE_BORDER_KEY).unwrap_or(true),
             caption_fields,
             tile_bg_enabled,
             tile_bg_folder,
@@ -9709,6 +9712,26 @@ impl PixelView {
                             }
                         }
 
+                        // Optional per-tile border (Preferences) so tiles read as separate cards,
+                        // not one continuous row. Drawn last so it sits over the thumbnail edges.
+                        if self.grid_tile_border {
+                            let stroke = if is_selected {
+                                egui::Stroke::new(1.5, ui.visuals().selection.stroke.color)
+                            } else if resp.hovered() {
+                                egui::Stroke::new(1.0, ui.visuals().widgets.hovered.bg_stroke.color)
+                            } else {
+                                egui::Stroke::new(
+                                    1.0,
+                                    ui.visuals().widgets.noninteractive.bg_stroke.color,
+                                )
+                            };
+                            ui.painter().rect_stroke(
+                                cell_rect.shrink(0.5),
+                                5.0,
+                                stroke,
+                                egui::StrokeKind::Inside,
+                            );
+                        }
                         if resp.hovered() {
                             hovered = Some(idx);
                         }
@@ -14357,6 +14380,11 @@ impl eframe::App for PixelView {
                                 }
                                 self.grid_gap = gap;
                                 self.grid_gap_y = gap_y;
+                                ui.checkbox(&mut self.grid_tile_border, "Tile borders")
+                                    .on_hover_text(
+                                        "Draw a border around each grid tile so they read as \
+                                         separate cards instead of one continuous row.",
+                                    );
 
                                 ui.add_space(10.0);
                                 ui.label("Window title bar");
@@ -14897,6 +14925,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::ZOOM_LOCK_KEY, &self.zoom_lock);
         eframe::set_value(storage, Self::THEME_KEY, &self.theme);
         eframe::set_value(storage, Self::GAP_KEY, &self.grid_gap);
+        eframe::set_value(storage, Self::TILE_BORDER_KEY, &self.grid_tile_border);
         eframe::set_value(storage, Self::GAP_Y_KEY, &self.grid_gap_y);
         eframe::set_value(storage, Self::CAPTION_KEY, &self.caption_fields);
         eframe::set_value(storage, Self::DETAILS_THUMB_H_KEY, &self.details_thumb_h);
