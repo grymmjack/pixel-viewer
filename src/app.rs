@@ -3837,6 +3837,8 @@ impl PixelView {
         let mut want_stop = false;
         let mut want_panic = false; // stop ALL sound (main + pads)
         let mut want_back = false; // leave a pad drill-in
+        let mut want_reveal_source: Option<PathBuf> = None; // open the edited sample's folder
+        let mut want_reload_source: Option<PathBuf> = None; // reload the edited sample from disk
         let mut want_loop: Option<bool> = None;
         let mut want_autoplay: Option<bool> = None;
         let mut want_select: Option<(f32, f32)> = None;
@@ -3918,6 +3920,41 @@ impl PixelView {
             let mm = |s: f32| format!("{}:{:02}", (s as u64) / 60, (s as u64) % 60);
             ui.weak(format!("{} / {}", mm(pos), mm(dur)));
         });
+        // When editing a sample loaded from the Samples browser, show its file path: click the name
+        // to jump back to its folder in the Samples explorer, or ↻ to reload it fresh (revert edits).
+        if big {
+            if let Some(src) = self.editor_source.clone() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak("Editing:");
+                    let link = ui
+                        .add(
+                            egui::Label::new(
+                                egui::RichText::new(short_name(&src))
+                                    .color(ui.visuals().hyperlink_color)
+                                    .underline(),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text(format!(
+                            "{}\n(click to open its folder in the Samples explorer)",
+                            src.display()
+                        ));
+                    if link.clicked() {
+                        want_reveal_source = Some(src.clone());
+                    }
+                    if ui
+                        .add(egui::Button::new(icons::REFRESH).small())
+                        .on_hover_text("Reload this sample from disk (revert your edits)")
+                        .clicked()
+                    {
+                        want_reload_source = Some(src.clone());
+                    }
+                    if let Some(parent) = src.parent() {
+                        ui.weak(elide(&parent.to_string_lossy(), 52));
+                    }
+                });
+            }
+        }
         // Per-pad loop / pitch / loop-type controls while drilled into a pad (they edit the pad
         // directly; the waveform drag sets the loop region, committed on Back). Play/trigger the
         // pad to hear the pitch + loop-type applied.
@@ -4816,6 +4853,17 @@ impl PixelView {
         }
         if want_back {
             self.focus_back();
+        }
+        if let Some(src) = want_reveal_source {
+            // Open the edited sample's folder in the Samples explorer (left dock, Samples tab).
+            if let Some(parent) = src.parent() {
+                self.sample_browse = Some(parent.to_path_buf());
+                self.places_tab = 3; // Samples
+                self.show_explorer = true;
+            }
+        }
+        if let Some(src) = want_reload_source {
+            self.load_sample_into_editor(&src); // fresh decode → revert edits
         }
         if want_panic {
             self.audio_panic();
