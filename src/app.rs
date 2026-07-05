@@ -986,6 +986,11 @@ pub struct PixelView {
     // DEBUG_MODE=true: dock the window to the bottom-right corner on startup (so a dev test
     // instance stays out of the way). Consumed once the monitor size is known. Not persisted.
     debug_dock_pending: bool,
+    // Window geometry persistence: `win_geom` = the last-seen [x, y, w, h] (outer position + inner
+    // size), captured each frame and written in `save()`. `restore_geom` = the persisted geometry
+    // to reapply on the first frame (None in DEBUG_MODE — the dock wins there).
+    win_geom: Option<[f32; 4]>,
+    restore_geom: Option<[f32; 4]>,
     // Window title bar: when on, the open folder/file's display path is shown after "pixelview";
     // the GUI zoom % (Ctrl +/-) is always appended in parens when it isn't 100%. `title_last`
     // dedupes so we only push a `ViewportCommand::Title` when the string actually changes.
@@ -1167,6 +1172,7 @@ impl PixelView {
     const DETAILS_KEY: &'static str = "show_details";
     /// Show the open path/file in the window title bar (zoom % is always appended when ≠100%).
     const TITLE_PATH_KEY: &'static str = "title_show_path";
+    const WINDOW_GEOM_KEY: &'static str = "window_geom"; // [x, y, w, h]: restore last window place
     const RECOLOR_KEY: &'static str = "show_recolor";
     const RECOLOR_GRID_KEY: &'static str = "recolor_grid";
     const ZOOM_LOCK_KEY: &'static str = "zoom_lock";
@@ -1824,6 +1830,18 @@ impl PixelView {
             debug_dock_pending: std::env::var("DEBUG_MODE")
                 .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
                 .unwrap_or(false),
+            win_geom: None,
+            // Restore the last window geometry — but not in DEBUG_MODE, where the bottom-right dock
+            // takes precedence (and a test instance shouldn't clobber that placement).
+            restore_geom: if std::env::var("DEBUG_MODE")
+                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
+                .unwrap_or(false)
+            {
+                None
+            } else {
+                cc.storage
+                    .and_then(|s| eframe::get_value::<[f32; 4]>(s, Self::WINDOW_GEOM_KEY))
+            },
             title_show_path: get_bool(Self::TITLE_PATH_KEY).unwrap_or(true),
             title_last: String::new(),
             idle_t: 0.0,
@@ -12221,6 +12239,28 @@ impl eframe::App for PixelView {
                 self.debug_dock_pending = false;
             }
         }
+        // Window-geometry persistence: remember where the window is each frame (so `save()` writes
+        // the final place on exit), and reapply the saved geometry once, on the first frame the
+        // monitor size is known — clamped on-screen in case the monitor changed since last run.
+        {
+            let (outer, inner, mon) = ctx.input(|i| {
+                let v = i.viewport();
+                (v.outer_rect, v.inner_rect, v.monitor_size)
+            });
+            if let Some(inner) = inner {
+                let pos = outer.map(|o| o.min).unwrap_or(inner.min);
+                self.win_geom = Some([pos.x, pos.y, inner.width(), inner.height()]);
+            }
+            if let (Some(g), Some(mon)) = (self.restore_geom, mon) {
+                let w = g[2].clamp(400.0, mon.x.max(400.0));
+                let h = g[3].clamp(300.0, mon.y.max(300.0));
+                let x = g[0].clamp(0.0, (mon.x - w).max(0.0));
+                let y = g[1].clamp(0.0, (mon.y - h).max(0.0));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
+                self.restore_geom = None;
+            }
+        }
         // Reflect the open path/file + GUI zoom in the OS title bar (deduped internally).
         self.update_window_title(&ctx);
         // Decode any new "Open in…" program icons (cheap: returns early when all cached).
@@ -13178,6 +13218,10 @@ impl eframe::App for PixelView {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        // Remember the window's place (position + inner size) so the next launch reopens there.
+        if let Some(g) = self.win_geom {
+            eframe::set_value(storage, Self::WINDOW_GEOM_KEY, &g);
+        }
         eframe::set_value(storage, Self::ZOOM_KEY, &self.ui_zoom);
         eframe::set_value(storage, Self::THUMB_KEY, &self.thumb_size);
         eframe::set_value(storage, Self::FAV_KEY, &self.favorites);
