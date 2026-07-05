@@ -924,9 +924,39 @@ truly-global escape hatch (the plain back-to-grid Escape excludes Shift). The wh
 field save the kit as a `.pvkit` (a zip — `manifest.txt` storing the kit name + **MIDI controller +
 base/octave + global velocity + every pad's record** + `pad_NN.wav`s; `save_kit`/`load_kit` via the
 `zip` crate). Saved
-kits live in `<data>/kits/` and are browsable via a **🎵 Kits** entry in the Places dock; a `.pvkit`
-file (shown with a KIT badge) **loads on click** (`is_kit_ext` → `load_kit`, not the viewer). All of
-it is gated on `self.plugin_audio`.
+kits live in `<data>/kits/`. **Places dock sub-tabs are `Local · 16colo · Kits · Samples`** (last two
+audio-plugin-only): the **Kits** tab lists saved `.pvkit`s (click → `load_kit` into the current pads,
+no navigation) and **opens the standalone pad editor** (below); **Samples** holds user-added sample
+folders (`sample_places`: name/dir/color, `SAMPLE_PLACES_KEY`) — `＋ Add location…` (rfd), click to
+browse, right-click to rename (inline) / colorize (ANSI32 swatches) / remove. All gated on
+`self.plugin_audio`.
+
+**Standalone Sample-Pads editor (`kit_editor`).** Clicking the Kits tab or loading a kit shows the
+pad grid + keyboard + a **silent waveform** with no audio file open (`enter_kit_editor` → `mode =
+Single` + `ensure_kit_editor`, which installs a 1 s **silent `AudioPlayer`** at the synthetic
+`kit_editor_path()` so the pad mixer has a device + a flat waveform). `ui_single` renders the "🎹
+Sample Pads — <kit>" view (heading + ‹ Grid) via the shared `draw_audio_controls(big)`; `kit_editor`
+clears on navigation (`open_folder`) or opening any file (`load_full`).
+
+**Waveform editor (`draw_audio_controls`'s interactive waveform).** A pro sample-editor interaction,
+resolved BEFORE drawing so the shade/edges track the live drag. `WaveDrag`/`Edge` model the drag:
+drag empty = new selection, drag an edge = adjust it (the opposite edge anchors → crossover swaps
+L/R), drag inside = move; a green hover line shows where a new selection begins, edges are bright-
+green handles (hot on hover/drag), the cursor is `↔`/Grab; a **full-file selection counts as no
+selection** so a drag can always start a sub-selection. `wave_view` is a zoom window: **mousewheel
+zooms** around the cursor (consuming `smooth_scroll_delta` so the audio ScrollArea doesn't scroll;
+per-sample bars when zoomed in), **Shift+wheel pans**, double-click resets. Over an edge, **wheel
+nudges** it by 1 / Shift 10 / Shift+Alt zero-crossing sample(s) (grow vs shrink by direction), and a
+magnified **edge inset** (the `zoom_edit_pct` "Zoom Edit %" pref) overlays per-sample detail with an
+`@ smp` readout. Move-drag snapping: **Alt+Shift** → nearest zero crossing (`next_zero_crossing`),
+**Alt** → nearest transient. **Transients** (`detect_transients`: RMS energy-flux + refractory gap,
+sensitivity slider; drawn as culled amber guideline markers) + **BPM** (`estimate_bpm` Detect) + a
+**Musical** beat-division grid. `next_zero_crossing`/`detect_transients` are unit-tested. A `.pvkit`
+file (shown with a KIT badge) **loads on click** (`is_kit_ext` → `load_kit`, not the viewer).
+
+**Window geometry** persists (`WINDOW_GEOM_KEY` = `[x,y,w,h]`, captured each frame, restored on the
+first frame the monitor size is known, clamped on-screen) — except in `DEBUG_MODE`, where the
+bottom-right dev dock wins.
 
 **Sample banks as folders (`soundfont.rs` / `sfz.rs` / `dls.rs`).** A `.sf2`, `.sfz`, or `.dls`
 is a **virtual folder** of its samples. `is_sample_bank(path)` folds all three into the
