@@ -800,7 +800,7 @@ pub struct PixelView {
     audio_decode_cache: Vec<(PathBuf, u64, DecodedAudio)>, // LRU of decoded audio (key: path+sig)
     audio_loading: Option<AudioLoading>, // a background audio decode in flight (spinner while pending)
     audio_autoplay: bool,      // start playing on select + loop until stopped (persisted)
-    audio_drag: Option<f32>,   // waveform drag-select anchor time (transient)
+    wave_drag: Option<WaveDrag>, // active waveform-editor drag (transient)
     audio_octave: i32,         // onscreen-keyboard octave offset (transient)
     audio_volume: f32,         // master playback volume 0..1 (menu-bar slider, persisted)
     audio_muted: bool,         // master mute (menu-bar speaker toggle, persisted)
@@ -1686,7 +1686,7 @@ impl PixelView {
             xi_cache: HashMap::new(),
             audio_player: None,
             audio_autoplay,
-            audio_drag: None,
+            wave_drag: None,
             audio_octave: 0,
             audio_volume,
             audio_muted,
@@ -3605,64 +3605,62 @@ impl PixelView {
                 egui::vec2(ui.available_width(), h),
                 egui::Sense::click_and_drag(),
             );
-            let p = ui.painter_at(rect);
-            p.rect_filled(rect, 3.0, egui::Color32::from_rgb(16, 18, 24));
             let w = rect.width().max(1.0);
             let x_of = |t: f32| rect.left() + (t / dur).clamp(0.0, 1.0) * w;
-            p.rect_filled(
-                egui::Rect::from_x_y_ranges(x_of(sel_lo)..=x_of(sel_hi), rect.y_range()),
-                0.0,
-                egui::Color32::from_rgba_unmultiplied(88, 196, 172, 34),
-            );
-            // Waveform tinted by the file's format accent color (configurable in Preferences).
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let accent = crate::format_color::color32(ext);
-            let accent_dim = accent.gamma_multiply(0.5);
-            let mid = rect.center().y;
-            // Faint center baseline so near-silent stretches still read as a continuous
-            // waveform (like the thumbnail), instead of dropping out to the background. The
-            // bars draw over it wherever the signal is loud.
-            p.hline(
-                rect.x_range(),
-                mid,
-                egui::Stroke::new(1.0, accent.gamma_multiply(0.32)),
-            );
-            let cols = w as usize;
-            let n = ap.peaks.len().max(1);
-            for cx in 0..cols {
-                let a = cx * n / cols.max(1);
-                let b = ((cx + 1) * n / cols.max(1)).max(a + 1).min(n);
-                let peak = ap.peaks[a..b].iter().copied().fold(0.0, f32::max);
-                let half = (peak * (h * 0.44)).max(0.5);
-                let x = rect.left() + cx as f32;
-                let t = (cx as f32 / w) * dur;
-                let col = if t >= sel_lo && t <= sel_hi {
-                    accent
-                } else {
-                    accent_dim
-                };
-                p.line_segment(
-                    [egui::pos2(x, mid - half), egui::pos2(x, mid + half)],
-                    egui::Stroke::new(1.0, col),
-                );
-            }
-            p.vline(
-                x_of(pos),
-                rect.y_range(),
-                egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 224, 130)),
-            );
             let t_at = |x: f32| (((x - rect.left()) / w).clamp(0.0, 1.0)) * dur;
+
+            // ---- Interaction (resolved BEFORE drawing so the edges/shade track the live drag) --
+            const EDGE_PX: f32 = 6.0; // pointer-to-edge grab tolerance
+            let has_sel = sel_hi > sel_lo + 1e-4;
+            let (lo_x, hi_x) = (x_of(sel_lo), x_of(sel_hi));
+            let near_edge = |x: f32| -> Option<Edge> {
+                if !has_sel {
+                    None
+                } else if (x - lo_x).abs() <= EDGE_PX {
+                    Some(Edge::Left)
+                } else if (x - hi_x).abs() <= EDGE_PX {
+                    Some(Edge::Right)
+                } else {
+                    None
+                }
+            };
+            let inside_sel = |x: f32| has_sel && x > lo_x + EDGE_PX && x < hi_x - EDGE_PX;
+            let hover_x = resp.hover_pos().map(|pp| pp.x);
+            let hovered_edge = hover_x.and_then(near_edge);
+
             if resp.drag_started() {
-                self.audio_drag = resp.interact_pointer_pos().map(|pp| t_at(pp.x));
+                if let Some(pp) = resp.interact_pointer_pos() {
+                    let x = pp.x;
+                    self.wave_drag = Some(match near_edge(x) {
+                        // Drag an edge → the OTHER edge is the fixed anchor; crossover is automatic.
+                        Some(Edge::Left) => WaveDrag::Select { anchor: sel_hi, edge: Edge::Left },
+                        Some(Edge::Right) => WaveDrag::Select { anchor: sel_lo, edge: Edge::Right },
+                        // Inside the selection → shift the whole thing.
+                        None if inside_sel(x) => WaveDrag::Move {
+                            width: sel_hi - sel_lo,
+                            grab_off: t_at(x) - sel_lo,
+                        },
+                        // Empty area → start a fresh selection anchored here.
+                        None => WaveDrag::Select { anchor: t_at(x), edge: Edge::Right },
+                    });
+                }
             }
             if resp.dragged() {
-                if let (Some(a), Some(pp)) = (self.audio_drag, resp.interact_pointer_pos()) {
-                    let b = t_at(pp.x);
-                    want_select = Some((a.min(b), a.max(b)));
+                if let (Some(drag), Some(pp)) = (self.wave_drag, resp.interact_pointer_pos()) {
+                    let t = t_at(pp.x);
+                    match drag {
+                        WaveDrag::Select { anchor, .. } => {
+                            want_select = Some((anchor.min(t), anchor.max(t)));
+                        }
+                        WaveDrag::Move { width, grab_off } => {
+                            let lo = (t - grab_off).clamp(0.0, (dur - width).max(0.0));
+                            want_select = Some((lo, lo + width));
+                        }
+                    }
                 }
             }
             if resp.drag_stopped() {
-                self.audio_drag = None;
+                self.wave_drag = None;
                 want_commit = true;
             }
             if resp.double_clicked() {
@@ -3677,7 +3675,98 @@ impl PixelView {
                     want_seek = Some(t_at(pp.x));
                 }
             }
-            ui.weak("drag: loop region · click: seek · dbl-click: all · middle-click: play here");
+            // Cursor feedback: ↔ over / while dragging an edge, grab inside a selection.
+            let active_edge = match self.wave_drag {
+                Some(WaveDrag::Select { edge, .. }) => Some(edge),
+                _ => None,
+            };
+            let dragging_move = matches!(self.wave_drag, Some(WaveDrag::Move { .. }));
+            if resp.hovered() || self.wave_drag.is_some() {
+                let icon = if active_edge.is_some() || hovered_edge.is_some() {
+                    egui::CursorIcon::ResizeHorizontal
+                } else if dragging_move {
+                    egui::CursorIcon::Grabbing
+                } else if hover_x.is_some_and(&inside_sel) {
+                    egui::CursorIcon::Grab
+                } else {
+                    egui::CursorIcon::Text
+                };
+                ui.ctx().set_cursor_icon(icon);
+            }
+
+            // ---- Drawing (uses the live drag selection so the shade + edges follow the pointer) -
+            let (draw_lo, draw_hi) = want_select.unwrap_or((sel_lo, sel_hi));
+            let draw_has_sel = draw_hi > draw_lo + 1e-4;
+            let p = ui.painter_at(rect);
+            p.rect_filled(rect, 3.0, egui::Color32::from_rgb(16, 18, 24));
+            if draw_has_sel {
+                p.rect_filled(
+                    egui::Rect::from_x_y_ranges(x_of(draw_lo)..=x_of(draw_hi), rect.y_range()),
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(96, 210, 130, 40),
+                );
+            }
+            // Waveform tinted by the file's format accent color (configurable in Preferences).
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let accent = crate::format_color::color32(ext);
+            let accent_dim = accent.gamma_multiply(0.5);
+            let mid = rect.center().y;
+            // Faint center baseline so near-silent stretches still read as a continuous
+            // waveform (like the thumbnail), instead of dropping out to the background.
+            p.hline(
+                rect.x_range(),
+                mid,
+                egui::Stroke::new(1.0, accent.gamma_multiply(0.32)),
+            );
+            let cols = w as usize;
+            let n = ap.peaks.len().max(1);
+            for cx in 0..cols {
+                let a = cx * n / cols.max(1);
+                let b = ((cx + 1) * n / cols.max(1)).max(a + 1).min(n);
+                let peak = ap.peaks[a..b].iter().copied().fold(0.0, f32::max);
+                let half = (peak * (h * 0.44)).max(0.5);
+                let x = rect.left() + cx as f32;
+                let t = (cx as f32 / w) * dur;
+                let col = if draw_has_sel && t >= draw_lo && t <= draw_hi {
+                    accent
+                } else {
+                    accent_dim
+                };
+                p.line_segment(
+                    [egui::pos2(x, mid - half), egui::pos2(x, mid + half)],
+                    egui::Stroke::new(1.0, col),
+                );
+            }
+            // Selection edge handles — bright green, brighter + thicker on the hovered/dragged edge.
+            const GREEN: egui::Color32 = egui::Color32::from_rgb(120, 240, 150);
+            const GREEN_HOT: egui::Color32 = egui::Color32::from_rgb(185, 255, 205);
+            if draw_has_sel {
+                let hot = |e: Edge| {
+                    active_edge == Some(e) || (active_edge.is_none() && hovered_edge == Some(e))
+                };
+                for (e, ex) in [(Edge::Left, x_of(draw_lo)), (Edge::Right, x_of(draw_hi))] {
+                    let (col, wdt) = if hot(e) { (GREEN_HOT, 2.5) } else { (GREEN, 1.5) };
+                    p.vline(ex, rect.y_range(), egui::Stroke::new(wdt, col));
+                }
+            }
+            // Hover cursor line — where a new selection / playback would begin (pre-drag), unless
+            // the pointer is over an edge (that gets its own highlight) or inside the selection.
+            if self.wave_drag.is_none() && hovered_edge.is_none() {
+                if let Some(x) = hover_x.filter(|&x| !inside_sel(x)) {
+                    p.vline(
+                        x,
+                        rect.y_range(),
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 215, 120)),
+                    );
+                }
+            }
+            // Playhead.
+            p.vline(
+                x_of(pos),
+                rect.y_range(),
+                egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 224, 130)),
+            );
+            ui.weak("drag: select · edges: adjust ↔ · inside: move · click: seek · dbl: all · mid: play");
             // Resize the waveform height (big view only).
             if big {
                 let dy = drag_h_divider(ui, ui.available_width());
@@ -15079,6 +15168,25 @@ enum EditFocus {
     Song,
     Sample(usize),
     Pad(usize),
+}
+
+/// Which edge of the waveform selection the pointer is acting on.
+#[derive(Clone, Copy, PartialEq)]
+enum Edge {
+    Left,
+    Right,
+}
+
+/// An in-progress waveform-editor drag. The selection itself lives on `AudioPlayer`
+/// (`sel_start`/`sel_end`); this only tracks what the current pointer drag is doing.
+#[derive(Clone, Copy)]
+enum WaveDrag {
+    /// Creating a selection **or** dragging one edge: `anchor` (secs) is the fixed point; the
+    /// moving edge follows the pointer. Crossover is automatic — the selection is always
+    /// `(min, max)` of anchor and pointer, so dragging one edge past the other just swaps them.
+    Select { anchor: f32, edge: Edge },
+    /// Shifting the whole selection: its `width` (secs) + the pointer-to-`lo` offset at grab time.
+    Move { width: f32, grab_off: f32 },
 }
 
 /// The editor state stashed while drilled into a pad, restored on Back.
