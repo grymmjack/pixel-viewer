@@ -801,6 +801,7 @@ pub struct PixelView {
     audio_loading: Option<AudioLoading>, // a background audio decode in flight (spinner while pending)
     audio_autoplay: bool,      // start playing on select + loop until stopped (persisted)
     wave_drag: Option<WaveDrag>, // active waveform-editor drag (transient)
+    nudge_lock: Option<(Edge, f32)>, // (edge, last wheel-nudge time): keep nudging it as it drifts
     wave_view: Option<(f32, f32)>, // zoomed view window (start,end secs); None = whole file (transient)
     zoom_edit_pct: u32, // "Zoom Edit %": magnification of the edge inset (0 = off); persisted
     // Transient / BPM / musical-grid state (item 10). Marks are detected times (secs), cached for
@@ -889,6 +890,9 @@ pub struct PixelView {
     // folders to drag/assign into pads. Add/rename/colorize/remove from the Samples sub-tab.
     sample_places: Vec<(String, PathBuf, Option<[u8; 3]>)>,
     sample_rename: Option<(usize, String)>, // inline-rename buffer for a Samples place (transient)
+    sample_browse: Option<PathBuf>, // an opened Samples location → inline file explorer (transient)
+    editor_source: Option<PathBuf>, // a sample loaded into the editor from the browser (for load_pad)
+    pad_rename: Option<(usize, String)>, // inline-rename buffer for pad i's name (transient)
     show_hotkeys: bool,
     show_prefs: bool,
     show_associations: bool, // the View → Associations editor window is open
@@ -1721,6 +1725,7 @@ impl PixelView {
             audio_player: None,
             audio_autoplay,
             wave_drag: None,
+            nudge_lock: None,
             wave_view: None,
             zoom_edit_pct: cc
                 .storage
@@ -1808,6 +1813,9 @@ impl PixelView {
                 })
                 .unwrap_or_default(),
             sample_rename: None,
+            sample_browse: None,
+            editor_source: None,
+            pad_rename: None,
             show_hotkeys: false,
             show_prefs: false,
             show_associations: false,
@@ -2790,22 +2798,28 @@ impl PixelView {
             self.status = "Load an audio file first".into();
             return;
         }
+        let editor_source = self.editor_source.clone();
         let ap = self.audio_player.as_ref().unwrap();
         if ap.samples.is_empty() {
             return;
         }
         let buf = ap.current_region_buf();
-        let name = ap
-            .active_sample
-            .and_then(|s| ap.tracker_samples.get(s))
-            .map(|s| s.name.clone())
-            .unwrap_or_else(|| short_name(&ap.path));
-        // Remember where the sample came from (for the pad-list hover); skip the synthetic
-        // kit-editor path.
-        let source = if ap.path == kit_editor_path() {
-            None
+        // Prefer the explicit editor source (a file picked in the Samples explorer); else the
+        // active tracker sample's name / the open file. Skip the synthetic kit-editor path.
+        let (name, source) = if let Some(src) = &editor_source {
+            (short_name(src), Some(src.to_string_lossy().into_owned()))
         } else {
-            Some(ap.path.to_string_lossy().into_owned())
+            let name = ap
+                .active_sample
+                .and_then(|s| ap.tracker_samples.get(s))
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| short_name(&ap.path));
+            let source = if ap.path == kit_editor_path() {
+                None
+            } else {
+                Some(ap.path.to_string_lossy().into_owned())
+            };
+            (name, source)
         };
         let _ = std::fs::create_dir_all(pads_dir(&self.data_dir));
         let _ = write_wav_16(
@@ -2846,6 +2860,7 @@ impl PixelView {
         }
         self.wave_view = None; // drilling into a pad's sample resets the zoom
         self.transient_dirty = true;
+        self.editor_source = self.pads[i].source.clone().map(PathBuf::from);
         let buf = self.pads[i].buf.clone().unwrap();
         {
             let ap = self.audio_player.as_mut().unwrap();
@@ -3278,6 +3293,7 @@ impl PixelView {
         self.editor_stash = None;
         self.wave_view = None; // a new buffer resets the zoom to the whole file
         self.transient_dirty = true;
+        self.editor_source = None; // a tracker sample has no external file path
         self.edit_focus = match idx {
             Some(i) => EditFocus::Sample(i),
             None => EditFocus::Song,
@@ -3436,6 +3452,44 @@ impl PixelView {
             self.wave_view = None;
             self.transient_dirty = true;
             self.edit_focus = EditFocus::Song;
+        }
+    }
+
+    /// Load a sample file's audio into the (kit-editor) editor buffer — keeping the player's
+    /// kit-editor identity so the pads/mixer stay live — so a sample picked in the Samples explorer
+    /// can be shaped and assigned to a pad. Remembers `editor_source` for the pad's name/path.
+    fn load_sample_into_editor(&mut self, path: &Path) {
+        self.ensure_kit_editor();
+        let real = self.resolve_local(path);
+        let bytes = match std::fs::read(&real) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = format!("Read failed: {e}");
+                return;
+            }
+        };
+        match decode_audio(&real, bytes, None) {
+            Ok(d) => {
+                if let Some(ap) = &mut self.audio_player {
+                    ap.stop();
+                    ap.tracker_samples = d.tracker_samples;
+                    ap.active_sample = None;
+                    ap.song_backup = None;
+                    ap.put_buffer(SampleBuf {
+                        samples: d.samples,
+                        channels: d.channels,
+                        sample_rate: d.sample_rate,
+                        duration: d.duration,
+                        peaks: d.peaks,
+                    });
+                }
+                self.editor_source = Some(path.to_path_buf());
+                self.edit_focus = EditFocus::Song;
+                self.wave_view = None;
+                self.transient_dirty = true;
+                self.status = format!("Loaded {}", short_name(path));
+            }
+            Err(e) => self.status = format!("Can't decode: {e}"),
         }
     }
 
@@ -3946,9 +4000,16 @@ impl PixelView {
                 if notches.abs() > 0.0 {
                     ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO); // don't scroll the page
                     let up = notches > 0.0;
-                    if let Some(edge) = hovered_edge {
-                        // Item 7: nudge the hovered edge. Wheel up = grow (edge outward, wider);
-                        // down = shrink (inward). Shift = 10 samples, Shift+Alt = zero crossing.
+                    // Keep nudging the same edge even as it drifts away from the cursor (a wheel
+                    // fine-tune session), so it doesn't flip to zoom the moment the edge moves.
+                    let locked = self
+                        .nudge_lock
+                        .filter(|(_, t)| now - *t < 0.6)
+                        .map(|(e, _)| e);
+                    if let Some(edge) = hovered_edge.or(locked) {
+                        // Item 7: nudge the edge. Wheel up = grow (edge outward, wider); down =
+                        // shrink (inward). Shift = 10 samples, Shift+Alt = zero crossing.
+                        self.nudge_lock = Some((edge, now));
                         let steps = (notches.abs().round() as i64).clamp(1, 8);
                         let cur_t = if edge == Edge::Left { sel_lo } else { sel_hi };
                         let cur_f =
@@ -4143,7 +4204,13 @@ impl PixelView {
             // Item 6: a zoomed edge inset — while hovering/dragging a selection edge, overlay a
             // magnified strip around that edge (per-sample detail) so nudges are precise. The
             // magnification is the "Zoom Edit %" preference (0 = off).
-            let inset_edge = active_edge.or(hovered_edge);
+            // Show the inset for the active/hovered edge, or the one being wheel-nudged (so a
+            // fine-tune session keeps the magnifier up even as the cursor drifts off the edge).
+            let nudging_edge = self
+                .nudge_lock
+                .filter(|(_, t)| now - *t < 0.6)
+                .map(|(e, _)| e);
+            let inset_edge = active_edge.or(hovered_edge).or(nudging_edge);
             if self.zoom_edit_pct > 0 && nframes > 0 {
                 if let Some(edge) = inset_edge {
                     let edge_t = if edge == Edge::Left { draw_lo } else { draw_hi };
@@ -4181,6 +4248,15 @@ impl PixelView {
                             [egui::pos2(x, imid - hh), egui::pos2(x, imid + hh)],
                             egui::Stroke::new(1.0, accent),
                         );
+                    }
+                    // The OTHER selection edge, if it falls inside the magnified window (so when
+                    // the two edges are close you can see both while fine-tuning).
+                    if draw_has_sel {
+                        let other_f = (if edge == Edge::Left { draw_hi } else { draw_lo }) * sr;
+                        if other_f >= ws && other_f <= we {
+                            let ox = ir.left() + ((other_f - ws) / span_f).clamp(0.0, 1.0) * iw;
+                            p.vline(ox, ir.y_range(), egui::Stroke::new(1.5, GREEN));
+                        }
                     }
                     // The edge itself, centered-ish, in bright green.
                     let ex = ir.left() + ((ef - ws) / span_f).clamp(0.0, 1.0) * iw;
@@ -4392,15 +4468,23 @@ impl PixelView {
             self.audio_autoplay = b;
         }
         if let Some((lo, hi)) = want_select {
+            // Minimum selection width: ~2 samples (not 0.01 s = 441 samples), so sample-accurate
+            // edge nudges / small selections actually take.
+            let min_w = self
+                .audio_player
+                .as_ref()
+                .map(|ap| 2.0 / ap.sample_rate.get() as f32)
+                .unwrap_or(1e-5);
+            let hi = hi.max(lo + min_w);
             if let Some(ap) = &mut self.audio_player {
                 ap.sel_start = lo;
-                ap.sel_end = hi.max(lo + 0.01);
+                ap.sel_end = hi;
             }
             // While drilled into a pad, the loop-region drag edits that pad's loop live.
             if let EditFocus::Pad(i) = self.edit_focus {
                 if i < self.pads.len() {
                     self.pads[i].loop_start = lo;
-                    self.pads[i].loop_end = hi.max(lo + 0.01);
+                    self.pads[i].loop_end = hi;
                 }
             }
         }
@@ -4760,6 +4844,10 @@ impl PixelView {
         let mut want_assign: Option<usize> = None;
         let mut want_edit: Option<usize> = None;
         let mut want_color: Option<(usize, Option<[u8; 3]>)> = None; // recolor pad i (None = clear)
+        let mut rename_start: Option<usize> = None; // begin renaming pad i
+        let mut rename_buf: Option<String> = None; // persist the in-progress rename edit
+        let mut rename_commit: Option<(usize, String)> = None;
+        let mut rename_cancel = false;
         let mut want_zip = false;
         let mut want_save_kit = false;
         let mut want_load_kit = false;
@@ -4889,6 +4977,10 @@ impl PixelView {
                     ui.painter().rect_filled(rect, 5.0, bg);
                     let border = if assigning {
                         egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 190, 70)) // MIDI-learn
+                    } else if soloed {
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 220, 110)) // solo = green
+                    } else if muted {
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(225, 70, 70)) // mute = red
                     } else {
                         egui::Stroke::new(1.0, egui::Color32::from_gray(72))
                     };
@@ -4971,24 +5063,18 @@ impl PixelView {
                         |ui| {
                             ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
                             ui.spacing_mut().button_padding = egui::vec2(3.0, 1.0);
-                            // Header: pad number + name + assigned note.
+                            // Header: pad number + name (fills the width; double-click to rename) +
+                            // assigned note.
                             ui.horizontal(|ui| {
                                 ui.label(
                                     egui::RichText::new(format!("{}", i + 1))
                                         .size(10.0)
                                         .color(egui::Color32::from_gray(120)),
                                 );
-                                if !empty {
-                                    ui.label(
-                                        egui::RichText::new(elide(&name, 8))
-                                            .size(10.0)
-                                            .color(egui::Color32::from_gray(215)),
-                                    );
-                                }
+                                // Note first (right-aligned) so the name can take all the room left.
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        // Assigned note; brighter when individually overridden.
                                         ui.label(
                                             egui::RichText::new(&note_name).size(10.0).color(
                                                 if overridden {
@@ -4998,6 +5084,49 @@ impl PixelView {
                                                 },
                                             ),
                                         );
+                                        let renaming =
+                                            matches!(&self.pad_rename, Some((ri, _)) if *ri == i);
+                                        if renaming {
+                                            let mut buf = self
+                                                .pad_rename
+                                                .as_ref()
+                                                .map(|(_, b)| b.clone())
+                                                .unwrap_or_default();
+                                            let r = ui.add(
+                                                egui::TextEdit::singleline(&mut buf)
+                                                    .id(egui::Id::new(("pad_rename", i)))
+                                                    .desired_width(f32::INFINITY)
+                                                    .font(egui::FontId::proportional(10.0)),
+                                            );
+                                            rename_buf = Some(buf.clone());
+                                            if r.lost_focus() {
+                                                if ui.input(|inp| inp.key_pressed(egui::Key::Enter))
+                                                {
+                                                    rename_commit = Some((i, buf));
+                                                } else {
+                                                    rename_cancel = true;
+                                                }
+                                            }
+                                        } else if !empty {
+                                            // Fit as many chars of the name as the pad width allows.
+                                            let max_chars =
+                                                ((cell_w - 46.0) / 5.5).max(4.0) as usize;
+                                            let lbl = ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(elide(&name, max_chars))
+                                                        .size(10.0)
+                                                        .color(egui::Color32::from_gray(215)),
+                                                )
+                                                .sense(egui::Sense::click())
+                                                .truncate(),
+                                            );
+                                            if lbl
+                                                .on_hover_text("Double-click to rename")
+                                                .double_clicked()
+                                            {
+                                                rename_start = Some(i);
+                                            }
+                                        }
                                     },
                                 );
                             });
@@ -5134,6 +5263,25 @@ impl PixelView {
             if i < self.pads.len() {
                 self.pads[i].color = c;
             }
+        }
+        // Pad-name rename (double-click the name → inline edit → Enter commits, click-away cancels).
+        if let Some((i, name)) = rename_commit {
+            if i < self.pads.len() && !name.trim().is_empty() {
+                self.pads[i].name = name.trim().to_string();
+            }
+            self.pad_rename = None;
+        } else if rename_cancel {
+            self.pad_rename = None;
+        } else if let Some(b) = rename_buf {
+            if let Some((i, _)) = self.pad_rename {
+                self.pad_rename = Some((i, b));
+            }
+        }
+        if let Some(i) = rename_start {
+            let cur = self.pads.get(i).map(|p| p.name.clone()).unwrap_or_default();
+            self.pad_rename = Some((i, cur));
+            ui.ctx()
+                .memory_mut(|m| m.request_focus(egui::Id::new(("pad_rename", i))));
         }
         if let Some(i) = want_assign {
             // Toggle MIDI-learn on this pad (click again to cancel).
@@ -6067,6 +6215,7 @@ impl PixelView {
 
     fn load_full(&mut self, ctx: &egui::Context, path: PathBuf) {
         self.kit_editor = false; // opening any file leaves the standalone pad editor
+        self.editor_source = None;
         let already = self
             .full_tex
             .as_ref()
@@ -12831,6 +12980,8 @@ impl PixelView {
         // Kits / Samples sub-tab actions (deferred — the closure can't borrow self twice).
         let mut load_kit: Option<PathBuf> = None;
         let mut open_editor = false; // enter the standalone pad editor (Kits tab / kit load)
+        let mut browse_sample: Option<PathBuf> = None; // open a Samples location in the inline explorer
+        let mut load_into_editor: Option<PathBuf> = None; // a file clicked in the sample explorer
         let mut add_sample = false;
         let mut remove_sample: Option<usize> = None;
         let mut color_sample: Option<(usize, Option<[u8; 3]>)> = None;
@@ -12982,13 +13133,18 @@ impl PixelView {
                                 }
                                 continue;
                             }
-                            let mut btn = egui::Button::new(elide(name, 22));
-                            if let Some(c) = color {
-                                btn = btn.fill(egui::Color32::from_rgb(c[0], c[1], c[2]));
-                            }
-                            let r = ui.add(btn).on_hover_text(path.display().to_string());
+                            let sel = self.sample_browse.as_deref() == Some(path.as_path());
+                            let r = ui
+                                .add(egui::Button::new(elide(name, 22)).fill(if sel {
+                                    egui::Color32::from_rgb(60, 90, 140)
+                                } else if let Some(c) = color {
+                                    egui::Color32::from_rgb(c[0], c[1], c[2])
+                                } else {
+                                    ui.visuals().widgets.inactive.bg_fill
+                                }))
+                                .on_hover_text(path.display().to_string());
                             if r.clicked() {
-                                nav = Some(path.clone());
+                                browse_sample = Some(path.clone());
                             }
                             r.context_menu(|ui| {
                                 if ui.button("Rename").clicked() {
@@ -13042,6 +13198,66 @@ impl PixelView {
                                     });
                             });
                         }
+                        // Inline file explorer for the opened Samples location (a mini browser).
+                        if let Some(dir) = self.sample_browse.clone() {
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                if let Some(parent) = dir.parent() {
+                                    if ui.small_button("⬆").on_hover_text("Up").clicked() {
+                                        browse_sample = Some(parent.to_path_buf());
+                                    }
+                                }
+                                ui.strong(elide(&short_name(&dir), 22));
+                            });
+                            ui.weak("click a sample → load into editor");
+                            let mut subdirs: Vec<PathBuf> = Vec::new();
+                            let mut files: Vec<PathBuf> = Vec::new();
+                            if let Ok(rd) = std::fs::read_dir(&dir) {
+                                for e in rd.flatten() {
+                                    let p = e.path();
+                                    if p.is_dir() {
+                                        subdirs.push(p);
+                                    } else if is_audio_ext(&p) {
+                                        files.push(p);
+                                    }
+                                }
+                            }
+                            subdirs.sort();
+                            files.sort();
+                            egui::ScrollArea::vertical()
+                                .id_salt("sample_explorer")
+                                .auto_shrink([false, true])
+                                .max_height(320.0)
+                                .show(ui, |ui| {
+                                    for d in &subdirs {
+                                        if ui
+                                            .button(format!("📁 {}", elide(&short_name(d), 24)))
+                                            .clicked()
+                                        {
+                                            browse_sample = Some(d.clone());
+                                        }
+                                    }
+                                    for f in &files {
+                                        if ui
+                                            .add(
+                                                egui::Button::new(format!(
+                                                    "{} {}",
+                                                    icons::MUSIC,
+                                                    elide(&short_name(f), 24)
+                                                ))
+                                                .frame(false),
+                                            )
+                                            .on_hover_text(f.display().to_string())
+                                            .clicked()
+                                        {
+                                            load_into_editor = Some(f.clone());
+                                        }
+                                    }
+                                    if subdirs.is_empty() && files.is_empty() {
+                                        ui.weak("(no audio files here)");
+                                    }
+                                });
+                        }
                     }
                 } else {
                     ui.add(
@@ -13082,6 +13298,14 @@ impl PixelView {
                     .to_string();
                 self.sample_places.push((name, dir, None));
             }
+        }
+        if let Some(dir) = browse_sample {
+            self.sample_browse = Some(dir);
+        }
+        if let Some(f) = load_into_editor {
+            // Show the pad editor + load the clicked sample into it, ready to shape + assign.
+            self.enter_kit_editor();
+            self.load_sample_into_editor(&f);
         }
         if let Some(i) = remove_sample {
             if i < self.sample_places.len() {
