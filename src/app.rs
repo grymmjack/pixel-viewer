@@ -13609,7 +13609,7 @@ impl eframe::App for PixelView {
             egui::Panel::left("leftdock")
                 .resizable(true)
                 .default_size(300.0)
-                .min_size(180.0) // don't let a drag shrink it into a black sliver
+                .size_range(160.0..=460.0) // min: no black sliver; max: don't hog the window
                 .show_inside(ui, |ui| {
                     if self.show_details && self.show_explorer {
                         egui::Panel::bottom("ld_explorer")
