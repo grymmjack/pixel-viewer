@@ -4302,15 +4302,26 @@ impl PixelView {
                 }
             }
             // Vertical amplitude ("waveform height") slider in the reserved right strip.
+            // Drawn in a NON-advancing child UI (`new_child`) — `ui.put` would call
+            // `advance_cursor_after_rect` on the (short) vertical slider's min_rect, yanking the
+            // layout cursor back UP above the waveform bottom, so the next rows (hint / Transients)
+            // painted over the lower half of the wave. `new_child` leaves the parent cursor where
+            // `allocate_exact_size` correctly parked it (at the waveform's bottom).
             if big && amp_w > 0.0 {
                 let amp_rect = egui::Rect::from_min_max(
                     egui::pos2(rect.right() + 3.0, rect.top() + 2.0),
                     egui::pos2(rect.right() + amp_w, rect.bottom() - 2.0),
                 );
                 let mut v = self.wave_amp;
-                if ui
-                    .put(
-                        amp_rect,
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(amp_rect)
+                        .layout(egui::Layout::centered_and_justified(
+                            egui::Direction::TopDown,
+                        )),
+                );
+                if child
+                    .add(
                         egui::Slider::new(&mut v, 1.0..=8.0)
                             .vertical()
                             .show_value(false),
