@@ -831,6 +831,7 @@ pub struct PixelView {
     note_flash: HashMap<i32, f32>, // MIDI note → last-played ctx time, for the keyboard key lights (transient)
     last_midi_t: f32,              // ctx time of the last hardware-MIDI event, for the activity LED (transient)
     kit_name: String,   // current kit's name ("Untitled" by default; persisted)
+    kit_editor: bool,   // standalone Sample-Pads view (no audio file needed); transient
     octave_lock: bool,  // lock the onscreen-keyboard octave across editor views (persisted)
     data_dir: PathBuf,  // eframe data dir (pads WAVs + saved kits live under here)
     // Hardware MIDI controller → play the loaded sample. The callback runs on midir's thread
@@ -1767,6 +1768,7 @@ impl PixelView {
             grid_recolor: HashMap::new(),
             folder_info: HashMap::new(),
             mode: Mode::Grid,
+            kit_editor: false,
             selected: 0,
             selection: HashSet::new(),
             anchor: None,
@@ -1982,6 +1984,7 @@ impl PixelView {
     /// Scan `dir` into folder + image entries (directories first, then images,
     /// each name-sorted — the default order; Phase 5 makes this configurable).
     fn open_folder(&mut self, dir: PathBuf) {
+        self.kit_editor = false; // navigating leaves the standalone pad editor
         // Visiting a folder (incl. a 16colo.rs pack) marks it viewed — recorded here,
         // before the remote/archive redirect, so the key is the tile's own path.
         self.mark_viewed(&dir);
@@ -3335,6 +3338,43 @@ impl PixelView {
             return;
         }
         self.start_audio_load(path, false);
+    }
+
+    /// Enter the standalone **Sample-Pads** editor (item 15): the pad grid + keyboard + a silent
+    /// waveform, no audio file required. Used when the Kits tab is opened or a kit is loaded so the
+    /// pads are visible immediately. Switches to the single view and stays there.
+    fn enter_kit_editor(&mut self) {
+        if !self.plugin_audio {
+            return;
+        }
+        self.kit_editor = true;
+        self.mode = Mode::Single;
+        self.ensure_kit_editor();
+    }
+
+    /// Make sure a (silent) audio player backs the kit editor — the pads need its mixer to sound,
+    /// and its empty buffer draws as a flat "silent waveform". No-op if already installed.
+    fn ensure_kit_editor(&mut self) {
+        if self.is_audio_loaded(&kit_editor_path()) || !self.plugin_audio {
+            return;
+        }
+        // A short buffer of silence: just enough to give the pad mixer a device + a flat waveform.
+        let d = DecodedAudio {
+            samples: vec![0.0f32; 44_100],
+            channels: std::num::NonZeroU16::new(1).unwrap(),
+            sample_rate: std::num::NonZeroU32::new(44_100).unwrap(),
+            duration: 1.0,
+            peaks: vec![0.0f32; 256],
+            tracker_samples: Vec::new(),
+        };
+        if let Ok(mut ap) = AudioPlayer::from_decoded(&kit_editor_path(), d) {
+            ap.volume = self.audio_volume;
+            ap.muted = self.audio_muted;
+            self.audio_player = Some(ap);
+            self.wave_view = None;
+            self.transient_dirty = true;
+            self.edit_focus = EditFocus::Song;
+        }
     }
 
     /// A cache signature for `real` (size ^ mtime) so an edited file re-decodes.
@@ -5780,6 +5820,7 @@ impl PixelView {
     }
 
     fn load_full(&mut self, ctx: &egui::Context, path: PathBuf) {
+        self.kit_editor = false; // opening any file leaves the standalone pad editor
         let already = self
             .full_tex
             .as_ref()
@@ -10321,6 +10362,35 @@ impl PixelView {
             // else: at rest → fall through to the static view (recolor / minimap).
         }
 
+        // Standalone Sample-Pads editor (item 15): the pad grid + keyboard + a silent waveform,
+        // shown when the Kits tab is opened / a kit is loaded — no audio file needed.
+        if self.kit_editor {
+            self.ensure_kit_editor();
+            let kit_path = kit_editor_path();
+            let title = format!("{} Sample Pads — {}", icons::PIANO, self.kit_name);
+            egui::ScrollArea::vertical()
+                .id_salt("kit_editor")
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.heading(title);
+                        if ui.button("‹ Grid").clicked() {
+                            self.kit_editor = false;
+                            self.mode = Mode::Grid;
+                        }
+                    });
+                    ui.add_space(6.0);
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(8, 0))
+                        .show(ui, |ui| {
+                            self.draw_audio_controls(ui, &kit_path, true, None);
+                        });
+                });
+            return;
+        }
+
         // Audio file open → the big interactive player (transport + hi-res waveform +
         // onscreen keyboard) fills the viewer, so it's front-and-center instead of a static
         // waveform image with the controls hidden in the narrow Details pane. Clone the path
@@ -12513,6 +12583,7 @@ impl PixelView {
         let mut remove_filter: Option<usize> = None;
         // Kits / Samples sub-tab actions (deferred — the closure can't borrow self twice).
         let mut load_kit: Option<PathBuf> = None;
+        let mut open_editor = false; // enter the standalone pad editor (Kits tab / kit load)
         let mut add_sample = false;
         let mut remove_sample: Option<usize> = None;
         let mut color_sample: Option<(usize, Option<[u8; 3]>)> = None;
@@ -12546,6 +12617,9 @@ impl PixelView {
                             }
                             if ui.selectable_label(self.places_tab == idx, label).clicked() {
                                 self.places_tab = idx;
+                                if idx == 2 {
+                                    open_editor = true; // Kits tab → show the pad editor
+                                }
                             }
                         }
                     });
@@ -12789,9 +12863,13 @@ impl PixelView {
             }
             self.sample_rename = None;
         }
-        // Load a kit (item 14): adopt it into the pads without navigating into the file.
+        // Load a kit (item 14): adopt it into the pads without navigating into the file, and show
+        // the pads (item 15). Clicking the Kits tab also opens the pad editor.
         if let Some(kf) = load_kit {
             self.load_kit(&kf);
+            self.enter_kit_editor();
+        } else if open_editor {
+            self.enter_kit_editor();
         } else if let Some(i) = recall {
             self.recall_filter(i);
         } else if let Some(p) = nav {
@@ -16593,6 +16671,12 @@ fn is_kit_ext(p: &Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("pvkit"))
+}
+
+/// The synthetic "path" that identifies the standalone kit editor's silent player (so
+/// `is_audio_loaded` can tell it apart from a real audio file). Not a real file.
+fn kit_editor_path() -> PathBuf {
+    PathBuf::from("\u{0}kit-editor")
 }
 
 /// Is `p` an audio file we can preview in-app (PCM via rodio/symphonia + trackers via xmrs)?
