@@ -818,6 +818,7 @@ pub struct PixelView {
     edit_focus: EditFocus,     // what the waveform editor is pointed at (Song / Sample / a Pad drill-in)
     editor_stash: Option<EditorStash>, // saved editor state during a pad drill-in (restored on Back)
     note_flash: HashMap<i32, f32>, // MIDI note → last-played ctx time, for the keyboard key lights (transient)
+    last_midi_t: f32,              // ctx time of the last hardware-MIDI event, for the activity LED (transient)
     kit_name: String,   // current kit's name ("Untitled" by default; persisted)
     octave_lock: bool,  // lock the onscreen-keyboard octave across editor views (persisted)
     data_dir: PathBuf,  // eframe data dir (pads WAVs + saved kits live under here)
@@ -1712,6 +1713,7 @@ impl PixelView {
             edit_focus: EditFocus::Song,
             editor_stash: None,
             note_flash: HashMap::new(),
+            last_midi_t: -10.0,
             kit_name,
             octave_lock,
             data_dir,
@@ -3242,6 +3244,7 @@ impl PixelView {
         if events.is_empty() {
             return;
         }
+        self.last_midi_t = now; // any event lights the MIDI activity LED
         for (note, vel, on) in events {
             if on {
                 // Route through the pad grid first (assign-mode / pad trigger), else audition.
@@ -11978,6 +11981,35 @@ impl PixelView {
                         .clicked()
                     {
                         audio_mute = true;
+                    }
+                    // MIDI activity LED — a quick "is my controller working?" indicator: lit
+                    // bright green on a hardware-MIDI event, fading to a dim green when idle. Only
+                    // shown when a controller is connected.
+                    if self.midi_conn.is_some() {
+                        let now = ui.input(|i| i.time) as f32;
+                        let glow = (1.0 - (now - self.last_midi_t) / 0.4).clamp(0.0, 1.0);
+                        ui.add_space(4.0);
+                        let (r, resp) =
+                            ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                        let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * glow) as u8;
+                        let c = egui::Color32::from_rgb(
+                            lerp(28, 90),
+                            lerp(74, 255),
+                            lerp(40, 130),
+                        );
+                        ui.painter().circle_filled(r.center(), 5.0, c);
+                        if glow > 0.05 {
+                            ui.painter().circle_stroke(
+                                r.center(),
+                                6.5,
+                                egui::Stroke::new(
+                                    1.5,
+                                    egui::Color32::from_rgba_unmultiplied(90, 255, 130, 110),
+                                ),
+                            );
+                            self.want_repaint = true; // animate the fade
+                        }
+                        resp.on_hover_text("MIDI input — lights up on controller activity");
                     }
                     // While something is playing, show a live VU meter + a clickable "PLAYING …"
                     // pill (left of the controls) — you can start audio then leave the viewer, so
