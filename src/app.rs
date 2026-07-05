@@ -801,6 +801,7 @@ pub struct PixelView {
     audio_loading: Option<AudioLoading>, // a background audio decode in flight (spinner while pending)
     audio_autoplay: bool,      // start playing on select + loop until stopped (persisted)
     wave_drag: Option<WaveDrag>, // active waveform-editor drag (transient)
+    wave_view: Option<(f32, f32)>, // zoomed view window (start,end secs); None = whole file (transient)
     audio_octave: i32,         // onscreen-keyboard octave offset (transient)
     audio_volume: f32,         // master playback volume 0..1 (menu-bar slider, persisted)
     audio_muted: bool,         // master mute (menu-bar speaker toggle, persisted)
@@ -1699,6 +1700,7 @@ impl PixelView {
             audio_player: None,
             audio_autoplay,
             wave_drag: None,
+            wave_view: None,
             audio_octave: 0,
             audio_volume,
             audio_muted,
@@ -2782,6 +2784,7 @@ impl PixelView {
         if i >= self.pads.len() || self.pads[i].buf.is_none() || self.audio_player.is_none() {
             return;
         }
+        self.wave_view = None; // drilling into a pad's sample resets the zoom
         let buf = self.pads[i].buf.clone().unwrap();
         {
             let ap = self.audio_player.as_mut().unwrap();
@@ -2819,6 +2822,7 @@ impl PixelView {
     /// Leave a pad drill-in: commit the editor's loop region back to the pad, then restore the
     /// stashed editor buffer + focus (the song / tracker sample you were on before).
     fn focus_back(&mut self) {
+        self.wave_view = None; // leaving a pad drill-in resets the zoom
         if let (EditFocus::Pad(i), Some(ap)) = (self.edit_focus, self.audio_player.as_ref()) {
             if i < self.pads.len() {
                 self.pads[i].loop_start = ap.sel_start;
@@ -3169,6 +3173,7 @@ impl PixelView {
         // Choosing a tracker sample is an explicit editor change → leave any pad drill-in so a
         // stale Pad focus can't linger (its stash held the *previous* buffer, not this one).
         self.editor_stash = None;
+        self.wave_view = None; // a new buffer resets the zoom to the whole file
         self.edit_focus = match idx {
             Some(i) => EditFocus::Sample(i),
             None => EditFocus::Song,
@@ -3642,8 +3647,18 @@ impl PixelView {
                 egui::Sense::click_and_drag(),
             );
             let w = rect.width().max(1.0);
-            let x_of = |t: f32| rect.left() + (t / dur).clamp(0.0, 1.0) * w;
-            let t_at = |x: f32| (((x - rect.left()) / w).clamp(0.0, 1.0)) * dur;
+            let sr = ap.sample_rate.get() as f32;
+            let ch = ap.channels.get() as usize;
+            let nframes = if ch > 0 { ap.samples.len() / ch } else { 0 };
+            // Visible window (seconds). `wave_view` = a zoomed sub-range; None = the whole file.
+            let (vs, ve) = {
+                let (a, b) = self.wave_view.unwrap_or((0.0, dur));
+                let a = a.clamp(0.0, dur);
+                (a, b.clamp(a + 1e-4, dur.max(a + 1e-4)))
+            };
+            let vspan = (ve - vs).max(1e-6);
+            let x_of = |t: f32| rect.left() + ((t - vs) / vspan).clamp(0.0, 1.0) * w;
+            let t_at = |x: f32| vs + ((x - rect.left()) / w).clamp(0.0, 1.0) * vspan;
 
             // ---- Interaction (resolved BEFORE drawing so the edges/shade track the live drag) --
             const EDGE_PX: f32 = 6.0; // pointer-to-edge grab tolerance
@@ -3704,8 +3719,9 @@ impl PixelView {
                 want_commit = true;
             }
             if resp.double_clicked() {
-                want_select = Some((0.0, dur)); // double-click → select the whole thing
+                want_select = Some((0.0, dur)); // double-click → select all + reset the zoom
                 want_commit = true;
+                self.wave_view = None;
             } else if resp.middle_clicked() {
                 if let Some(pp) = resp.interact_pointer_pos() {
                     want_play_at = Some(t_at(pp.x)); // middle-click → play from here
@@ -3732,6 +3748,40 @@ impl PixelView {
                     egui::CursorIcon::Text
                 };
                 ui.ctx().set_cursor_icon(icon);
+            }
+            // Mousewheel over the waveform (and NOT on a selection edge — Phase 3 nudges the edge
+            // there) zooms the view around the cursor. Consume the scroll so the surrounding
+            // ScrollArea doesn't also scroll. Wheel up = zoom in; zoom all the way out → full file.
+            if resp.hovered() && hovered_edge.is_none() && self.wave_drag.is_none() {
+                let (scroll, shift) = ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.shift));
+                if scroll.abs() > 0.1 {
+                    ui.input_mut(|i| {
+                        i.smooth_scroll_delta = egui::Vec2::ZERO;
+                    });
+                    if shift {
+                        // Shift+wheel pans the zoomed view left/right (no-op at full zoom-out).
+                        let delta = -(scroll / 120.0) * vspan * 0.5;
+                        let nvs = (vs + delta).clamp(0.0, (dur - vspan).max(0.0));
+                        if self.wave_view.is_some() {
+                            self.wave_view = Some((nvs, nvs + vspan));
+                        }
+                    } else {
+                        // Wheel zooms around the cursor. Zoom fully out → whole file.
+                        let cursor_t = hover_x.map(&t_at).unwrap_or((vs + ve) * 0.5);
+                        let min_span = (48.0 / sr).max(1e-4); // ≈48 frames wide at max zoom
+                        let factor = (-scroll * 0.004).exp(); // scroll up (+) → shrink span → zoom in
+                        let new_span = (vspan * factor).clamp(min_span, dur);
+                        if new_span >= dur - 1e-4 {
+                            self.wave_view = None;
+                        } else {
+                            let frac = ((cursor_t - vs) / vspan).clamp(0.0, 1.0);
+                            let nvs =
+                                (cursor_t - frac * new_span).clamp(0.0, (dur - new_span).max(0.0));
+                            self.wave_view = Some((nvs, nvs + new_span));
+                        }
+                    }
+                    self.want_repaint = true;
+                }
             }
 
             // ---- Drawing (uses the live drag selection so the shade + edges follow the pointer) -
@@ -3760,14 +3810,35 @@ impl PixelView {
                 egui::Stroke::new(1.0, accent.gamma_multiply(0.32)),
             );
             let cols = w as usize;
-            let n = ap.peaks.len().max(1);
+            let np = ap.peaks.len().max(1);
+            // When zoomed in enough that few frames are visible, draw the real per-sample peak
+            // (crisp detail); otherwise sample the precomputed envelope (fast for the whole file).
+            let vis_frames = (vspan * sr) as usize;
+            let use_samples = nframes > 0 && vis_frames > 0 && vis_frames < cols.saturating_mul(6).max(1);
             for cx in 0..cols {
-                let a = cx * n / cols.max(1);
-                let b = ((cx + 1) * n / cols.max(1)).max(a + 1).min(n);
-                let peak = ap.peaks[a..b].iter().copied().fold(0.0, f32::max);
+                let t0 = vs + (cx as f32 / w) * vspan;
+                let t1 = vs + ((cx + 1) as f32 / w) * vspan;
+                let peak = if use_samples {
+                    let f0 = ((t0 * sr) as usize).min(nframes.saturating_sub(1));
+                    let f1 = ((t1 * sr).ceil() as usize).clamp(f0 + 1, nframes);
+                    let mut mx = 0.0f32;
+                    for f in f0..f1 {
+                        let base = f * ch;
+                        for c in 0..ch {
+                            if let Some(&s) = ap.samples.get(base + c) {
+                                mx = mx.max(s.abs());
+                            }
+                        }
+                    }
+                    mx
+                } else {
+                    let a = (((t0 / dur) * np as f32) as usize).min(np - 1);
+                    let b = (((t1 / dur) * np as f32) as usize).clamp(a + 1, np);
+                    ap.peaks[a..b].iter().copied().fold(0.0, f32::max)
+                };
                 let half = (peak * (h * 0.44)).max(0.5);
                 let x = rect.left() + cx as f32;
-                let t = (cx as f32 / w) * dur;
+                let t = t0;
                 // No sub-selection → the whole file reads bright; a sub-selection dims outside it.
                 let col = if !draw_has_sel || (t >= draw_lo && t <= draw_hi) {
                     accent
@@ -3786,9 +3857,12 @@ impl PixelView {
                 let hot = |e: Edge| {
                     active_edge == Some(e) || (active_edge.is_none() && hovered_edge == Some(e))
                 };
-                for (e, ex) in [(Edge::Left, x_of(draw_lo)), (Edge::Right, x_of(draw_hi))] {
-                    let (col, wdt) = if hot(e) { (GREEN_HOT, 2.5) } else { (GREEN, 1.5) };
-                    p.vline(ex, rect.y_range(), egui::Stroke::new(wdt, col));
+                // Only draw an edge handle when it falls inside the visible (zoomed) window.
+                for (e, et) in [(Edge::Left, draw_lo), (Edge::Right, draw_hi)] {
+                    if et >= vs - 1e-6 && et <= ve + 1e-6 {
+                        let (col, wdt) = if hot(e) { (GREEN_HOT, 2.5) } else { (GREEN, 1.5) };
+                        p.vline(x_of(et), rect.y_range(), egui::Stroke::new(wdt, col));
+                    }
                 }
             }
             // Hover cursor line — where a new selection / playback would begin (pre-drag), unless
@@ -3802,13 +3876,25 @@ impl PixelView {
                     );
                 }
             }
-            // Playhead.
-            p.vline(
-                x_of(pos),
-                rect.y_range(),
-                egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 224, 130)),
-            );
-            ui.weak("drag: select · edges: adjust ↔ · inside: move · click: seek · dbl: all · mid: play");
+            // Playhead (only when it's in view).
+            if pos >= vs - 1e-6 && pos <= ve + 1e-6 {
+                p.vline(
+                    x_of(pos),
+                    rect.y_range(),
+                    egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 224, 130)),
+                );
+            }
+            // Zoom readout, top-left, when zoomed in.
+            if self.wave_view.is_some() {
+                p.text(
+                    rect.left_top() + egui::vec2(4.0, 3.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("{:.0}×", dur / vspan),
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_rgb(150, 220, 170),
+                );
+            }
+            ui.weak("drag: select · edges: ↔ · inside: move · wheel: zoom · click: seek · dbl: all/reset zoom");
             // Resize the waveform height (big view only).
             if big {
                 let dy = drag_h_divider(ui, ui.available_width());
