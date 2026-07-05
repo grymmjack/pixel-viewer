@@ -2924,7 +2924,7 @@ impl PixelView {
         let stem = if self.pads[i].name.trim().is_empty() {
             format!("pad_{:02}", i + 1)
         } else {
-            sanitize_filename(&self.pads[i].name)
+            sanitize_filename(strip_audio_ext(&self.pads[i].name))
         };
         if let Some(path) = rfd::FileDialog::new()
             .set_file_name(format!("{stem}.wav"))
@@ -2972,7 +2972,10 @@ impl PixelView {
             let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             for (i, name, wav) in &items {
-                zw.start_file(format!("pad_{:02}_{}.wav", i + 1, sanitize_filename(name)), opts)?;
+                zw.start_file(
+                    format!("pad_{:02}_{}.wav", i + 1, sanitize_filename(strip_audio_ext(name))),
+                    opts,
+                )?;
                 zw.write_all(wav)?;
             }
             zw.finish()?;
@@ -3374,7 +3377,7 @@ impl PixelView {
         }) else {
             return;
         };
-        let default = format!("{}.wav", sanitize_filename(&name));
+        let default = format!("{}.wav", sanitize_filename(strip_audio_ext(&name)));
         if let Some(path) = rfd::FileDialog::new().set_file_name(default).save_file() {
             match write_wav_16(&path, &samples, ch, rate) {
                 Ok(()) => self.status = format!("Exported {}", short_name(&path)),
@@ -16942,6 +16945,21 @@ fn kit_editor_path() -> PathBuf {
     PathBuf::from("\u{0}kit-editor")
 }
 
+/// Strip a trailing *audio* extension from a sample name, so exporting it as a WAV doesn't double
+/// the extension (e.g. "kick.wav" → "kick" → "kick.wav", not "kick.wav.wav"). Only removes a known
+/// audio ext, so names with an incidental dot ("1.5s") are left intact.
+fn strip_audio_ext(name: &str) -> &str {
+    let lower = name.to_ascii_lowercase();
+    for ext in [
+        ".wav", ".mp3", ".ogg", ".oga", ".flac", ".aif", ".aiff", ".m4a", ".voc", ".au",
+    ] {
+        if lower.ends_with(ext) {
+            return &name[..name.len() - ext.len()];
+        }
+    }
+    name
+}
+
 /// Is `p` an audio file we can preview in-app (PCM via rodio/symphonia + trackers via xmrs)?
 fn is_audio_ext(p: &Path) -> bool {
     p.extension()
@@ -18993,6 +19011,15 @@ mod tests {
         // A light base tints toward the accent from the other side.
         let light = blend_toward(egui::Color32::from_rgb(240, 240, 240), accent, 0.25);
         assert_eq!(light, egui::Color32::from_rgb(230, 205, 190));
+    }
+
+    #[test]
+    fn strip_audio_ext_removes_only_known_exts() {
+        assert_eq!(strip_audio_ext("CM 1 Aalto 1v Seq's.wav"), "CM 1 Aalto 1v Seq's");
+        assert_eq!(strip_audio_ext("kick.WAV"), "kick"); // case-insensitive
+        assert_eq!(strip_audio_ext("loop.flac"), "loop");
+        assert_eq!(strip_audio_ext("snare"), "snare"); // no ext → unchanged
+        assert_eq!(strip_audio_ext("take 1.5s"), "take 1.5s"); // incidental dot kept
     }
 
     #[test]
