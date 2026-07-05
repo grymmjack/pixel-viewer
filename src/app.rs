@@ -3743,8 +3743,10 @@ impl PixelView {
         // directly; the waveform drag sets the loop region, committed on Back). Play/trigger the
         // pad to hear the pitch + loop-type applied.
         if let EditFocus::Pad(i) = self.edit_focus {
-            if i < self.pads.len() {
-                ui.horizontal(|ui| {
+            // Big view only — this row is too wide for the compact Details player and would force
+            // the whole left dock wide.
+            if big && i < self.pads.len() {
+                ui.horizontal_wrapped(|ui| {
                     let mut loop_on = self.pads[i].loop_on;
                     if ui.checkbox(&mut loop_on, "Loop").changed() {
                         self.pads[i].loop_on = loop_on;
