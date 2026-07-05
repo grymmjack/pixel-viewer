@@ -208,6 +208,9 @@ its flush-right zoom readout first, then fills the rest with a truncating left
 label, so they can't overlap. The grid is virtualized via `ScrollArea::show_rows`;
 each tile is a `tile`-square thumbnail plus a configurable caption strip below
 (`caption_lines`, `caption_fields` bitmask; independent `grid_gap`/`grid_gap_y`).
+An optional per-tile **border** (`grid_tile_border`, Preferences → "Tile borders",
+persisted, default on) frames each tile as a card (brighter on hover/selection),
+painted **last** so it sits over the thumbnail edges.
 `want_repaint` drives `ctx.request_repaint()` while thumbnails are pending.
 
 File ops (`copy_selection`/`cut_selection`/`paste`/`new_folder`/`start_rename`/
@@ -957,14 +960,26 @@ magnified **edge inset** (the `zoom_edit_pct` "Zoom Edit %" pref) overlays per-s
 `@ smp` readout. Move-drag snapping: **Alt+Shift** → nearest zero crossing (`next_zero_crossing`),
 **Alt** → nearest transient. **Transients** (`detect_transients`: RMS energy-flux + refractory gap,
 sensitivity slider; drawn as culled amber guideline markers) + **BPM** (`estimate_bpm` Detect) + a
-**Musical** beat-division grid. `next_zero_crossing`/`detect_transients` are unit-tested. **Snap to
-transient** (`snap_transient`, a Transients-row checkbox, persisted): a fresh selection's anchor
-snaps at drag-start and its moving edge snaps while dragging (edge-adjust snaps only the moving
-edge); markers are drawn + detected whenever Snap **or** Transients is on. **Middle-click a transient
-slice**: with Transients on, a middle-click selects from the transient boundary at/before the click
-to the next one after, and plays just that slice (`want_play_region`); no transients → play-from-here
-(`want_play_at`/`play_from`). A `.pvkit`
-file (shown with a KIT badge) **loads on click** (`is_kit_ext` → `load_kit`, not the viewer).
+**Musical** beat-division grid. `next_zero_crossing`/`detect_transients` are unit-tested (the detector
+uses a nonlinear threshold `0.45→0.02·peak-flux` + a `7%` near-silence energy floor, so low
+sensitivity is sparse; the caller treats a fully-left slider as **off** and doesn't detect at all).
+**Snap** (`snap_transient`, a Transients-row checkbox, persisted) snaps selection edges to
+`snap_boundaries(dur)` — a **unified** set of the detected transient onsets (only when Transients is on
+AND sensitivity > 0) **plus** the Musical grid lines. So dropping sensitivity to zero hands the grid to
+Musical: a fresh selection's anchor snaps at drag-start, its moving edge snaps while dragging, and
+**moving a whole selection** snaps its start too (edge-adjust snaps only the moving edge). **Middle-click
+a slice**: selects from the boundary at/before the click to the next one after and plays just that slice
+(`want_play_region`) — so with Musical on it plays one division (a quarter-note's worth); no boundaries →
+play-from-here (`want_play_at`/`play_from`). **Off-editor drag:** an active drag is driven from our own
+`wave_drag` state + the **global** pointer (not `resp.dragged()`/`interact_pointer_pos()`, which egui
+ties to the widget), so dragging past the editor edge stays clamped at the far left/right instead of
+being dropped; it ends on the global button release. **Undo/redo selections** (`sel_undo`/`sel_redo`
+stacks, ↶/↷ in the Transients row): every commit pushes the pre-change selection; cleared by
+`clear_sel_history()` when the editor's sample changes. Selection edges are tagged **S** / **E**. When a
+Samples-browser file is being edited, an **"Editing: <name> ↻ <dir>"** row shows under the transport —
+the name links to that file's folder in the Samples explorer (`want_reveal_source` → `sample_browse` +
+Samples tab), the ↻ reloads it fresh from disk (`want_reload_source` → `load_sample_into_editor`). A
+`.pvkit` file (shown with a KIT badge) **loads on click** (`is_kit_ext` → `load_kit`, not the viewer).
 
 **Window geometry** persists (`WINDOW_GEOM_KEY` = `[x,y,w,h]`, captured each frame, restored on the
 first frame the monitor size is known, clamped on-screen) — except in `DEBUG_MODE`, where the
