@@ -943,10 +943,12 @@ the played note's velocity, off = fixed 127), a short **vertical volume fader** 
 a painted vertical **VU** (`pad_levels`). The fader is **vertical, not a bottom row** — a horizontal
 slider row made the stacked controls taller than the short tile and overflowed into the pad below; a
 vertical fader on the right edge costs no vertical row. It's drawn in a **non-advancing `new_child`**
-(so it can't disturb the cell's horizontal layout — same gotcha as the pad-grid `scope_builder` bug)
-and kept **short + top-anchored with a ≥12px bottom margin**: a vertical slider's handle circle
-overhangs its rail ends by ~8px, so a full-height fader's bottom handle poked past the tile into the
-pad below (`fader_top = rect.top()+28`, `fader_bottom = (fader_top+42).min(rect.bottom()-12)`). A pad is
+(so it can't disturb the cell's horizontal layout — same gotcha as the pad-grid `scope_builder` bug).
+Its **height SCALES with the tile** (`fader_top = rect.top()+24`, `fader_bottom =
+(rect.bottom()-14).min(fader_top+46)`) so it shrinks as the window is resized down and is capped at
+46px on big tiles; a degenerate guard skips it on an ultra-short tile. **`fchild.set_clip_rect(rect)`**
+(the tile) is the hard guarantee that the slider handle's circular overhang can never bleed into the
+pad below (a fixed-height fader's bottom handle used to poke past a shrunk tile's edge). A pad is
 triggered by clicking it, or a matching note (onscreen/MIDI) via
 `route_note_on`. **A pad click's X-position sets its velocity** (far left = soft 10 → far right =
 127), passed to `trigger_pad` which still gates it — only heard with the pad's **V** on (fixed 127

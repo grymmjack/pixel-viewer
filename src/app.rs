@@ -5973,31 +5973,36 @@ impl PixelView {
                     // stacked controls taller than the short tile and overflowed into the pad below.
                     // Non-advancing `new_child` so it can't disturb the cell's horizontal layout.
                     if !empty {
-                        // Keep the fader SHORT and well inside the tile: a vertical slider's handle
-                        // circle overhangs its rail ends by ~8px, so a full-height fader's bottom
-                        // handle poked past the tile edge into the pad below. Anchor near the top
-                        // (below the note) and cap the height with a generous bottom margin.
-                        let fader_top = rect.top() + 28.0;
-                        let fader_bottom = (fader_top + 42.0).min(rect.bottom() - 12.0);
-                        let fader = egui::Rect::from_min_max(
-                            egui::pos2(rect.right() - 30.0, fader_top),
-                            egui::pos2(rect.right() - 14.0, fader_bottom),
-                        );
-                        let mut fchild = ui.new_child(
-                            egui::UiBuilder::new().max_rect(fader).layout(
-                                egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                            ),
-                        );
-                        if fchild
-                            .add(
-                                egui::Slider::new(&mut volume, 0.0..=1.0)
-                                    .vertical()
-                                    .show_value(false),
-                            )
-                            .on_hover_text(format!("Volume {:.0}%", volume * 100.0))
-                            .changed()
-                        {
-                            want_vol = Some((i, volume));
+                        // The fader height SCALES with the tile — it shrinks as the window is resized
+                        // down — and is capped so it's not too tall on big tiles. `set_clip_rect(rect)`
+                        // clips the child to THIS tile, a hard guarantee that the slider handle's
+                        // circular overhang can never bleed into the pad below ("faders overlap the
+                        // pads when resized down"). A degenerate guard skips it on an ultra-short tile.
+                        let fader_top = rect.top() + 24.0;
+                        let fader_bottom = (rect.bottom() - 14.0).min(fader_top + 46.0);
+                        if fader_bottom - fader_top >= 12.0 {
+                            let fader = egui::Rect::from_min_max(
+                                egui::pos2(rect.right() - 30.0, fader_top),
+                                egui::pos2(rect.right() - 14.0, fader_bottom),
+                            );
+                            let parent_clip = ui.clip_rect();
+                            let mut fchild = ui.new_child(
+                                egui::UiBuilder::new().max_rect(fader).layout(
+                                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                                ),
+                            );
+                            fchild.set_clip_rect(rect.intersect(parent_clip));
+                            if fchild
+                                .add(
+                                    egui::Slider::new(&mut volume, 0.0..=1.0)
+                                        .vertical()
+                                        .show_value(false),
+                                )
+                                .on_hover_text(format!("Volume {:.0}%", volume * 100.0))
+                                .changed()
+                            {
+                                want_vol = Some((i, volume));
+                            }
                         }
                     }
 
