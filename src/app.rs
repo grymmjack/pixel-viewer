@@ -2792,22 +2792,25 @@ impl PixelView {
 
     /// **Alt+drag: CLONE** pad `src` onto slot `dst` — copy *everything* (sample, name, colour, mix,
     /// pitch, loop region/type, V) WITHOUT removing the source, for quick variations of one sound.
-    /// The clone's firing note: if the **destination** was key-locked (🔒), it KEEPS the destination's
-    /// current key (so the variation triggers on the pad's already-mapped key — the "optionally
-    /// maintain the MIDI key" case); otherwise it adopts the source's absolute key. Persists the WAV.
+    /// **The MIDI map is honoured:** when the map is LOCKED — either the kit-wide **Kit Map Lock**
+    /// (`kit_map_lock`) or this pad's own 🔒 `note_lock` — the destination KEEPS its assigned key
+    /// (only every *other* parameter is cloned from the source), so the variation triggers on the
+    /// pad's already-mapped MIDI key. Unlocked, the clone adopts the source's key. Persists the WAV.
     fn clone_pad(&mut self, src: usize, dst: usize) {
         if src == dst || src >= self.pads.len() || dst >= self.pads.len() || self.pads[src].is_empty()
         {
             return;
         }
-        let dst_key = self.pad_note(dst);
-        let dst_locked = self.pads[dst].note_lock;
+        // Read the destination's key identity BEFORE it's overwritten by the clone.
+        let keep_note = self.kit_map_lock || self.pads[dst].note_lock;
+        let dst_note = self.pads[dst].note; // Some(override) or None (auto = its slot default)
+        let dst_lock = self.pads[dst].note_lock;
         let src_key = self.pad_note(src);
         let mut clone = self.pads[src].clone(); // Arc buffer + all fields (name, colour, loop, …)
         clone.flash_t = -1.0;
-        if dst_locked {
-            clone.note = Some(dst_key); // keep the destination's mapped key
-            clone.note_lock = true;
+        if keep_note {
+            clone.note = dst_note; // keep the destination's mapped key (or its auto slot default)
+            clone.note_lock = dst_lock; // …and its lock identity
         } else {
             clone.note = Some(src_key); // clone the source's key too
         }
@@ -2817,7 +2820,7 @@ impl PixelView {
             "Cloned pad {} → {}{}",
             src + 1,
             dst + 1,
-            if dst_locked { " (kept its key)" } else { "" }
+            if keep_note { " (kept its key)" } else { "" }
         );
     }
 
@@ -5615,6 +5618,9 @@ impl PixelView {
         ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
         // Alt held turns a pad→pad drag into a CLONE (copy the whole pad) instead of a move/swap.
         let alt_down = ui.input(|i| i.modifiers.alt);
+        // Tile borders are painted in a SECOND pass (after ALL tiles) so a neighbouring tile's
+        // background can never clip the previous tile's right/bottom edge (the drop-target "[" bug).
+        let mut tile_borders: Vec<(egui::Rect, egui::Stroke)> = Vec::new();
         for r in 0..4 {
             ui.horizontal(|ui| {
                 for c in 0..cols {
@@ -5696,12 +5702,8 @@ impl PixelView {
                     } else {
                         egui::Stroke::new(1.0, egui::Color32::from_gray(72))
                     };
-                    ui.painter().rect_stroke(
-                        rect,
-                        5.0,
-                        border,
-                        egui::StrokeKind::Inside,
-                    );
+                    // Defer the border to a second pass (drawn over all tile backgrounds).
+                    tile_borders.push((rect, border));
                     if !empty && resp.clicked() {
                         // Velocity from click X-position: far left = soft (10), far right = 127.
                         // `trigger_pad` gates this — it's only heard when the pad's V (vel_track) is
@@ -5963,6 +5965,12 @@ impl PixelView {
             });
         }
         ui.spacing_mut().item_spacing = old_spacing;
+        // Second pass: paint every tile's border on top of all the tile backgrounds, so a
+        // neighbouring tile can't clip a highlighted tile's right/bottom edge.
+        for (rect, stroke) in &tile_borders {
+            ui.painter()
+                .rect_stroke(*rect, 5.0, *stroke, egui::StrokeKind::Inside);
+        }
 
         // Apply collected actions.
         if let Some(n) = want_base {

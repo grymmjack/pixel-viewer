@@ -950,9 +950,14 @@ kit reloads slot N from `<data>/pads/pad_N.wav`, `move_pad` calls **`persist_pad
 slots (rewrite/remove the WAV) so a swapped kit reloads correctly. **Alt+drag a pad = CLONE**
 (`clone_pad`, a green drop-outline + Copy cursor vs. the blue move-outline; keyed off
 `alt_down = ui.input(i.modifiers.alt)`): copies the whole pad (Arc buffer + every field) onto the
-target WITHOUT removing the source — for quick variations of one sound. The clone's firing note
-keeps the **destination's** key when the destination was 🔒-locked (the "maintain the already-mapped
-MIDI key" case), else adopts the source's key. **A pad CLICK also lights its assigned key** on the
+target WITHOUT removing the source — for quick variations of one sound. **The MIDI map is honoured**:
+when the map is LOCKED — the kit-wide **Kit Map Lock** (`kit_map_lock`) *or* the destination pad's own
+🔒 `note_lock` — the clone **keeps the destination's key** (its override, or its auto slot default;
+only every *other* param is cloned), so the variation triggers on the pad's already-mapped MIDI key;
+unlocked it adopts the source's key. (Both locks matter — a global-only lock check was the "clone
+reassigns the key even with the midimap locked" bug.) **Per-tile borders are painted in a SECOND
+pass** after ALL tile backgrounds (`tile_borders`), so a neighbouring tile can't clip a highlighted
+tile's right/bottom edge (the drop-target rendered as a "[" — 3 sides — during a drag). **A pad CLICK also lights its assigned key** on the
 onscreen keyboard — `trigger_pad` inserts `pad_note(i)` into `note_flash` (red, since it routes to a
 pad), so a click, a keyboard press, and a MIDI note all light the key identically. **`AudioPlayer::trigger_pad_voice`** fires each hit as its own `rodio::Player` on the
 **shared `_stream.mixer()`** (`pad_voices: Vec<PadVoice>`, reaped each frame) — the mixer sums them,
