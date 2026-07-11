@@ -1140,6 +1140,12 @@ Samples tab), the ↻ reloads it fresh from disk (`want_reload_source` → `load
 first frame the monitor size is known, clamped on-screen) — except in `DEBUG_MODE`, where the
 bottom-right dev dock wins.
 
+**Window title** (`update_window_title` → `title_location`): `pixelview — <path> (<ui%>)`. In the
+standalone kit editor (`kit_editor`) there's no open file, so `title_location` must special-case it —
+it shows **`Sample Pads — <kit_name>`** (+ `· Pad N: <sample>` while drilled into a pad), NOT the
+generic Single-view fallback (`full_tex` → the selected grid entry), which left a **stale file** (e.g.
+the last-viewed `Atmo02.wav`) in the title bar — "the title is wrong for the kit".
+
 **Sample banks as folders (`soundfont.rs` / `sfz.rs` / `dls.rs`).** A `.sf2`, `.sfz`, or `.dls`
 is a **virtual folder** of its samples. `is_sample_bank(path)` folds all three into the
 `Entry.is_archive` path (📁 glyph + a per-format badge, click-to-enter, prev/next skipping), and

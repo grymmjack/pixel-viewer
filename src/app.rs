@@ -8472,6 +8472,21 @@ impl PixelView {
     /// The display path shown in the window title bar: the open file in single view,
     /// else the current folder. `None` when nothing is open yet.
     fn title_location(&self) -> Option<String> {
+        // The standalone pad editor has no "open file" — `full_tex` still holds whatever was last
+        // viewed (or falls back to the selected grid entry), so the title showed a STALE file, not
+        // the kit. Show the kit (+ the pad being edited) instead.
+        if self.kit_editor {
+            let base = format!("Sample Pads — {}", self.kit_name);
+            return Some(match self.edit_focus {
+                EditFocus::Pad(i) => self
+                    .pads
+                    .get(i)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| format!("{base} · Pad {}: {}", i + 1, p.name))
+                    .unwrap_or(base),
+                _ => base,
+            });
+        }
         let p = match self.mode {
             Mode::Single => self
                 .full_tex
