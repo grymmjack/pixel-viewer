@@ -990,12 +990,20 @@ highlight on the selected row — the user asked to "reuse the table style, no h
 the folder AND selects that file. **Renoise-style pane focus** (`sample_focus`): clicking a sample (or
 revealing a source) focuses the pane — a blue **focus outline** (`ScrollArea` output's `inner_rect`)
 shows it owns the keyboard; clicking a pad (`want_trigger`) or navigating (`show_folder`) unfocuses it.
-While focused, the pane's keys drive a **hot-swap** and are **`consume_key`-consumed** so they never
-also fire the grid/viewer nav bound to the same keys (no duplicate-handler clashes): **↑/↓** audition
-the prev/next sample **on the hot-swapped pad** (`audition_on_pad`: in-memory buffer swap + `focus_pad`
-so "Editing pad N" stays + play — **no WAV write yet**), **→** replays, **Enter** assigns (`hotswap_assign`
-→ `persist_pad_wav`), **Esc** aborts (`hotswap_abort` → restore the pad's pre-swap `Pad` from
-`hotswap_orig`; the disk WAV was never touched while auditioning). The hot-swap is armed when you reveal
+While focused, the pane's keys drive **file-browser navigation** — all **`consume_key`-consumed** so they
+never also fire the grid/viewer nav bound to the same keys (no duplicate-handler clashes). **The list is
+subdirs-first-then-audio-files** (`sample_entries` — the same order the pane paints, so keyboard rows line
+up), and folders show a `selection.bg_fill` highlight when the cursor lands on them, not just files.
+**↑/↓** (`sample_browse_step`) move the selection through folders+files (wrapping); on a FILE it auditions —
+on the hot-swapped pad if one's armed (`audition_on_pad`: in-memory buffer swap + `focus_pad` so "Editing
+pad N" stays + play, **no WAV write yet**), else loaded into the editor — on a FOLDER it just moves the
+cursor. **Enter / →** (`sample_browse_enter`) **descend into** a selected folder, else act on the file
+(`hotswap_assign` → `persist_pad_wav` if a hot-swap is armed, else load into the editor); **→** on a file
+instead replays. **Backspace / ←** (`sample_browse_up`) go **up a dir** (parent of `sample_browse`,
+landing the cursor on the child we came from) — consumed *before* the global `Backspace`→ParentDir nav so
+it moves the browser, not the main folder. **Esc** aborts a hot-swap (`hotswap_abort` → restore the pad's
+pre-swap `Pad` from `hotswap_orig`; the disk WAV was never touched while auditioning) + unfocuses. The
+hot-swap is armed when you reveal
 a source / click a sample **while editing a pad** (`hotswap_pad`/`hotswap_orig` captured); with no pad
 focus a click just loads into the editor as before. The key handler is gated on the pane being
 **visible** (`sample_focus && show_explorer && places_tab == 3 && sample_browse.is_some()`) so a stale

@@ -3695,20 +3695,86 @@ impl PixelView {
     }
 
     /// The sorted audio files in the currently-browsed Samples folder (the ↑/↓ hot-swap nav list).
-    fn sample_files(&self) -> Vec<PathBuf> {
+    /// The Samples browser's ordered rows: subdirectories first (sorted), then audio files
+    /// (sorted) — the SAME order `ui_explorer` paints, so ↑/↓ keyboard nav lines up with the list.
+    fn sample_entries(&self) -> Vec<(PathBuf, bool)> {
+        let mut dirs = Vec::new();
         let mut files = Vec::new();
         if let Some(dir) = &self.sample_browse {
             if let Ok(rd) = std::fs::read_dir(dir) {
                 for e in rd.flatten() {
                     let p = e.path();
-                    if p.is_file() && is_audio_ext(&p) {
+                    if p.is_dir() {
+                        dirs.push(p);
+                    } else if is_audio_ext(&p) {
                         files.push(p);
                     }
                 }
             }
         }
+        dirs.sort();
         files.sort();
-        files
+        dirs.into_iter()
+            .map(|p| (p, true))
+            .chain(files.into_iter().map(|p| (p, false)))
+            .collect()
+    }
+
+    /// Samples browser ↑/↓: move the selection through the combined dir+file list (wraps). On a
+    /// FILE, audition it (on the hot-swap pad if one's armed, else loaded into the editor); on a
+    /// FOLDER just move the cursor — Enter / → then descends into it.
+    fn sample_browse_step(&mut self, delta: i32) {
+        let entries = self.sample_entries();
+        if entries.is_empty() {
+            return;
+        }
+        let cur = self
+            .sample_sel
+            .as_ref()
+            .and_then(|s| entries.iter().position(|(p, _)| p == s));
+        let next = match cur {
+            Some(i) => (i as i32 + delta).rem_euclid(entries.len() as i32) as usize,
+            None if delta >= 0 => 0,
+            None => entries.len() - 1,
+        };
+        let (path, is_dir) = entries[next].clone();
+        self.sample_sel = Some(path.clone());
+        if is_dir {
+            self.want_repaint = true; // just move the cursor onto the folder
+        } else {
+            self.audition_sample(&path);
+        }
+    }
+
+    /// Samples browser Backspace / ← / ⬆: go to the parent folder, landing the cursor on the
+    /// folder we came up from (so it's highlighted and a ↓ continues from there).
+    fn sample_browse_up(&mut self) {
+        if let Some(dir) = self.sample_browse.clone() {
+            if let Some(parent) = dir.parent() {
+                self.sample_browse = Some(parent.to_path_buf());
+                self.sample_sel = Some(dir); // highlight the child we came from
+                self.sample_focus = true;
+                self.want_repaint = true;
+            }
+        }
+    }
+
+    /// Samples browser Enter / →: descend into the selected FOLDER, or act on the selected FILE
+    /// (assign to the hot-swap pad if one's armed, else load it into the editor).
+    fn sample_browse_enter(&mut self) {
+        let Some(sel) = self.sample_sel.clone() else {
+            return;
+        };
+        if sel.is_dir() {
+            self.sample_browse = Some(sel);
+            self.sample_sel = None; // fresh folder — a ↓ starts at the top
+            self.sample_focus = true;
+            self.want_repaint = true;
+        } else if self.hotswap_pad.is_some() {
+            self.hotswap_assign();
+        } else {
+            self.audition_sample(&sel);
+        }
     }
 
     /// Audition a sample picked in the browser: select it, then either audition it ON the
@@ -3766,25 +3832,6 @@ impl PixelView {
             ap.play_region();
         }
         self.status = format!("Audition {} on pad {}", short_name(path), p + 1);
-    }
-
-    /// Hot-swap ↑/↓: move the selection `delta` rows through the browsed folder and audition it.
-    fn hotswap_step(&mut self, delta: i32) {
-        let files = self.sample_files();
-        if files.is_empty() {
-            return;
-        }
-        let cur = self
-            .sample_sel
-            .as_ref()
-            .and_then(|s| files.iter().position(|f| f == s));
-        let next = match cur {
-            Some(i) => (i as i32 + delta).rem_euclid(files.len() as i32) as usize,
-            None if delta >= 0 => 0,
-            None => files.len() - 1,
-        };
-        let f = files[next].clone();
-        self.audition_sample(&f);
     }
 
     /// Hot-swap Enter: keep the auditioned sample on the pad — write it through to the kit WAV and
@@ -14162,11 +14209,11 @@ impl PixelView {
                                 }
                                 ui.strong(elide(&short_name(&dir), 22));
                             });
-                            // The header hint reflects the hot-swap keys when the pane is focused.
+                            // The header hint reflects the keyboard nav when the pane is focused.
                             if self.sample_focus && self.hotswap_pad.is_some() {
-                                ui.weak("↑/↓ audition on pad · → play · Enter assign · Esc cancel");
+                                ui.weak("↑/↓ audition · Enter assign · Backspace up · Esc cancel");
                             } else if self.sample_focus {
-                                ui.weak("↑/↓ browse · → play · Esc unfocus");
+                                ui.weak("↑/↓ select · Enter/→ open · Backspace/← up · Esc unfocus");
                             } else {
                                 ui.weak("click a sample → load into editor (click focuses this pane)");
                             }
@@ -14241,10 +14288,13 @@ impl PixelView {
                                         resp
                                     };
                                     for d in &subdirs {
+                                        // Highlight a keyboard-selected folder too (↑/↓ can land on a
+                                        // dir before Enter/→ descends), not just files.
+                                        let is_sel = cur_sel.as_deref() == Some(d.as_path());
                                         let r = row(
                                             ui,
                                             format!("📁 {}", elide(&short_name(d), 30)),
-                                            false,
+                                            is_sel,
                                             egui::Sense::click(),
                                         );
                                         if r.clicked() {
@@ -14473,30 +14523,45 @@ impl eframe::App for PixelView {
             && self.places_tab == 3
             && self.sample_browse.is_some();
         if sample_pane_live && !typing {
-            let (up, down, right, enter, esc) = ctx.input_mut(|i| {
+            // File-browser nav: ↑/↓ move the selection through folders+files, Enter/→ open (descend
+            // a folder or act on a file), Backspace/← go up a dir. All consumed so they never leak to
+            // the grid/viewer's own arrow/Enter/Backspace bindings.
+            let (up, down, left, right, enter, back, esc) = ctx.input_mut(|i| {
                 (
                     i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
                     i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
                     i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
                     i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace),
                     i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
                 )
             });
             if up {
-                self.hotswap_step(-1);
+                self.sample_browse_step(-1);
             } else if down {
-                self.hotswap_step(1);
+                self.sample_browse_step(1);
+            } else if back || left {
+                self.sample_browse_up();
             } else if right {
-                if let Some(ap) = &mut self.audio_player {
+                // → descends into a selected folder, else replays the selected sample.
+                let is_dir = self
+                    .sample_sel
+                    .as_deref()
+                    .map(|p| p.is_dir())
+                    .unwrap_or(false);
+                if is_dir {
+                    self.sample_browse_enter();
+                } else if let Some(ap) = &mut self.audio_player {
                     ap.play_region();
                 }
             } else if enter {
-                self.hotswap_assign();
+                self.sample_browse_enter();
             } else if esc {
                 self.hotswap_abort();
                 self.sample_focus = false;
             }
-            if up || down || right || enter || esc {
+            if up || down || left || right || enter || back || esc {
                 self.want_repaint = true;
             }
         }
