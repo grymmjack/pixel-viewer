@@ -1001,23 +1001,22 @@ focus a click just loads into the editor as before. The key handler is gated on 
 **visible** (`sample_focus && show_explorer && places_tab == 3 && sample_browse.is_some()`) so a stale
 flag can't hijack the keyboard.
 
-**Pad-grid width (overflow/overlap gotcha) — the real fix is a clipped `new_child`.** The 4×4 pad
-grid must be sized from an EXPLICIT width, never `ui.available_width()` in the split's right column
-(the keyboard's non-wrapping MIDI row inflates that ui). But the *deeper* bug was the LEFT "Pads (N)"
-pane: its pad-name rows overflow the narrow `left_w`, and **`allocate_ui_with_layout` advances the
-horizontal cursor by the RENDERED CONTENT width, not the requested size** — so the overflow shoved the
-divider + right column (hence the pad grid) rightward by a per-frame-varying amount, *and* the pane's
-own ScrollArea scrollbar (drawn at the content's right edge) bled over the first pad column (the
-"scrollbar sitting on a pad" symptom). Truncating the rows / a min `left_w` did NOT fix it (egui still
-measured & advanced by the content). **The fix:** draw the left pane into a **hard-clipped
-`ui.new_child(UiBuilder::new().max_rect(left_rect)…)`** (`set_clip_rect(left_rect ∩ parent_clip)` — a
-GUARANTEE the pane's painting, scrollbar included, cannot extend past `left_w`), then advance the
-parent cursor by the FIXED rect via **`ui.allocate_rect(left_rect, …)`** (not the content). Now
-`right_w = avail - left_w - divider - 2·item_spacing` is deterministic and the grid can't be pushed or
-overlapped. Same class as the amplitude-slider gotcha (a child's measured size corrupting the parent
-layout → non-advancing `new_child`). Verified: pixel-identical tile rects across frames (positive
-3-4px gaps, no overlap) at 2741px, clean boundary, and a *scrolling* pad list (short window) keeps its
-scrollbar inside the pane.
+**Pad-grid overlap (the real bug: `scope_builder` inside a `ui.horizontal` cell).** The 4×4 pad
+tiles overlapped by exactly **8px** — each column's left edge sat 8px INSIDE the previous column's
+right edge. Root cause (found by `eprintln!`ing every `allocate_exact_size` rect — don't eyeball 1px
+borders): each cell drew its controls with **`ui.scope_builder(UiBuilder::max_rect(inner), …)`**, and
+`scope_builder` — like `ui.put` — **advances the parent's cursor by the child's `min_rect`**. `inner`
+is inset **14px** from the cell's right edge, so after each cell `scope_builder` yanked the horizontal
+cursor back to `cell.right() − 14`, then `+ 6px` item-spacing put the NEXT `allocate_exact_size` at
+`cell.right() − 8` → −8px pitch → overlap. **The fix:** draw the controls in a **non-advancing
+`ui.new_child(UiBuilder::max_rect(inner)…)`** (borrow it as `let ui = &mut cui;`) so the cell's pitch
+is set solely by `allocate_exact_size` (`cell_w + gap`, exact). Same class as the amplitude-slider
+gotcha — a child's measured size corrupting the parent layout, cured by `new_child` not
+`scope_builder`/`ui.put`. Verified with a `PAD_DEBUG` build: gaps went from −8.0 → **+6.0** between
+every column at a 3000px window, and bright-red debug borders showed clean separation. **Lesson:** the
+pad-grid `width` parameter + the pad-list clipped-`new_child` (deterministic pane width) were fixes for
+a *misdiagnosed* cause (assumed `available_width` jitter / scrollbar bleed) — harmless robustness, but
+the overlap was always this `scope_builder` cursor-advance, not the pane width.
 
 **"Pads (N)" list — keyboard focus + nav.** The big audio view's left column shows the 16-pad list
 (`audio_sample_list` when `big && pad_list_visible()` — the kit editor, OR the normal audio view

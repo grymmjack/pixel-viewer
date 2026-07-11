@@ -5915,11 +5915,20 @@ impl PixelView {
                         rect.min + egui::vec2(6.0, 4.0),
                         egui::pos2(rect.right() - 14.0, rect.bottom() - 5.0),
                     );
-                    ui.scope_builder(
+                    // MUST be `new_child`, NOT `scope_builder`: scope_builder advances the parent's
+                    // horizontal cursor by this child's min_rect (= `inner`, inset 14px from the cell's
+                    // right edge), so the NEXT cell was allocated 8px early and the pads overlapped by
+                    // 8px. `new_child` is non-advancing — it leaves the cursor where
+                    // `allocate_exact_size` parked it (cell.right() + gap), so the pitch is exact.
+                    // (The documented `ui.put`/scope_builder layout gotcha.)
+                    let mut cui = ui.new_child(
                         egui::UiBuilder::new()
                             .max_rect(inner)
                             .layout(egui::Layout::top_down(egui::Align::Min)),
-                        |ui| {
+                    );
+                    {
+                        let ui = &mut cui;
+                        {
                             ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
                             ui.spacing_mut().button_padding = egui::vec2(3.0, 1.0);
                             // Header: pad number + name (fills the width; double-click to rename) +
@@ -6096,8 +6105,8 @@ impl PixelView {
                                     want_vol = Some((i, volume));
                                 }
                             }
-                        },
-                    );
+                        }
+                    }
                 }
             });
         }
