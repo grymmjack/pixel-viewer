@@ -1001,6 +1001,17 @@ focus a click just loads into the editor as before. The key handler is gated on 
 **visible** (`sample_focus && show_explorer && places_tab == 3 && sample_browse.is_some()`) so a stale
 flag can't hijack the keyboard.
 
+**Kit-editor "Pads (N)" list — keyboard focus + nav.** The standalone kit editor's left column
+(`audio_sample_list` when `kit_editor && big`) lists the 16 pads. It **auto-focuses** on
+`enter_kit_editor` (`pad_list_focus`, a blue focus outline — mutually exclusive with the Samples pane's
+`sample_focus`): **↑/↓** drill the editor into the prev/next **non-empty** pad (`pad_list_step` →
+`focus_pad`, so "Editing pad N" + the waveform follow), **Enter** keeps that pad edited and **swaps to
+the sample browser** (`pad_list_enter` → open the Samples tab on the pad's source folder, select it,
+arm a hot-swap, hand focus to the browser — or, for a kit pad with no source file, just arm the
+hot-swap so once you pick a Samples location ↑/↓ audition on the pad), **Esc** unfocuses. Same
+`consume_key` gating as the Samples pane so the arrows never leak to grid/viewer nav; clicking a pad
+row / a pad tile / navigating (`show_folder`) clears the focus.
+
 **Standalone Sample-Pads editor (`kit_editor`).** Clicking the Kits tab or loading a kit shows the
 pad grid + keyboard + a **silent waveform** with no audio file open (`enter_kit_editor` → `mode =
 Single` + `ensure_kit_editor`, which installs a 1 s **silent `AudioPlayer`** at the synthetic

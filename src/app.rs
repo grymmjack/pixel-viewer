@@ -904,6 +904,8 @@ pub struct PixelView {
     sample_sel: Option<PathBuf>, // highlighted sample row (selection + hot-swap cursor); transient
     sample_focus: bool, // the Samples pane holds keyboard focus (arrows navigate it) — a Renoise-style
     // click-to-focus so hot-swap keys never clash with grid/viewer handlers; a focus outline shows it
+    pad_list_focus: bool, // the kit-editor "Pads (N)" list holds keyboard focus (↑/↓ drill pads, Enter
+    // opens the sample browser for the pad) — mutually exclusive with `sample_focus`; a focus outline shows it
     hotswap_pad: Option<usize>, // pad being auditioned/hot-swapped from the Samples browser (Up/Down
     // audition on it, Right plays, Enter assigns, Esc reverts) — its pre-swap state is `hotswap_orig`
     hotswap_orig: Option<Pad>, // the hot-swapped pad's pre-swap state, restored on Escape (abort)
@@ -1848,6 +1850,7 @@ impl PixelView {
             sample_browse: None,
             sample_sel: None,
             sample_focus: false,
+            pad_list_focus: false,
             hotswap_pad: None,
             hotswap_orig: None,
             editor_source: None,
@@ -2132,8 +2135,9 @@ impl PixelView {
         self.cancel_colo();
         self.colo_flat = false;
         self.colo_pieces.clear();
-        // Drop any Samples-pane focus / hot-swap session (its pad is about to be out of context).
+        // Drop any Samples-pane / Pads-list focus + hot-swap session (out of context after nav).
         self.sample_focus = false;
+        self.pad_list_focus = false;
         self.hotswap_pad = None;
         self.hotswap_orig = None;
         self.all_entries = entries;
@@ -3616,6 +3620,8 @@ impl PixelView {
         }
         self.kit_editor = true;
         self.mode = Mode::Single;
+        self.pad_list_focus = true; // arrows drive the Pads list right away
+        self.sample_focus = false;
         self.ensure_kit_editor();
     }
 
@@ -3804,6 +3810,58 @@ impl PixelView {
                 self.focus_pad(p);
             }
             self.status = "Hot-swap cancelled (pad restored)".into();
+        }
+    }
+
+    /// Kit-editor Pads-list ↑/↓: drill the editor into the prev/next **non-empty** pad (wraps).
+    fn pad_list_step(&mut self, delta: i32) {
+        let nonempty: Vec<usize> = (0..self.pads.len())
+            .filter(|&i| !self.pads[i].is_empty())
+            .collect();
+        if nonempty.is_empty() {
+            return;
+        }
+        let cur = if let EditFocus::Pad(i) = self.edit_focus {
+            nonempty.iter().position(|&x| x == i)
+        } else {
+            None
+        };
+        let next = match cur {
+            Some(p) => (p as i32 + delta).rem_euclid(nonempty.len() as i32) as usize,
+            None if delta >= 0 => 0,
+            None => nonempty.len() - 1,
+        };
+        self.focus_pad(nonempty[next]);
+    }
+
+    /// Kit-editor Pads-list Enter: keep editing the focused pad and **swap to the sample browser**
+    /// — open the Samples tab on the pad's source folder, select it, and arm a hot-swap (so ↑/↓ then
+    /// audition replacements on this pad). Hands keyboard focus to the browser. If the pad has no
+    /// source file, just opens the Samples tab.
+    fn pad_list_enter(&mut self) {
+        let EditFocus::Pad(p) = self.edit_focus else {
+            return;
+        };
+        self.places_tab = 3; // Samples
+        self.show_explorer = true;
+        self.pad_list_focus = false;
+        if let Some(src) = self.pads.get(p).and_then(|pd| pd.source.clone()) {
+            let src = PathBuf::from(src);
+            if let Some(parent) = src.parent() {
+                self.sample_browse = Some(parent.to_path_buf());
+            }
+            self.sample_sel = Some(src);
+            self.sample_focus = true; // focus moves to the browser
+            self.hotswap_pad = Some(p);
+            self.hotswap_orig = Some(self.pads[p].clone());
+            self.status = format!("Pad {}: browse replacements (↑/↓ audition, Enter assign)", p + 1);
+        } else {
+            // No source file to open — still arm the hot-swap so once you click into a Samples
+            // location, ↑/↓ audition replacements on this pad (Enter assigns, Esc reverts).
+            self.sample_focus = true;
+            self.hotswap_pad = Some(p);
+            self.hotswap_orig = Some(self.pads[p].clone());
+            self.status = format!("Pad {}: pick a Samples location, then ↑/↓ to audition", p + 1);
         }
     }
 
@@ -5155,6 +5213,7 @@ impl PixelView {
             }
             self.sample_sel = Some(src.clone());
             self.sample_focus = true;
+            self.pad_list_focus = false;
             // Editing a pad → arm a hot-swap so ↑/↓ audition on that pad and Enter assigns.
             if let EditFocus::Pad(p) = self.edit_focus {
                 self.hotswap_pad = Some(p);
@@ -5383,15 +5442,20 @@ impl PixelView {
             } else {
                 None
             };
+            let list_focus = self.pad_list_focus;
             ui.horizontal(|ui| {
                 ui.strong("Pads (16)");
-                ui.weak("· click to edit");
+                if list_focus {
+                    ui.weak("· ↑/↓ edit · Enter browse · Esc unfocus");
+                } else {
+                    ui.weak("· click to edit");
+                }
             });
             ui.add_space(2.0);
             let list_h = (ui.available_height() - 4.0).max(160.0);
             let mut pad_focus: Option<usize> = None;
             let mut pad_export: Option<usize> = None;
-            egui::ScrollArea::vertical()
+            let sa = egui::ScrollArea::vertical()
                 .id_salt("pad_sample_list")
                 .max_height(list_h)
                 .auto_shrink([false, true])
@@ -5436,8 +5500,19 @@ impl PixelView {
                         });
                     }
                 });
+            // Renoise-style focus outline — this list owns the keyboard (↑/↓/Enter).
+            if list_focus {
+                ui.painter().rect_stroke(
+                    sa.inner_rect,
+                    3.0,
+                    egui::Stroke::new(2.0, egui::Color32::from_rgb(120, 170, 235)),
+                    egui::StrokeKind::Inside,
+                );
+            }
             if let Some(i) = pad_focus {
                 self.focus_pad(i);
+                self.pad_list_focus = true; // clicking a row focuses the list
+                self.sample_focus = false;
             }
             if let Some(i) = pad_export {
                 self.download_pad(i);
@@ -5995,7 +6070,8 @@ impl PixelView {
             }
         }
         if let Some((i, vel)) = want_trigger {
-            self.sample_focus = false; // clicking a pad hands keyboard focus back out of the pane
+            self.sample_focus = false; // clicking a pad hands keyboard focus back out of the panes
+            self.pad_list_focus = false;
             self.trigger_pad(i, vel, now);
             // Request C: clicking a pad also loads it into the top waveform editor (implicit `e`),
             // unless it's empty or already the focused pad.
@@ -14177,11 +14253,13 @@ impl PixelView {
         if let Some(dir) = browse_sample {
             self.sample_browse = Some(dir);
             self.sample_focus = true; // browsing focuses the pane
+            self.pad_list_focus = false;
         }
         if let Some(f) = select_sample {
             // Clicking a sample focuses the pane (Renoise-style) + auditions it. If we're editing a
             // pad, begin/continue a hot-swap (audition ON the pad; Enter assigns, Esc reverts).
             self.sample_focus = true;
+            self.pad_list_focus = false;
             if self.hotswap_pad.is_none() {
                 if let EditFocus::Pad(p) = self.edit_focus {
                     self.hotswap_pad = Some(p);
@@ -14335,6 +14413,30 @@ impl eframe::App for PixelView {
                 self.sample_focus = false;
             }
             if up || down || right || enter || esc {
+                self.want_repaint = true;
+            }
+        }
+        // Same, for the kit-editor "Pads (N)" list: ↑/↓ drill the editor into the prev/next pad,
+        // Enter opens the sample browser for the pad (hands focus over), Esc unfocuses.
+        if self.pad_list_focus && self.kit_editor && !typing {
+            let (up, down, enter, esc) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                )
+            });
+            if up {
+                self.pad_list_step(-1);
+            } else if down {
+                self.pad_list_step(1);
+            } else if enter {
+                self.pad_list_enter();
+            } else if esc {
+                self.pad_list_focus = false;
+            }
+            if up || down || enter || esc {
                 self.want_repaint = true;
             }
         }
