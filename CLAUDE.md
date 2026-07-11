@@ -947,7 +947,14 @@ pinned as an override so it keeps triggering on the **same key** in the new slot
 slot** (lock off → the override is dropped so it takes the destination's `base + index` default) —
 notes are resolved *before* the swap since `pad_note` reads the slot index. Because the persistent
 kit reloads slot N from `<data>/pads/pad_N.wav`, `move_pad` calls **`persist_pad_wav`** on both
-slots (rewrite/remove the WAV) so a swapped kit reloads correctly. **`AudioPlayer::trigger_pad_voice`** fires each hit as its own `rodio::Player` on the
+slots (rewrite/remove the WAV) so a swapped kit reloads correctly. **Alt+drag a pad = CLONE**
+(`clone_pad`, a green drop-outline + Copy cursor vs. the blue move-outline; keyed off
+`alt_down = ui.input(i.modifiers.alt)`): copies the whole pad (Arc buffer + every field) onto the
+target WITHOUT removing the source — for quick variations of one sound. The clone's firing note
+keeps the **destination's** key when the destination was 🔒-locked (the "maintain the already-mapped
+MIDI key" case), else adopts the source's key. **A pad CLICK also lights its assigned key** on the
+onscreen keyboard — `trigger_pad` inserts `pad_note(i)` into `note_flash` (red, since it routes to a
+pad), so a click, a keyboard press, and a MIDI note all light the key identically. **`AudioPlayer::trigger_pad_voice`** fires each hit as its own `rodio::Player` on the
 **shared `_stream.mixer()`** (`pad_voices: Vec<PadVoice>`, reaped each frame) — the mixer sums them,
 so pads are **polyphonic** (the base player is monophonic). Feedback (the user's ask): every played
 note lights its keyboard key (`note_flash`) — **red** if it routes to a pad, an accent otherwise — and
@@ -970,6 +977,24 @@ no navigation) and **opens the standalone pad editor** (below); **Samples** hold
 folders (`sample_places`: name/dir/color, `SAMPLE_PLACES_KEY`) — `＋ Add location…` (rfd), click to
 browse, right-click to rename (inline) / colorize (ANSI32 swatches) / remove. All gated on
 `self.plugin_audio`.
+
+**Samples file browser + keyboard hot-swap.** The Samples-tab file list renders **full-width rows
+with the table view's look** (zebra `faint_bg_color` on odd rows, hover, and a `selection.bg_fill`
+highlight on the selected row — the user asked to "reuse the table style, no headers"), tracked by
+`sample_sel: Option<PathBuf>`. Clicking the editor's **source link** (`want_reveal_source`) now opens
+the folder AND selects that file. **Renoise-style pane focus** (`sample_focus`): clicking a sample (or
+revealing a source) focuses the pane — a blue **focus outline** (`ScrollArea` output's `inner_rect`)
+shows it owns the keyboard; clicking a pad (`want_trigger`) or navigating (`show_folder`) unfocuses it.
+While focused, the pane's keys drive a **hot-swap** and are **`consume_key`-consumed** so they never
+also fire the grid/viewer nav bound to the same keys (no duplicate-handler clashes): **↑/↓** audition
+the prev/next sample **on the hot-swapped pad** (`audition_on_pad`: in-memory buffer swap + `focus_pad`
+so "Editing pad N" stays + play — **no WAV write yet**), **→** replays, **Enter** assigns (`hotswap_assign`
+→ `persist_pad_wav`), **Esc** aborts (`hotswap_abort` → restore the pad's pre-swap `Pad` from
+`hotswap_orig`; the disk WAV was never touched while auditioning). The hot-swap is armed when you reveal
+a source / click a sample **while editing a pad** (`hotswap_pad`/`hotswap_orig` captured); with no pad
+focus a click just loads into the editor as before. The key handler is gated on the pane being
+**visible** (`sample_focus && show_explorer && places_tab == 3 && sample_browse.is_some()`) so a stale
+flag can't hijack the keyboard.
 
 **Standalone Sample-Pads editor (`kit_editor`).** Clicking the Kits tab or loading a kit shows the
 pad grid + keyboard + a **silent waveform** with no audio file open (`enter_kit_editor` → `mode =

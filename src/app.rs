@@ -901,6 +901,12 @@ pub struct PixelView {
     sample_places: Vec<(String, PathBuf, Option<[u8; 3]>)>,
     sample_rename: Option<(usize, String)>, // inline-rename buffer for a Samples place (transient)
     sample_browse: Option<PathBuf>, // an opened Samples location → inline file explorer (transient)
+    sample_sel: Option<PathBuf>, // highlighted sample row (selection + hot-swap cursor); transient
+    sample_focus: bool, // the Samples pane holds keyboard focus (arrows navigate it) — a Renoise-style
+    // click-to-focus so hot-swap keys never clash with grid/viewer handlers; a focus outline shows it
+    hotswap_pad: Option<usize>, // pad being auditioned/hot-swapped from the Samples browser (Up/Down
+    // audition on it, Right plays, Enter assigns, Esc reverts) — its pre-swap state is `hotswap_orig`
+    hotswap_orig: Option<Pad>, // the hot-swapped pad's pre-swap state, restored on Escape (abort)
     editor_source: Option<PathBuf>, // a sample loaded into the editor from the browser (for load_pad)
     pad_rename: Option<(usize, String)>, // inline-rename buffer for pad i's name (transient)
     show_hotkeys: bool,
@@ -1840,6 +1846,10 @@ impl PixelView {
                 .unwrap_or_default(),
             sample_rename: None,
             sample_browse: None,
+            sample_sel: None,
+            sample_focus: false,
+            hotswap_pad: None,
+            hotswap_orig: None,
             editor_source: None,
             pad_rename: None,
             show_hotkeys: false,
@@ -2122,6 +2132,10 @@ impl PixelView {
         self.cancel_colo();
         self.colo_flat = false;
         self.colo_pieces.clear();
+        // Drop any Samples-pane focus / hot-swap session (its pad is about to be out of context).
+        self.sample_focus = false;
+        self.hotswap_pad = None;
+        self.hotswap_orig = None;
         self.all_entries = entries;
         // Record in the back/forward history unless we're navigating *via* it.
         if !self.suppress_history {
@@ -2776,6 +2790,37 @@ impl PixelView {
         self.status = format!("Moved pad {} → {}", src + 1, dst + 1);
     }
 
+    /// **Alt+drag: CLONE** pad `src` onto slot `dst` — copy *everything* (sample, name, colour, mix,
+    /// pitch, loop region/type, V) WITHOUT removing the source, for quick variations of one sound.
+    /// The clone's firing note: if the **destination** was key-locked (🔒), it KEEPS the destination's
+    /// current key (so the variation triggers on the pad's already-mapped key — the "optionally
+    /// maintain the MIDI key" case); otherwise it adopts the source's absolute key. Persists the WAV.
+    fn clone_pad(&mut self, src: usize, dst: usize) {
+        if src == dst || src >= self.pads.len() || dst >= self.pads.len() || self.pads[src].is_empty()
+        {
+            return;
+        }
+        let dst_key = self.pad_note(dst);
+        let dst_locked = self.pads[dst].note_lock;
+        let src_key = self.pad_note(src);
+        let mut clone = self.pads[src].clone(); // Arc buffer + all fields (name, colour, loop, …)
+        clone.flash_t = -1.0;
+        if dst_locked {
+            clone.note = Some(dst_key); // keep the destination's mapped key
+            clone.note_lock = true;
+        } else {
+            clone.note = Some(src_key); // clone the source's key too
+        }
+        self.pads[dst] = clone;
+        self.persist_pad_wav(dst);
+        self.status = format!(
+            "Cloned pad {} → {}{}",
+            src + 1,
+            dst + 1,
+            if dst_locked { " (kept its key)" } else { "" }
+        );
+    }
+
     /// Route a note-on from the onscreen keyboard or a hardware MIDI key. Order: (1) MIDI-learn
     /// mode assigns the note to the pending pad; (2) a note matching a loaded pad's note fires
     /// that pad at native pitch (drum-rack); (3) otherwise it auditions the editor sample pitched
@@ -2855,6 +2900,13 @@ impl PixelView {
             ap.trigger_pad_voice(i, buf, region, pitch, gain, loop_it);
         }
         self.pads[i].flash_t = now;
+        // Light this pad's assigned key on the onscreen keyboard too (red — it routes to a pad), so
+        // a pad CLICK shows which key drives it, exactly like a keyboard/MIDI trigger already does.
+        // (route_note_on inserts the same note before calling us — a harmless idempotent overwrite.)
+        let note = self.pad_note(i);
+        self.note_flash.retain(|_, t| now - *t < 1.0); // bound the map
+        self.note_flash.insert(note, now);
+        self.want_repaint = true; // animate the key-light fade
     }
 
     /// Load the current editor buffer (selection region if set, else the whole sample) into pad
@@ -3630,6 +3682,125 @@ impl PixelView {
                 self.status = format!("Loaded {}", short_name(path));
             }
             Err(e) => self.status = format!("Can't decode: {e}"),
+        }
+    }
+
+    /// The sorted audio files in the currently-browsed Samples folder (the ↑/↓ hot-swap nav list).
+    fn sample_files(&self) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        if let Some(dir) = &self.sample_browse {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_file() && is_audio_ext(&p) {
+                        files.push(p);
+                    }
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// Audition a sample picked in the browser: select it, then either audition it ON the
+    /// hot-swapped pad (in-memory swap + play, keeping "Editing pad N") or — with no hot-swap
+    /// armed — just load it into the editor as before.
+    fn audition_sample(&mut self, path: &Path) {
+        self.sample_sel = Some(path.to_path_buf());
+        match self.hotswap_pad {
+            Some(p) => self.audition_on_pad(p, path),
+            None => {
+                self.enter_kit_editor();
+                self.load_sample_into_editor(path);
+            }
+        }
+        self.want_repaint = true;
+    }
+
+    /// Swap `path` into pad `p` IN MEMORY (no WAV write — the on-disk kit keeps the pre-swap sample
+    /// until Enter commits, so Esc can revert), point the editor at the pad, and play it — so ↑/↓
+    /// auditions "in place on the pad" you're hot-swapping.
+    fn audition_on_pad(&mut self, p: usize, path: &Path) {
+        if p >= self.pads.len() {
+            return;
+        }
+        let real = self.resolve_local(path);
+        let bytes = match std::fs::read(&real) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = format!("Read failed: {e}");
+                return;
+            }
+        };
+        let d = match decode_audio(&real, bytes, None) {
+            Ok(d) => d,
+            Err(e) => {
+                self.status = format!("Can't decode: {e}");
+                return;
+            }
+        };
+        self.pads[p].buf = Some(std::sync::Arc::new(SampleBuf {
+            samples: d.samples,
+            channels: d.channels,
+            sample_rate: d.sample_rate,
+            duration: d.duration,
+            peaks: d.peaks,
+        }));
+        self.pads[p].name = short_name(path);
+        self.pads[p].source = Some(path.to_string_lossy().into_owned());
+        self.pads[p].loop_start = 0.0; // fresh sample → whole-sample loop
+        self.pads[p].loop_end = 0.0;
+        self.focus_pad(p); // editor follows the pad; the "Editing pad N" context stays
+        let autoplay = self.audio_autoplay;
+        if let Some(ap) = &mut self.audio_player {
+            ap.looping = autoplay;
+            ap.play_region();
+        }
+        self.status = format!("Audition {} on pad {}", short_name(path), p + 1);
+    }
+
+    /// Hot-swap ↑/↓: move the selection `delta` rows through the browsed folder and audition it.
+    fn hotswap_step(&mut self, delta: i32) {
+        let files = self.sample_files();
+        if files.is_empty() {
+            return;
+        }
+        let cur = self
+            .sample_sel
+            .as_ref()
+            .and_then(|s| files.iter().position(|f| f == s));
+        let next = match cur {
+            Some(i) => (i as i32 + delta).rem_euclid(files.len() as i32) as usize,
+            None if delta >= 0 => 0,
+            None => files.len() - 1,
+        };
+        let f = files[next].clone();
+        self.audition_sample(&f);
+    }
+
+    /// Hot-swap Enter: keep the auditioned sample on the pad — write it through to the kit WAV and
+    /// end the session.
+    fn hotswap_assign(&mut self) {
+        if let Some(p) = self.hotswap_pad {
+            self.persist_pad_wav(p); // the pad already holds the auditioned sample in memory
+            let n = self.pads.get(p).map(|pd| pd.name.clone()).unwrap_or_default();
+            self.status = format!("Assigned {} → pad {}", n, p + 1);
+        }
+        self.hotswap_pad = None;
+        self.hotswap_orig = None;
+    }
+
+    /// Hot-swap Esc: abort — restore the pad to its pre-swap sample (the disk WAV was never touched
+    /// while auditioning) and re-point the editor at it.
+    fn hotswap_abort(&mut self) {
+        if let (Some(p), Some(orig)) = (self.hotswap_pad.take(), self.hotswap_orig.take()) {
+            if p < self.pads.len() {
+                self.pads[p] = orig;
+                // Move the browser cursor back onto the pad's (restored) sample.
+                self.sample_sel = self.pads[p].source.clone().map(PathBuf::from);
+                self.focus_pad(p);
+            }
+            self.status = "Hot-swap cancelled (pad restored)".into();
         }
     }
 
@@ -4972,11 +5143,19 @@ impl PixelView {
             self.focus_back();
         }
         if let Some(src) = want_reveal_source {
-            // Open the edited sample's folder in the Samples explorer (left dock, Samples tab).
+            // Open the edited sample's folder in the Samples explorer (left dock, Samples tab),
+            // SELECT the file there, and focus the pane so its hot-swap keys are live.
             if let Some(parent) = src.parent() {
                 self.sample_browse = Some(parent.to_path_buf());
                 self.places_tab = 3; // Samples
                 self.show_explorer = true;
+            }
+            self.sample_sel = Some(src.clone());
+            self.sample_focus = true;
+            // Editing a pad → arm a hot-swap so ↑/↓ audition on that pad and Enter assigns.
+            if let EditFocus::Pad(p) = self.edit_focus {
+                self.hotswap_pad = Some(p);
+                self.hotswap_orig = Some(self.pads[p].clone());
             }
         }
         if let Some(src) = want_reload_source {
@@ -5434,6 +5613,8 @@ impl PixelView {
         let cell_h = ((ui.available_height() - gap * 3.0) / 4.0).clamp(72.0, 400.0);
         let old_spacing = ui.spacing().item_spacing;
         ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
+        // Alt held turns a pad→pad drag into a CLONE (copy the whole pad) instead of a move/swap.
+        let alt_down = ui.input(|i| i.modifiers.alt);
         for r in 0..4 {
             ui.horizontal(|ui| {
                 for c in 0..cols {
@@ -5457,16 +5638,25 @@ impl PixelView {
                         egui::Sense::click_and_drag(),
                     );
                     // Drag-and-drop onto this pad: from the Samples explorer / tracker list (load a
-                    // sample) OR from another pad (move/swap). Highlight while a payload hovers, act
-                    // on release. Dragging THIS pad's body out sets a `PadDrop::Pad(i)` payload so it
-                    // can be dropped onto another slot (a click still triggers it — see below).
-                    let drop_hover = resp.dnd_hover_payload::<PadDrop>().is_some();
+                    // sample) OR from another pad (move/swap, or Alt = clone). Highlight while a
+                    // payload hovers, act on release. Dragging THIS pad's body out sets a
+                    // `PadDrop::Pad(i)` payload so it can be dropped onto another slot (a click still
+                    // triggers it — see below).
+                    let hover_payload = resp.dnd_hover_payload::<PadDrop>();
+                    let drop_hover = hover_payload.is_some();
+                    // Alt + a pad-payload hover = clone target → a distinct green outline.
+                    let clone_hover =
+                        alt_down && matches!(hover_payload.as_deref(), Some(PadDrop::Pad(_)));
                     if let Some(payload) = resp.dnd_release_payload::<PadDrop>() {
                         want_drop = Some((i, (*payload).clone()));
                     }
                     if !empty && resp.dragged() {
                         egui::DragAndDrop::set_payload(ui.ctx(), PadDrop::Pad(i));
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                        ui.ctx().set_cursor_icon(if alt_down {
+                            egui::CursorIcon::Copy // Alt = clone
+                        } else {
+                            egui::CursorIcon::Grabbing
+                        });
                     }
                     let flash = flash_t >= 0.0 && now - flash_t < 0.18;
                     let base_bg = if empty {
@@ -5489,7 +5679,9 @@ impl PixelView {
                         base_bg
                     };
                     ui.painter().rect_filled(rect, 5.0, bg);
-                    let border = if drop_hover {
+                    let border = if clone_hover {
+                        egui::Stroke::new(2.5, egui::Color32::from_rgb(120, 230, 140)) // clone (Alt)
+                    } else if drop_hover {
                         egui::Stroke::new(2.5, egui::Color32::from_rgb(90, 180, 255)) // drop target
                     } else if self.kb_hover_pad == Some(i) && !empty {
                         // Hovering this pad's key on the keyboard → light outline so you can see
@@ -5789,10 +5981,13 @@ impl PixelView {
             match drop {
                 PadDrop::File(p) => self.load_pad_from_file(i, &p),
                 PadDrop::Tracker(idx) => self.load_pad_from_tracker(i, idx),
+                // Alt = clone the whole pad; plain = move/swap.
+                PadDrop::Pad(src) if alt_down => self.clone_pad(src, i),
                 PadDrop::Pad(src) => self.move_pad(src, i),
             }
         }
         if let Some((i, vel)) = want_trigger {
+            self.sample_focus = false; // clicking a pad hands keyboard focus back out of the pane
             self.trigger_pad(i, vel, now);
             // Request C: clicking a pad also loads it into the top waveform editor (implicit `e`),
             // unless it's empty or already the focused pad.
@@ -13571,7 +13766,7 @@ impl PixelView {
         let mut load_kit: Option<PathBuf> = None;
         let mut open_editor = false; // enter the standalone pad editor (Kits tab / kit load)
         let mut browse_sample: Option<PathBuf> = None; // open a Samples location in the inline explorer
-        let mut load_into_editor: Option<PathBuf> = None; // a file clicked in the sample explorer
+        let mut select_sample: Option<PathBuf> = None; // a file clicked in the sample explorer (select + audition)
         let mut add_sample = false;
         let mut remove_sample: Option<usize> = None;
         let mut color_sample: Option<(usize, Option<[u8; 3]>)> = None;
@@ -13799,7 +13994,14 @@ impl PixelView {
                                 }
                                 ui.strong(elide(&short_name(&dir), 22));
                             });
-                            ui.weak("click a sample → load into editor");
+                            // The header hint reflects the hot-swap keys when the pane is focused.
+                            if self.sample_focus && self.hotswap_pad.is_some() {
+                                ui.weak("↑/↓ audition on pad · → play · Enter assign · Esc cancel");
+                            } else if self.sample_focus {
+                                ui.weak("↑/↓ browse · → play · Esc unfocus");
+                            } else {
+                                ui.weak("click a sample → load into editor (click focuses this pane)");
+                            }
                             let mut subdirs: Vec<PathBuf> = Vec::new();
                             let mut files: Vec<PathBuf> = Vec::new();
                             if let Ok(rd) = std::fs::read_dir(&dir) {
@@ -13814,56 +14016,114 @@ impl PixelView {
                             }
                             subdirs.sort();
                             files.sort();
+                            let cur_sel = self.sample_sel.clone();
+                            let focused = self.sample_focus;
                             // Fill the rest of the dock (auto_shrink false + the remaining height),
                             // so the file list doesn't stop at a fixed 320 px and leave a big blank
                             // area below it.
                             let avail_h = ui.available_height().max(80.0);
-                            egui::ScrollArea::vertical()
+                            // Full-width zebra-striped rows with a selection highlight, matching the
+                            // table view's look (the user asked to reuse that style, no headers).
+                            let sa = egui::ScrollArea::vertical()
                                 .id_salt("sample_explorer")
                                 .auto_shrink([false, false])
                                 .max_height(avail_h)
                                 .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    let row_h = 20.0;
+                                    let mut ri = 0usize; // row index for the zebra stripe
+                                    let mut row = |ui: &mut egui::Ui,
+                                                   label: String,
+                                                   is_sel: bool,
+                                                   sense: egui::Sense|
+                                     -> egui::Response {
+                                        let w = ui.available_width();
+                                        let (rect, resp) =
+                                            ui.allocate_exact_size(egui::vec2(w, row_h), sense);
+                                        let hover = resp.hovered();
+                                        let fill = if is_sel {
+                                            ui.visuals().selection.bg_fill
+                                        } else if hover {
+                                            ui.visuals().widgets.hovered.bg_fill
+                                        } else if ri % 2 == 1 {
+                                            ui.visuals().faint_bg_color
+                                        } else {
+                                            egui::Color32::TRANSPARENT
+                                        };
+                                        if fill != egui::Color32::TRANSPARENT {
+                                            ui.painter().rect_filled(rect, 0.0, fill);
+                                        }
+                                        let fg = if is_sel {
+                                            ui.visuals().strong_text_color()
+                                        } else {
+                                            ui.visuals().text_color()
+                                        };
+                                        let p = ui.painter().with_clip_rect(rect);
+                                        p.text(
+                                            rect.left_center() + egui::vec2(5.0, 0.0),
+                                            egui::Align2::LEFT_CENTER,
+                                            label,
+                                            egui::FontId::proportional(13.0),
+                                            fg,
+                                        );
+                                        if hover {
+                                            ui.ctx().request_repaint();
+                                        }
+                                        ri += 1;
+                                        resp
+                                    };
                                     for d in &subdirs {
-                                        if ui
-                                            .button(format!("📁 {}", elide(&short_name(d), 24)))
-                                            .clicked()
-                                        {
+                                        let r = row(
+                                            ui,
+                                            format!("📁 {}", elide(&short_name(d), 30)),
+                                            false,
+                                            egui::Sense::click(),
+                                        );
+                                        if r.clicked() {
                                             browse_sample = Some(d.clone());
                                         }
                                     }
                                     for f in &files {
-                                        // Click = load into the editor; DRAG = drop onto a pad to
-                                        // load it there (payload read by the pad grid on release).
-                                        let resp = ui
-                                            .add(
-                                                egui::Button::new(format!(
-                                                    "{} {}",
-                                                    icons::MUSIC,
-                                                    elide(&short_name(f), 24)
-                                                ))
-                                                .frame(false)
-                                                .sense(egui::Sense::click_and_drag()),
-                                            )
-                                            .on_hover_text(format!(
-                                                "{}\n(drag onto a pad to load it)",
-                                                f.display()
-                                            ));
-                                        if resp.dragged() {
+                                        // Click = select + audition (focuses the pane); DRAG = drop
+                                        // onto a pad to load it there.
+                                        let is_sel = cur_sel.as_deref() == Some(f.as_path());
+                                        let r = row(
+                                            ui,
+                                            format!("{} {}", icons::MUSIC, elide(&short_name(f), 30)),
+                                            is_sel,
+                                            egui::Sense::click_and_drag(),
+                                        )
+                                        .on_hover_text(format!(
+                                            "{}\n(drag onto a pad to load it)",
+                                            f.display()
+                                        ));
+                                        if r.dragged() {
                                             egui::DragAndDrop::set_payload(
                                                 ui.ctx(),
                                                 PadDrop::File(f.clone()),
                                             );
-                                            ui.ctx()
-                                                .set_cursor_icon(egui::CursorIcon::Grabbing);
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                                         }
-                                        if resp.clicked() {
-                                            load_into_editor = Some(f.clone());
+                                        if r.clicked() {
+                                            select_sample = Some(f.clone());
                                         }
                                     }
                                     if subdirs.is_empty() && files.is_empty() {
                                         ui.weak("(no audio files here)");
                                     }
                                 });
+                            // Renoise-style focus outline: shows the pane owns the keyboard (arrows).
+                            if focused {
+                                ui.painter().rect_stroke(
+                                    sa.inner_rect,
+                                    3.0,
+                                    egui::Stroke::new(
+                                        2.0,
+                                        egui::Color32::from_rgb(120, 170, 235),
+                                    ),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
                         }
                     }
                 } else {
@@ -13908,11 +14168,19 @@ impl PixelView {
         }
         if let Some(dir) = browse_sample {
             self.sample_browse = Some(dir);
+            self.sample_focus = true; // browsing focuses the pane
         }
-        if let Some(f) = load_into_editor {
-            // Show the pad editor + load the clicked sample into it, ready to shape + assign.
-            self.enter_kit_editor();
-            self.load_sample_into_editor(&f);
+        if let Some(f) = select_sample {
+            // Clicking a sample focuses the pane (Renoise-style) + auditions it. If we're editing a
+            // pad, begin/continue a hot-swap (audition ON the pad; Enter assigns, Esc reverts).
+            self.sample_focus = true;
+            if self.hotswap_pad.is_none() {
+                if let EditFocus::Pad(p) = self.edit_focus {
+                    self.hotswap_pad = Some(p);
+                    self.hotswap_orig = Some(self.pads[p].clone());
+                }
+            }
+            self.audition_sample(&f);
         }
         if let Some(i) = remove_sample {
             if i < self.sample_places.len() {
@@ -14025,6 +14293,42 @@ impl eframe::App for PixelView {
             self.immersive = !self.immersive;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.immersive));
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.immersive));
+        }
+        // Renoise-style pane focus: while the Samples pane holds keyboard focus (and is visible),
+        // its keys drive the hot-swap and are CONSUMED (consume_key) so they never also fire the
+        // grid/viewer nav bound to the same keys. ↑/↓ audition, → replay, Enter assigns to the pad,
+        // Esc aborts (and unfocuses). Gated on visibility so a stale flag can't hijack the keyboard.
+        let sample_pane_live = self.sample_focus
+            && self.show_explorer
+            && self.places_tab == 3
+            && self.sample_browse.is_some();
+        if sample_pane_live && !typing {
+            let (up, down, right, enter, esc) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                )
+            });
+            if up {
+                self.hotswap_step(-1);
+            } else if down {
+                self.hotswap_step(1);
+            } else if right {
+                if let Some(ap) = &mut self.audio_player {
+                    ap.play_region();
+                }
+            } else if enter {
+                self.hotswap_assign();
+            } else if esc {
+                self.hotswap_abort();
+                self.sample_focus = false;
+            }
+            if up || down || right || enter || esc {
+                self.want_repaint = true;
+            }
         }
         // Space plays/pauses the loaded audio preview (only when one exists, so it doesn't
         // steal Space from anything else). Restarts a finished clip.
