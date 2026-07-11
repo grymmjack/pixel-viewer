@@ -818,6 +818,14 @@ inside `caught(||…)` (the same panic guard as `decode_caught`). Both always re
   leaves an unpainted **clear-color (8,8,8) gap** between the dock and the central panel. So those
   rows are gated `if big` (the transport row uses `horizontal_wrapped` so it's safe); keep new
   compact-view rows narrow/wrapping or `big`-only.
+  **Stable header (reserved control slot):** between the transport row and the waveform sit two
+  CONDITIONAL rows — the "Editing: <source>" row and the per-pad Loop/Pitch row — each of which used to
+  appear/disappear (drilling in/out of a pad, starting a browser-sample edit) and **shove the waveform +
+  keyboard + pads up/down**. So the big view reserves a **constant 2-row slot** there: record
+  `ui.cursor().top()`, render whichever rows apply, then `add_space(target - used)` up to
+  `2·(interact_size.y + item_spacing.y)`. The waveform's Y is then fixed regardless of edit state
+  (measure-and-pad, robust to which 0/1/2 rows render). Confirmed by the user ("the UI no longer pushed
+  down").
   It draws an **interactive waveform** (hi-res peaks + a moving loop-aware playhead + shaded
   region): drag = set loop region, click = seek; plus a loop toggle, an **Autoplay** checkbox
   (persisted: play on select + loop until Stop), a Stop button, and **Spacebar** play/pause. The
@@ -931,8 +939,15 @@ set on the big editor, restored on Back — via `take_buffer`/`put_buffer` + an 
 `EditFocus::{Song,Sample,Pad}`), 🎹 MIDI-learn (`pad_assign` → next note assigns), **🔒 key-lock**
 (`icons::LOCK`/`LOCK_OPEN`, `nf-md-lock`; toggles `note_lock` — see drag-move), ⬇ WAV download,
 × clear, **M/S** (`pad_is_audible` folds mute + kit-wide solo), a **V** velocity toggle (on = track
-the played note's velocity, off = fixed 127), a volume slider, and a painted vertical
-**VU** (`pad_levels`). A pad is triggered by clicking it, or a matching note (onscreen/MIDI) via
+the played note's velocity, off = fixed 127), a short **vertical volume fader** on the right edge, and
+a painted vertical **VU** (`pad_levels`). The fader is **vertical, not a bottom row** — a horizontal
+slider row made the stacked controls taller than the short tile and overflowed into the pad below; a
+vertical fader on the right edge costs no vertical row. It's drawn in a **non-advancing `new_child`**
+(so it can't disturb the cell's horizontal layout — same gotcha as the pad-grid `scope_builder` bug)
+and kept **short + top-anchored with a ≥12px bottom margin**: a vertical slider's handle circle
+overhangs its rail ends by ~8px, so a full-height fader's bottom handle poked past the tile into the
+pad below (`fader_top = rect.top()+28`, `fader_bottom = (fader_top+42).min(rect.bottom()-12)`). A pad is
+triggered by clicking it, or a matching note (onscreen/MIDI) via
 `route_note_on`. **A pad click's X-position sets its velocity** (far left = soft 10 → far right =
 127), passed to `trigger_pad` which still gates it — only heard with the pad's **V** on (fixed 127
 when off; Global velocity wins). **Drop a sample onto a pad to load it**: the Samples-explorer file

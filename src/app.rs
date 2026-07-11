@@ -4254,9 +4254,18 @@ impl PixelView {
             let mm = |s: f32| format!("{}:{:02}", (s as u64) / 60, (s as u64) % 60);
             ui.weak(format!("{} / {}", mm(pos), mm(dur)));
         });
-        // When editing a sample loaded from the Samples browser, show its file path: click the name
-        // to jump back to its folder in the Samples explorer, or ↻ to reload it fresh (revert edits).
+        // Two CONDITIONAL control rows live between the transport and the waveform: an "Editing:
+        // <source>" row (when editing a sample/pad that has an external file) and the per-pad
+        // Loop/Pitch/loop-type row (while drilled into a pad). Each appearing/disappearing used to
+        // shove the waveform + keyboard + pads up/down — jarring. So (big view only) reserve a
+        // CONSTANT 2-row slot here and render whichever rows apply into it, padding the rest: the
+        // waveform's Y is then fixed whether or not you're editing a pad. (User request.)
         if big {
+            let row_h = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+            let target = 2.0 * row_h;
+            let y0 = ui.cursor().top();
+            // (a) Editing-source row: click the name to jump back to its folder in the Samples
+            // explorer, or ↻ to reload it fresh (revert edits).
             if let Some(src) = self.editor_source.clone() {
                 ui.horizontal_wrapped(|ui| {
                     ui.weak("Editing:");
@@ -4288,47 +4297,49 @@ impl PixelView {
                     }
                 });
             }
-        }
-        // Per-pad loop / pitch / loop-type controls while drilled into a pad (they edit the pad
-        // directly; the waveform drag sets the loop region, committed on Back). Play/trigger the
-        // pad to hear the pitch + loop-type applied.
-        if let EditFocus::Pad(i) = self.edit_focus {
-            // Big view only — this row is too wide for the compact Details player and would force
-            // the whole left dock wide.
-            if big && i < self.pads.len() {
-                ui.horizontal_wrapped(|ui| {
-                    let mut loop_on = self.pads[i].loop_on;
-                    if ui.checkbox(&mut loop_on, "Loop").changed() {
-                        self.pads[i].loop_on = loop_on;
-                        if let Some(ap) = &mut self.audio_player {
-                            ap.looping = loop_on;
-                        }
-                    }
-                    let cur = (self.pads[i].loop_type as usize).min(2);
-                    egui::ComboBox::from_id_salt("pad_loop_type")
-                        .selected_text(LOOP_TYPES[cur])
-                        .show_ui(ui, |ui| {
-                            for (t, name) in LOOP_TYPES.iter().enumerate() {
-                                if ui.selectable_label(cur == t, *name).clicked() {
-                                    self.pads[i].loop_type = t as u8;
-                                }
+            // (b) Per-pad loop / pitch / loop-type row while drilled into a pad (edits the pad
+            // directly; the waveform drag sets the loop region, committed on Back).
+            if let EditFocus::Pad(i) = self.edit_focus {
+                if i < self.pads.len() {
+                    ui.horizontal_wrapped(|ui| {
+                        let mut loop_on = self.pads[i].loop_on;
+                        if ui.checkbox(&mut loop_on, "Loop").changed() {
+                            self.pads[i].loop_on = loop_on;
+                            if let Some(ap) = &mut self.audio_player {
+                                ap.looping = loop_on;
                             }
-                        });
-                    ui.separator();
-                    ui.weak("Pitch");
-                    ui.add(
-                        egui::DragValue::new(&mut self.pads[i].pitch)
-                            .range(-24..=24)
-                            .suffix(" st"),
-                    );
-                    if ui.small_button("Oct −").clicked() {
-                        self.pads[i].pitch = (self.pads[i].pitch - 12).max(-24);
-                    }
-                    if ui.small_button("Oct +").clicked() {
-                        self.pads[i].pitch = (self.pads[i].pitch + 12).min(24);
-                    }
-                    ui.weak("· drag the waveform to set the loop · click the pad / press its key to audition");
-                });
+                        }
+                        let cur = (self.pads[i].loop_type as usize).min(2);
+                        egui::ComboBox::from_id_salt("pad_loop_type")
+                            .selected_text(LOOP_TYPES[cur])
+                            .show_ui(ui, |ui| {
+                                for (t, name) in LOOP_TYPES.iter().enumerate() {
+                                    if ui.selectable_label(cur == t, *name).clicked() {
+                                        self.pads[i].loop_type = t as u8;
+                                    }
+                                }
+                            });
+                        ui.separator();
+                        ui.weak("Pitch");
+                        ui.add(
+                            egui::DragValue::new(&mut self.pads[i].pitch)
+                                .range(-24..=24)
+                                .suffix(" st"),
+                        );
+                        if ui.small_button("Oct −").clicked() {
+                            self.pads[i].pitch = (self.pads[i].pitch - 12).max(-24);
+                        }
+                        if ui.small_button("Oct +").clicked() {
+                            self.pads[i].pitch = (self.pads[i].pitch + 12).min(24);
+                        }
+                        ui.weak("· drag the waveform to set the loop · click the pad / press its key to audition");
+                    });
+                }
+            }
+            // Pad the slot out to the constant target so the waveform never jumps.
+            let used = ui.cursor().top() - y0;
+            if used < target {
+                ui.add_space(target - used);
             }
         }
         ui.add_space(4.0);
@@ -5957,10 +5968,44 @@ impl PixelView {
                         );
                     }
 
-                    // Controls, in a child ui inset from the tile edges (minus the VU strip).
+                    // Vertical volume fader on the right edge (left of the VU meter). Vertical so it
+                    // doesn't cost a whole row of the pad's height — a horizontal slider row made the
+                    // stacked controls taller than the short tile and overflowed into the pad below.
+                    // Non-advancing `new_child` so it can't disturb the cell's horizontal layout.
+                    if !empty {
+                        // Keep the fader SHORT and well inside the tile: a vertical slider's handle
+                        // circle overhangs its rail ends by ~8px, so a full-height fader's bottom
+                        // handle poked past the tile edge into the pad below. Anchor near the top
+                        // (below the note) and cap the height with a generous bottom margin.
+                        let fader_top = rect.top() + 28.0;
+                        let fader_bottom = (fader_top + 42.0).min(rect.bottom() - 12.0);
+                        let fader = egui::Rect::from_min_max(
+                            egui::pos2(rect.right() - 30.0, fader_top),
+                            egui::pos2(rect.right() - 14.0, fader_bottom),
+                        );
+                        let mut fchild = ui.new_child(
+                            egui::UiBuilder::new().max_rect(fader).layout(
+                                egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                            ),
+                        );
+                        if fchild
+                            .add(
+                                egui::Slider::new(&mut volume, 0.0..=1.0)
+                                    .vertical()
+                                    .show_value(false),
+                            )
+                            .on_hover_text(format!("Volume {:.0}%", volume * 100.0))
+                            .changed()
+                        {
+                            want_vol = Some((i, volume));
+                        }
+                    }
+
+                    // Controls, in a child ui inset from the tile edges — leaving a right-edge strip
+                    // for the vertical volume fader + the VU meter.
                     let inner = egui::Rect::from_min_max(
                         rect.min + egui::vec2(6.0, 4.0),
-                        egui::pos2(rect.right() - 14.0, rect.bottom() - 5.0),
+                        egui::pos2(rect.right() - 32.0, rect.bottom() - 5.0),
                     );
                     // MUST be `new_child`, NOT `scope_builder`: scope_builder advances the parent's
                     // horizontal cursor by this child's min_rect (= `inner`, inset 14px from the cell's
@@ -6143,14 +6188,7 @@ impl PixelView {
                                         want_vel_track = Some(i);
                                     }
                                 });
-                                // Volume.
-                                ui.spacing_mut().slider_width = (inner.width() - 4.0).max(40.0);
-                                if ui
-                                    .add(egui::Slider::new(&mut volume, 0.0..=1.0).show_value(false))
-                                    .changed()
-                                {
-                                    want_vol = Some((i, volume));
-                                }
+                                // (Volume is the vertical fader on the right edge — see above.)
                             }
                         }
                     }
