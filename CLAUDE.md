@@ -974,10 +974,18 @@ clears on navigation (`open_folder`) or opening any file (`load_full`).
 
 **Waveform editor (`draw_audio_controls`'s interactive waveform).** A pro sample-editor interaction,
 resolved BEFORE drawing so the shade/edges track the live drag. `WaveDrag`/`Edge` model the drag:
-drag empty = new selection, drag an edge = adjust it (the opposite edge anchors → crossover swaps
-L/R), drag inside = move; a green hover line shows where a new selection begins, edges are bright-
-green handles (hot on hover/drag), the cursor is `↔`/Grab; a **full-file selection counts as no
-selection** so a drag can always start a sub-selection. `wave_view` is a zoom window: **mousewheel
+drag empty = a **fresh** selection (`WaveDrag::Select { fresh: true }`), drag an edge = **resize** it
+(`fresh: false`; the opposite edge anchors → crossover swaps L/R), drag inside = move; a green hover
+line shows where a new selection begins, edges are bright-green handles (hot on hover/drag), the
+cursor is `↔`/Grab; a **full-file selection counts as no selection** so a drag can always start a
+sub-selection, and S/E handles are drawn **only for a real sub-selection** (a whole-sample pad shows
+none — the old `|| editing_pad` forced phantom S/E at the very edges that read as "already selected").
+The anchor is captured from **`pointer.press_origin()`** (the true button-down point), not the
+post-threshold drag pos, so a selection starts exactly where you clicked; the moving edge follows the
+pointer symmetrically (`(min, max)` of anchor and pointer), so L→R and R→L both work with no
+inversion. The `fresh` flag also **suppresses the magnified edge inset** during a new-selection drag —
+otherwise it popped up the instant the pointer sat on the new moving edge and hid the waveform you
+were selecting on (the inset is for edge RESIZE / hover / wheel-nudge only). `wave_view` is a zoom window: **mousewheel
 zooms** around the cursor (consuming `smooth_scroll_delta` so the audio ScrollArea doesn't scroll;
 per-sample bars when zoomed in), **Shift+wheel pans**, double-click resets. Over an edge, **wheel
 nudges** it by 1 / Shift 10 / Shift+Alt zero-crossing sample(s) (grow vs shrink by direction), and a
@@ -996,9 +1004,11 @@ Musical: a fresh selection's anchor snaps at drag-start, its moving edge snaps w
 a slice**: selects from the boundary at/before the click to the next one after and plays just that slice
 (`want_play_region`) — so with Musical on it plays one division (a quarter-note's worth); no boundaries →
 play-from-here (`want_play_at`/`play_from`). **Off-editor drag:** an active drag is driven from our own
-`wave_drag` state + the **global** pointer (not `resp.dragged()`/`interact_pointer_pos()`, which egui
-ties to the widget), so dragging past the editor edge stays clamped at the far left/right instead of
-being dropped; it ends on the global button release. **Undo/redo selections** (`sel_undo`/`sel_redo`
+`wave_drag` state + the **global** pointer (`pointer.latest_pos()`, NOT
+`resp.dragged()`/`interact_pointer_pos()`, which egui ties to the widget and reads a stale/wrong X once
+the cursor leaves the rect — that was what inverted the selection to span the far edge), so dragging
+past the editor edge (or releasing over other UI entirely) stays clamped at the far left/right instead
+of being dropped; it ends on the global button release wherever the pointer is. **Undo/redo selections** (`sel_undo`/`sel_redo`
 stacks, ↶/↷ in the Transients row): every commit pushes the pre-change selection; cleared by
 `clear_sel_history()` when the editor's sample changes. A middle-click also drops a **neon-green ▶
 play-from marker** (`play_from_mark`) at the slice/seek origin so you can see where playback began

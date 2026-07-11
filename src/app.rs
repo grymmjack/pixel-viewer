@@ -4123,34 +4123,54 @@ impl PixelView {
             };
 
             if resp.drag_started() {
-                if let Some(pp) = resp.interact_pointer_pos() {
+                // Anchor at the TRUE press position (`press_origin`), not the post-threshold drag
+                // pos — so a fresh selection starts exactly where the button went down (a few px of
+                // threshold slop otherwise shifted every selection's start).
+                let press = ui
+                    .input(|i| i.pointer.press_origin())
+                    .or_else(|| resp.interact_pointer_pos());
+                if let Some(pp) = press {
                     let x = pp.x;
                     self.wave_drag = Some(match near_edge(x) {
-                        // Drag an edge → the OTHER edge is the fixed anchor; crossover is automatic.
-                        Some(Edge::Left) => WaveDrag::Select { anchor: sel_hi, edge: Edge::Left },
-                        Some(Edge::Right) => WaveDrag::Select { anchor: sel_lo, edge: Edge::Right },
+                        // Grab an existing edge → RESIZE (the OTHER edge is the fixed anchor;
+                        // crossover is automatic). Only possible when a real sub-selection exists.
+                        Some(Edge::Left) => WaveDrag::Select {
+                            anchor: sel_hi,
+                            edge: Edge::Left,
+                            fresh: false,
+                        },
+                        Some(Edge::Right) => WaveDrag::Select {
+                            anchor: sel_lo,
+                            edge: Edge::Right,
+                            fresh: false,
+                        },
                         // Inside the selection → shift the whole thing.
                         None if inside_sel(x) => WaveDrag::Move {
                             width: sel_hi - sel_lo,
                             grab_off: t_at(x) - sel_lo,
                         },
-                        // Empty area → start a fresh selection anchored here (snapped if enabled).
-                        None => WaveDrag::Select { anchor: snap_to(t_at(x)), edge: Edge::Right },
+                        // Anywhere else → carve a FRESH selection anchored here (snapped if enabled).
+                        None => WaveDrag::Select {
+                            anchor: snap_to(t_at(x)),
+                            edge: Edge::Right,
+                            fresh: true,
+                        },
                     });
                     // Remember the pre-drag selection so the commit can push it to the undo stack.
                     self.sel_undo_pending = Some((sel_lo, sel_hi));
                 }
             }
-            // Drive an ACTIVE drag from the GLOBAL pointer (our own `wave_drag` state), not from
-            // `resp.dragged()`/`interact_pointer_pos()` — egui ties those to the widget's own
-            // interaction, so when the cursor leaves the editor rect the drag was "forgotten".
-            // `t_at` clamps x to the visible range, so the selection stays pinned at the far
-            // left/right edge instead. End on the global button release, wherever the pointer is.
+            // Drive an ACTIVE drag from the GLOBAL pointer (`latest_pos`), NOT
+            // `resp.dragged()`/`interact_pointer_pos()` — egui ties those to the widget, so once the
+            // cursor leaves the editor rect the drag was "forgotten" (and could read a stale X,
+            // which inverted the selection). `latest_pos` is the true current pointer position even
+            // over other UI; `t_at` clamps X to the visible range, so the moving edge just pins to
+            // the far left/right. The drag ends on the GLOBAL button release, wherever the pointer is.
             if self.wave_drag.is_some() {
-                let ptr = resp
-                    .interact_pointer_pos()
-                    .or_else(|| ui.input(|i| i.pointer.interact_pos()))
-                    .or_else(|| ui.input(|i| i.pointer.latest_pos()));
+                let ptr = ui
+                    .input(|i| i.pointer.latest_pos())
+                    .or_else(|| resp.interact_pointer_pos())
+                    .or_else(|| ui.input(|i| i.pointer.interact_pos()));
                 if let (Some(drag), Some(pp)) = (self.wave_drag, ptr) {
                     let t = t_at(pp.x);
                     match drag {
@@ -4230,14 +4250,18 @@ impl PixelView {
                     want_seek = Some(t_at(pp.x));
                 }
             }
-            // Cursor feedback: ↔ over / while dragging an edge, grab inside a selection.
+            // Cursor feedback: ↔ over / while RESIZING an edge, grab inside a selection. A FRESH
+            // selection drag has no fixed edge (both endpoints move) → not treated as an edge.
             let active_edge = match self.wave_drag {
-                Some(WaveDrag::Select { edge, .. }) => Some(edge),
+                Some(WaveDrag::Select { edge, fresh: false, .. }) => Some(edge),
                 _ => None,
             };
+            let fresh_drag = matches!(self.wave_drag, Some(WaveDrag::Select { fresh: true, .. }));
             let dragging_move = matches!(self.wave_drag, Some(WaveDrag::Move { .. }));
             if resp.hovered() || self.wave_drag.is_some() {
-                let icon = if active_edge.is_some() || hovered_edge.is_some() {
+                let icon = if fresh_drag {
+                    egui::CursorIcon::Text // carving a new selection
+                } else if active_edge.is_some() || hovered_edge.is_some() {
                     egui::CursorIcon::ResizeHorizontal
                 } else if dragging_move {
                     egui::CursorIcon::Grabbing
@@ -4429,10 +4453,11 @@ impl PixelView {
             // Selection edge handles — bright green, brighter + thicker on the hovered/dragged edge.
             const GREEN: egui::Color32 = egui::Color32::from_rgb(120, 240, 150);
             const GREEN_HOT: egui::Color32 = egui::Color32::from_rgb(185, 255, 205);
-            // Show the edges for a real sub-selection, or always while editing a pad (so the pad's
-            // start/end bounds are visible even when it's the whole sample).
-            let editing_pad = matches!(self.edit_focus, EditFocus::Pad(_));
-            if draw_has_sel || editing_pad {
+            // Draw the S/E handles only for a REAL sub-selection. (Previously they were also forced
+            // on while editing a pad, which drew S/E at the very edges of a whole-sample pad — it
+            // looked like a selection already existed and made "just drag a new one" feel broken.
+            // A full-sample loop = no crop, so no handles; they appear once you carve a region.)
+            if draw_has_sel {
                 let hot = |e: Edge| {
                     active_edge == Some(e) || (active_edge.is_none() && hovered_edge == Some(e))
                 };
@@ -4512,7 +4537,14 @@ impl PixelView {
                 .nudge_lock
                 .filter(|(_, t)| now - *t < 0.6)
                 .map(|(e, _)| e);
-            let inset_edge = active_edge.or(hovered_edge).or(nudging_edge);
+            // Suppress the magnifier while carving a FRESH selection — otherwise it pops up the
+            // instant the pointer sits on the new moving edge and hides the waveform you're
+            // selecting on. It's only useful for precise edge RESIZE / hover / wheel-nudge.
+            let inset_edge = if fresh_drag {
+                None
+            } else {
+                active_edge.or(hovered_edge).or(nudging_edge)
+            };
             if self.zoom_edit_pct > 0 && nframes > 0 {
                 if let Some(edge) = inset_edge {
                     let edge_t = if edge == Edge::Left { draw_lo } else { draw_hi };
@@ -16954,7 +16986,10 @@ enum WaveDrag {
     /// Creating a selection **or** dragging one edge: `anchor` (secs) is the fixed point; the
     /// moving edge follows the pointer. Crossover is automatic — the selection is always
     /// `(min, max)` of anchor and pointer, so dragging one edge past the other just swaps them.
-    Select { anchor: f32, edge: Edge },
+    /// `fresh` distinguishes carving a **new** selection from empty (edge flips as you cross the
+    /// anchor; no magnified edge-inset) vs. **resizing** an existing edge (`edge` is that fixed
+    /// grabbed edge; the inset overlay is shown for precise placement).
+    Select { anchor: f32, edge: Edge, fresh: bool },
     /// Shifting the whole selection: its `width` (secs) + the pointer-to-`lo` offset at grab time.
     Move { width: f32, grab_off: f32 },
 }
