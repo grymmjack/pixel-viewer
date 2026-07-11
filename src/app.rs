@@ -2714,6 +2714,24 @@ impl PixelView {
         pad_wav_path(&self.data_dir, i)
     }
 
+    /// Write pad `i`'s current audio to its slot WAV (`<data>/pads/pad_NN.wav`), or remove the file
+    /// if the slot is now empty. The persistent kit reloads slot N from `pad_N.wav`, so whenever a
+    /// slot's *buffer* changes without going through `set_pad`/`clear_pad` — e.g. a drag-move swap —
+    /// the WAV must be rewritten or the slot would reload stale audio on the next launch.
+    fn persist_pad_wav(&mut self, i: usize) {
+        let path = self.pad_wav_path(i);
+        match self.pads.get(i).and_then(|p| p.buf.clone()) {
+            Some(buf) => {
+                let _ = std::fs::create_dir_all(pads_dir(&self.data_dir));
+                let _ =
+                    write_wav_16(&path, &buf.samples, buf.channels.get(), buf.sample_rate.get());
+            }
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
     /// The MIDI note that triggers pad `i`: its individual override (MIDI-learned) if set, else
     /// the auto chromatic mapping from the base note (pad 0 = base, pad 1 = base+1, …). Changing
     /// the base note remaps every non-overridden pad for free (nothing is stored for auto pads).
@@ -2728,6 +2746,30 @@ impl PixelView {
     /// Whether MIDI note `midi` triggers some loaded pad (used to colour the keyboard key red).
     fn note_routes_to_pad(&self, midi: i32) -> bool {
         (0..self.pads.len()).any(|i| !self.pads[i].is_empty() && self.pad_note(i) == midi)
+    }
+
+    /// Move/swap pad `src` onto slot `dst` (drag-and-drop rearrange). The two pads exchange slots;
+    /// each pad's firing note either **stays with the pad** (its 🔒 key-lock is on → pin its
+    /// current absolute note as an override so it keeps triggering on the same key in the new slot)
+    /// or **follows the slot** (lock off → drop the override so it takes the destination's chromatic
+    /// `base + index` default). Dropping onto an empty slot is a plain move. Notes are resolved
+    /// *before* the swap because `pad_note` reads the slot index.
+    fn move_pad(&mut self, src: usize, dst: usize) {
+        if src == dst || src >= self.pads.len() || dst >= self.pads.len() {
+            return;
+        }
+        let src_note = self.pad_note(src);
+        let dst_note = self.pad_note(dst);
+        let src_lock = self.pads[src].note_lock;
+        let dst_lock = self.pads[dst].note_lock;
+        self.pads.swap(src, dst);
+        // src's pad now lives at dst; dst's now at src. Pin (locked) or release (unlocked) each note.
+        self.pads[dst].note = if src_lock { Some(src_note) } else { None };
+        self.pads[src].note = if dst_lock { Some(dst_note) } else { None };
+        // The buffers changed slots — rewrite both slot WAVs so the kit reloads correctly.
+        self.persist_pad_wav(src);
+        self.persist_pad_wav(dst);
+        self.status = format!("Moved pad {} → {}", src + 1, dst + 1);
     }
 
     /// Route a note-on from the onscreen keyboard or a hardware MIDI key. Order: (1) MIDI-learn
@@ -2877,6 +2919,7 @@ impl PixelView {
             vel_track: if old.is_empty() { true } else { old.vel_track },
             color: old.color,
             source,
+            note_lock: old.note_lock, // reloading a sample keeps the key-lock
             flash_t: -1.0,
         };
         self.status = format!("Loaded pad {}", i + 1);
@@ -5250,6 +5293,7 @@ impl PixelView {
         let mut want_vol: Option<(usize, f32)> = None;
         let mut want_base: Option<i32> = None;
         let mut want_assign: Option<usize> = None;
+        let mut want_lock: Option<usize> = None; // toggle a pad's key-lock
         let mut want_edit: Option<usize> = None;
         let mut want_color: Option<(usize, Option<[u8; 3]>)> = None; // recolor pad i (None = clear)
         let mut rename_start: Option<usize> = None; // begin renaming pad i
@@ -5358,16 +5402,23 @@ impl PixelView {
                     let note_name = midi_note_name(self.pad_note(i) as u8);
                     let assigning = self.pad_assign == Some(i); // MIDI-learn armed on this pad
                     let color = self.pads[i].color;
+                    let note_lock = self.pads[i].note_lock; // 🔒 keeps the key across a drag-move
 
                     let (rect, resp) = ui.allocate_exact_size(
                         egui::vec2(cell_w, cell_h),
-                        egui::Sense::click(),
+                        egui::Sense::click_and_drag(),
                     );
-                    // Drag-and-drop a sample onto this pad (from the Samples explorer / tracker
-                    // list): highlight while a payload hovers, load it on release.
+                    // Drag-and-drop onto this pad: from the Samples explorer / tracker list (load a
+                    // sample) OR from another pad (move/swap). Highlight while a payload hovers, act
+                    // on release. Dragging THIS pad's body out sets a `PadDrop::Pad(i)` payload so it
+                    // can be dropped onto another slot (a click still triggers it — see below).
                     let drop_hover = resp.dnd_hover_payload::<PadDrop>().is_some();
                     if let Some(payload) = resp.dnd_release_payload::<PadDrop>() {
                         want_drop = Some((i, (*payload).clone()));
+                    }
+                    if !empty && resp.dragged() {
+                        egui::DragAndDrop::set_payload(ui.ctx(), PadDrop::Pad(i));
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                     }
                     let flash = flash_t >= 0.0 && now - flash_t < 0.18;
                     let base_bg = if empty {
@@ -5580,6 +5631,30 @@ impl PixelView {
                                     want_assign = Some(i);
                                 }
                                 if !empty {
+                                    // Key-lock: when on, dragging this pad to another slot keeps it
+                                    // firing on the same note (its key stays put); off = the note
+                                    // follows the destination slot's chromatic default.
+                                    if ui
+                                        .add(
+                                            egui::Button::new(if note_lock {
+                                                icons::LOCK
+                                            } else {
+                                                icons::LOCK_OPEN
+                                            })
+                                            .small()
+                                            .selected(note_lock),
+                                        )
+                                        .on_hover_text(if note_lock {
+                                            "Key locked: keeps firing on this note when the pad is \
+                                             dragged to another slot (click to unlock)"
+                                        } else {
+                                            "Key free: dragging the pad to another slot moves its \
+                                             note to that slot (click to lock the key in place)"
+                                        })
+                                        .clicked()
+                                    {
+                                        want_lock = Some(i);
+                                    }
                                     if ui
                                         .add(egui::Button::new("e").small())
                                         .on_hover_text(
@@ -5666,6 +5741,7 @@ impl PixelView {
             match drop {
                 PadDrop::File(p) => self.load_pad_from_file(i, &p),
                 PadDrop::Tracker(idx) => self.load_pad_from_tracker(i, idx),
+                PadDrop::Pad(src) => self.move_pad(src, i),
             }
         }
         if let Some((i, vel)) = want_trigger {
@@ -5689,6 +5765,11 @@ impl PixelView {
         }
         if let Some((i, v)) = want_vol {
             self.pads[i].volume = v;
+        }
+        if let Some(i) = want_lock {
+            if i < self.pads.len() {
+                self.pads[i].note_lock = !self.pads[i].note_lock;
+            }
         }
         if let Some(i) = want_edit {
             self.focus_pad(i);
@@ -15269,6 +15350,8 @@ mod icons {
     pub const GLOBE: &str = "\u{f01e7}"; // nf-md-earth
     pub const MUSIC: &str = "\u{f0389}"; // nf-md-music_note
     pub const PIANO: &str = "\u{f067d}"; // nf-md-piano
+    pub const LOCK: &str = "\u{f033e}"; // nf-md-lock (pad key-lock, engaged)
+    pub const LOCK_OPEN: &str = "\u{f033f}"; // nf-md-lock_open (pad key-lock, free)
 }
 
 /// A `min_size` that fits the **widest** of `labels` at the current button style, so a button
@@ -16829,6 +16912,8 @@ struct Pad {
     vel_track: bool,  // track incoming MIDI velocity (on) vs. fixed max velocity 127 (off)
     color: Option<[u8; 3]>, // optional tile color tag (right-click → colorize)
     source: Option<String>, // original sample path (for the sample-list hover); "" if unknown
+    note_lock: bool,  // key-lock: keep this pad firing on the same note when it's dragged to a new
+                      // slot (its override is pinned to the absolute note); off ⇒ note follows slot
     flash_t: f32,     // ctx time of the last trigger (green flash); transient
 }
 
@@ -16859,6 +16944,7 @@ enum Edge {
 enum PadDrop {
     File(PathBuf),  // a sample file (Samples explorer)
     Tracker(usize), // a tracker/bank sample index in the current player
+    Pad(usize),     // another pad (drag one pad onto another to move/swap them)
 }
 
 /// An in-progress waveform-editor drag. The selection itself lives on `AudioPlayer`
@@ -16899,6 +16985,7 @@ impl Pad {
             vel_track: true,
             color: None,
             source: None,
+            note_lock: false,
             flash_t: -1.0,
         }
     }
@@ -16937,6 +17024,7 @@ impl Pad {
                 .map(|c| format!("{},{},{}", c[0], c[1], c[2]))
                 .unwrap_or_default(),
             self.source.clone().unwrap_or_default(),
+            if self.note_lock { "1" } else { "0" }.to_string(),
         ]
     }
 
@@ -16967,6 +17055,7 @@ impl Pad {
                 }
             },
             source: Some(g(13)).filter(|s| !s.is_empty()),
+            note_lock: g(14) == "1", // default off (old records without the field aren't locked)
             flash_t: -1.0,
         };
         (pad, has_audio)
@@ -18108,8 +18197,17 @@ fn piano_keyboard(
     let names = ["C", "D", "E", "F", "G", "A", "B"];
     // (semitone, white-key boundary the black key centers on, within an octave)
     let black = [(1i32, 1.0f32), (3, 2.0), (6, 4.0), (8, 5.0), (10, 6.0)];
-    // Fit whole octaves at ~34 px/white-key so the keys aren't stretched.
-    let n_oct = ((rect.width() / (7.0 * 34.0)).round() as i32).clamp(1, 11);
+    // Fit whole octaves at ~34 px/white-key so the keys aren't stretched. AUTO-RANGE so every
+    // mapped pad's key (and its chip) stays visible: start no higher than the lowest mapped pad's
+    // octave and draw enough octaves to reach the highest — otherwise pads mapped below the default
+    // C4 view (common with a hardware grid controller like a Launchpad) have no key to chip. Keys
+    // shrink a little for a wide span; with no pads it's just the requested `octave` filling width.
+    let width_oct = ((rect.width() / (7.0 * 34.0)).round() as i32).clamp(1, 11);
+    let pad_lo = pad_keys.iter().map(|(s, _)| *s).min();
+    let pad_hi = pad_keys.iter().map(|(s, _)| *s).max();
+    let start = octave.min(pad_lo.map_or(octave, |s| s.div_euclid(12)));
+    let hi_oct = pad_hi.map_or(start, |s| s.div_euclid(12));
+    let n_oct = (hi_oct - start + 1).max(width_oct).clamp(1, 11);
     let ww = rect.width() / (7 * n_oct) as f32;
     let lit = |semi: i32| highlights.iter().find(|(s, _)| *s == semi).map(|(_, c)| *c);
     let pad_of = |semi: i32| pad_keys.iter().find(|(s, _)| *s == semi).map(|(_, c)| *c);
@@ -18139,7 +18237,7 @@ fn piano_keyboard(
         );
     };
     for oi in 0..n_oct {
-        let base = (octave + oi) * 12;
+        let base = (start + oi) * 12;
         for (i, &semi) in white.iter().enumerate() {
             let wi = oi * 7 + i as i32; // global white-key index
             let kr = egui::Rect::from_min_size(
@@ -18182,7 +18280,7 @@ fn piano_keyboard(
     }
     let (bw, bh) = (ww * 0.62, h * 0.6);
     for oi in 0..n_oct {
-        let base = (octave + oi) * 12;
+        let base = (start + oi) * 12;
         let oct_left = rect.left() + (oi * 7) as f32 * ww;
         for &(semi, bnd) in &black {
             let cx = oct_left + bnd * ww;
@@ -19846,6 +19944,7 @@ mod tests {
             loop_type: 2,
             color: Some([200, 50, 90]),
             source: Some("/samples/kick.wav".into()),
+            note_lock: true,
             ..Pad::empty()
         };
         let (r, has_audio) = Pad::from_record(&p.record());
@@ -19859,10 +19958,12 @@ mod tests {
         assert_eq!(r.loop_type, 2); // ping-pong survives the round-trip
         assert_eq!(r.color, Some([200, 50, 90]));
         assert_eq!(r.source.as_deref(), Some("/samples/kick.wav"));
+        assert!(r.note_lock); // key-lock survives the round-trip
         // A short/garbage row degrades gracefully to sane defaults.
         let (d, _) = Pad::from_record(&["1".to_string()]);
         assert_eq!(d.note, None);
         assert_eq!(d.volume, 1.0);
+        assert!(!d.note_lock); // missing field → unlocked
     }
 
     #[test]

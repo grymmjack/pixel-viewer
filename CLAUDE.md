@@ -857,7 +857,14 @@ the sample as a one-shot instrument — a key plays the selected region pitch-sh
 `speed()` (2^(semitone/12)); `AudioPlayer::play_note` / `play_speed` keep the playhead correct at a
 pitched tempo. Keys a **pad** is mapped to get a little **pad chip** (in the pad's tag colour);
 **hovering a mapped key** returns that key so the caller sets `kb_hover_pad` and `draw_pad_grid`
-gives that pad a **light outline** — so you can see which key drives which pad.
+gives that pad a **light outline** — so you can see which key drives which pad. The keyboard
+**auto-ranges to keep every mapped pad visible**: `piano_keyboard` starts no higher than the
+lowest mapped pad note's octave (`start = octave.min(floor(min pad_key / 12))`) and draws enough
+octaves to reach the highest, so pads mapped **below the default C4 view** (the common case with a
+hardware grid controller like a Launchpad, whose learned notes sit in the C3 range) still get a key
+to chip — otherwise their chips fell off the left edge and never drew. Keys shrink a little for a
+wide span; with no pads it's just `octave` filling the width. `octave` (Oct −/+) still pans, and
+`picked`/`hovered` stay absolute (`base + semi`, i.e. `midi − 60`) so click-to-trigger is unaffected.
 
 **Master audio controls** live flush-right in the **menu bar**, shown only while the audio
 plugin is on (`self.plugin_audio`): a **🔊/🔇 mute** speaker toggle, a **global ⏹ stop**, and a
@@ -908,13 +915,15 @@ pads fit the bottom exactly — the dividers reshape them). The big audio view i
 `ScrollArea(auto_shrink=[false;2])` so `available_height()` is real. Side docks set `min_size` so a
 drag can't shrink them into a black sliver. A `Pad` (`pads: Vec<Pad>`, always
 16) holds `buf: Option<Arc<SampleBuf>>`, an assigned MIDI `note`, `volume`/`muted`/`soloed`, and
-per-pad **pitch / loop region / loop_on / loop_type (Forward/Reverse/Ping-pong)**. Pads **auto-map
-chromatically from a base note** (`pad_base_note`, default 48 = C3, a header dropdown); `pad_note(i)`
-= the individual override (MIDI-learn) or `base + i`. Per pad: ⟲ load (captures the current editor
+per-pad **pitch / loop region / loop_on / loop_type (Forward/Reverse/Ping-pong)** + a **`note_lock`
+key-lock** (see drag-move below). Pads **auto-map chromatically from a base note** (`pad_base_note`,
+default 48 = C3, a header dropdown); `pad_note(i)` = the individual override (MIDI-learn / a pinned
+key-lock) or `base + i`. Per pad: ⟲ load (captures the current editor
 selection → `load_pad`, WAV write-through to `<data>/pads/pad_NN.wav`), **e** drill-in editor
 (`focus_pad`/`focus_back`: re-points the main waveform at the pad's sample so its loop/pitch/type are
 set on the big editor, restored on Back — via `take_buffer`/`put_buffer` + an `EditorStash`, gated by
-`EditFocus::{Song,Sample,Pad}`), 🎹 MIDI-learn (`pad_assign` → next note assigns), ⬇ WAV download,
+`EditFocus::{Song,Sample,Pad}`), 🎹 MIDI-learn (`pad_assign` → next note assigns), **🔒 key-lock**
+(`icons::LOCK`/`LOCK_OPEN`, `nf-md-lock`; toggles `note_lock` — see drag-move), ⬇ WAV download,
 × clear, **M/S** (`pad_is_audible` folds mute + kit-wide solo), a **V** velocity toggle (on = track
 the played note's velocity, off = fixed 127), a volume slider, and a painted vertical
 **VU** (`pad_levels`). A pad is triggered by clicking it, or a matching note (onscreen/MIDI) via
@@ -924,7 +933,15 @@ when off; Global velocity wins). **Drop a sample onto a pad to load it**: the Sa
 rows + the tracker "Samples (N)" rows are drag sources (`PadDrop::File(PathBuf)` / `::Tracker(usize)`
 set via `egui::DragAndDrop::set_payload`); a pad tile highlights while a payload hovers
 (`dnd_hover_payload`) and loads it on release (`dnd_release_payload` → `load_pad_from_file` /
-`load_pad_from_tracker`, both via the shared `set_pad`). **`AudioPlayer::trigger_pad_voice`** fires each hit as its own `rodio::Player` on the
+`load_pad_from_tracker`, both via the shared `set_pad`). **Drag one pad onto another to move/swap
+them** (`PadDrop::Pad(usize)` — the tile is `Sense::click_and_drag`, so a plain click still triggers
+it but a body-drag sets the payload → `move_pad(src, dst)` swaps the two slots). Each pad's firing
+note then either **stays with the pad** (its 🔒 `note_lock` is on → its current absolute note is
+pinned as an override so it keeps triggering on the **same key** in the new slot) or **follows the
+slot** (lock off → the override is dropped so it takes the destination's `base + index` default) —
+notes are resolved *before* the swap since `pad_note` reads the slot index. Because the persistent
+kit reloads slot N from `<data>/pads/pad_N.wav`, `move_pad` calls **`persist_pad_wav`** on both
+slots (rewrite/remove the WAV) so a swapped kit reloads correctly. **`AudioPlayer::trigger_pad_voice`** fires each hit as its own `rodio::Player` on the
 **shared `_stream.mixer()`** (`pad_voices: Vec<PadVoice>`, reaped each frame) — the mixer sums them,
 so pads are **polyphonic** (the base player is monophonic). Feedback (the user's ask): every played
 note lights its keyboard key (`note_flash`) — **red** if it routes to a pad, an accent otherwise — and
