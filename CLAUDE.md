@@ -1001,8 +1001,11 @@ focus a click just loads into the editor as before. The key handler is gated on 
 **visible** (`sample_focus && show_explorer && places_tab == 3 && sample_browse.is_some()`) so a stale
 flag can't hijack the keyboard.
 
-**Kit-editor "Pads (N)" list — keyboard focus + nav.** The standalone kit editor's left column
-(`audio_sample_list` when `kit_editor && big`) lists the 16 pads. It **auto-focuses** on
+**"Pads (N)" list — keyboard focus + nav.** The big audio view's left column shows the 16-pad list
+(`audio_sample_list` when `big && pad_list_visible()` — the kit editor, OR the normal audio view
+whenever a kit has loaded pads and there's no tracker "Samples (N)" list to show instead; that's why
+editing a kit pad from a plain WAV now shows the pad list too, not an empty column). It **auto-focuses**
+in the kit editor on
 `enter_kit_editor` (`pad_list_focus`, a blue focus outline — mutually exclusive with the Samples pane's
 `sample_focus`): **↑/↓** drill the editor into the prev/next **non-empty** pad (`pad_list_step` →
 `focus_pad`, so "Editing pad N" + the waveform follow), **Enter** keeps that pad edited and **swaps to

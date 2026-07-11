@@ -5420,6 +5420,19 @@ impl PixelView {
         }
     }
 
+    /// Whether the big audio view's left column shows the **"Pads (N)"** list (rather than the
+    /// tracker "Samples (N)" list): always in the standalone kit editor, and in the normal audio
+    /// view whenever a kit has loaded pads AND there's no tracker-sample list to show instead.
+    fn pad_list_visible(&self) -> bool {
+        self.plugin_audio
+            && (self.kit_editor
+                || (self.pads.iter().any(|p| !p.is_empty())
+                    && self
+                        .audio_player
+                        .as_ref()
+                        .map_or(true, |ap| ap.tracker_samples.is_empty())))
+    }
+
     /// The tracker sample explorer list (click to load into the editor, ⬇ to export a WAV).
     /// Collects into the caller's `want_*`. Empty (a non-tracker file) → renders nothing.
     fn audio_sample_list(
@@ -5429,9 +5442,10 @@ impl PixelView {
         want_sample: &mut Option<Option<usize>>,
         want_export: &mut Option<usize>,
     ) {
-        // In the standalone kit editor the list shows the 16 pads' loaded samples (a Battery-style
-        // explorer): click a row to drill the editor into that pad, hover to see its source path.
-        if self.kit_editor && big {
+        // The left column shows the 16 pads (a Battery-style explorer) whenever a kit is loaded —
+        // in the standalone kit editor OR the normal audio view: click a row to drill the editor
+        // into that pad, hover to see its source path.
+        if big && self.pad_list_visible() {
             let pads: Vec<(String, Option<String>, bool, Option<[u8; 3]>)> = self
                 .pads
                 .iter()
@@ -14416,9 +14430,9 @@ impl eframe::App for PixelView {
                 self.want_repaint = true;
             }
         }
-        // Same, for the kit-editor "Pads (N)" list: ↑/↓ drill the editor into the prev/next pad,
-        // Enter opens the sample browser for the pad (hands focus over), Esc unfocuses.
-        if self.pad_list_focus && self.kit_editor && !typing {
+        // Same, for the "Pads (N)" list (kit editor OR the normal audio view): ↑/↓ drill the editor
+        // into the prev/next pad, Enter opens the sample browser for the pad, Esc unfocuses.
+        if self.pad_list_focus && self.pad_list_visible() && !typing {
             let (up, down, enter, esc) = ctx.input_mut(|i| {
                 (
                     i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
