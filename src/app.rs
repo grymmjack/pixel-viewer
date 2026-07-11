@@ -5039,20 +5039,26 @@ impl PixelView {
                 ui.horizontal_top(|ui| {
                     let h = ui.available_height();
                     // The left pane's ROWS (full pad-sample names) overflow the narrow `left_w`
-                    // allocation, so the pane actually renders WIDER — capture its real rendered
-                    // width from the response and compute the right column from THAT. `avail` (the
-                    // split total, captured before this row) is reliable; `ui.available_width()`
-                    // inside the right column is NOT (the keyboard's non-wrapping MIDI row inflates
-                    // it), which is what sized the pad cells too wide → overflow + overlap.
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(left_w, h),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| self.audio_sample_list(ui, true, &mut want_sample, &mut want_export),
+                    // allocation. `allocate_ui_with_layout` advances the horizontal cursor by the
+                    // *rendered content* width, so that overflow shoved the divider + right column
+                    // (and thus the pad grid) rightward by a per-frame-varying amount, and the pad
+                    // list's own scrollbar bled over the first pad column (the "scrollbar on the pad"
+                    // the user saw). Fix: draw the pane into a HARD-CLIPPED `new_child` fixed to
+                    // `left_rect`, then advance the cursor by that FIXED rect via `allocate_rect` —
+                    // so nothing downstream depends on the pane's content width.
+                    let origin = ui.cursor().min;
+                    let parent_clip = ui.clip_rect();
+                    let left_rect = egui::Rect::from_min_size(origin, egui::vec2(left_w, h));
+                    let mut lchild = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(left_rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
                     );
-                    // The left pane fits EXACTLY `left_w` (its rows truncate — see `audio_sample_list`),
-                    // so the right column is deterministic: `avail` minus the pane, divider, and the
-                    // two item-spacings. Computed from `left_w` (not the rendered rect, which egui
-                    // reports inconsistently across frames → the pad cells jittered wide → overlap).
+                    lchild.set_clip_rect(left_rect.intersect(parent_clip));
+                    self.audio_sample_list(&mut lchild, true, &mut want_sample, &mut want_export);
+                    ui.allocate_rect(left_rect, egui::Sense::hover());
+                    // Right column is now deterministic: `avail` minus the fixed pane, divider, and
+                    // the two item-spacings — never the (overflowing) rendered pane width.
                     let right_w = (avail - left_w - 7.0 - sx * 2.0).max(220.0);
                     // Draggable divider — resize the sample-list pane (persisted).
                     let (dr, dresp) =

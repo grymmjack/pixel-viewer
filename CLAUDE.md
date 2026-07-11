@@ -1001,16 +1001,23 @@ focus a click just loads into the editor as before. The key handler is gated on 
 **visible** (`sample_focus && show_explorer && places_tab == 3 && sample_browse.is_some()`) so a stale
 flag can't hijack the keyboard.
 
-**Pad-grid width (overflow/overlap gotcha).** The 4×4 pad grid must be sized from an EXPLICIT
-width, never `ui.available_width()` in the split's right column — the keyboard's non-wrapping MIDI
-row inflates that ui, AND the left "Pads (N)" pane's width was **non-deterministic frame-to-frame**
-(its long rows overflowed the allocated `left_w`, and egui reported the rendered rect inconsistently),
-so `right_w`/`cell_w` jittered and the cells intermittently grew wide enough to overlap. Fixed by
-making the pane a FIXED width — its rows **truncate** (`elide` to the row's available width) and a
-readable **minimum `left_w` (300px) when `pad_list_visible()`** — then `right_w = avail - left_w -
-divider - 2·item_spacing` (deterministic; `avail` is reliable, captured before the split) is threaded
-into `draw_pad_grid(…, width)`, which sizes cells from `width.min(available)`. Verified stable
-(pixel-identical tile rects across frames) + non-overlapping at a 2741px window.
+**Pad-grid width (overflow/overlap gotcha) — the real fix is a clipped `new_child`.** The 4×4 pad
+grid must be sized from an EXPLICIT width, never `ui.available_width()` in the split's right column
+(the keyboard's non-wrapping MIDI row inflates that ui). But the *deeper* bug was the LEFT "Pads (N)"
+pane: its pad-name rows overflow the narrow `left_w`, and **`allocate_ui_with_layout` advances the
+horizontal cursor by the RENDERED CONTENT width, not the requested size** — so the overflow shoved the
+divider + right column (hence the pad grid) rightward by a per-frame-varying amount, *and* the pane's
+own ScrollArea scrollbar (drawn at the content's right edge) bled over the first pad column (the
+"scrollbar sitting on a pad" symptom). Truncating the rows / a min `left_w` did NOT fix it (egui still
+measured & advanced by the content). **The fix:** draw the left pane into a **hard-clipped
+`ui.new_child(UiBuilder::new().max_rect(left_rect)…)`** (`set_clip_rect(left_rect ∩ parent_clip)` — a
+GUARANTEE the pane's painting, scrollbar included, cannot extend past `left_w`), then advance the
+parent cursor by the FIXED rect via **`ui.allocate_rect(left_rect, …)`** (not the content). Now
+`right_w = avail - left_w - divider - 2·item_spacing` is deterministic and the grid can't be pushed or
+overlapped. Same class as the amplitude-slider gotcha (a child's measured size corrupting the parent
+layout → non-advancing `new_child`). Verified: pixel-identical tile rects across frames (positive
+3-4px gaps, no overlap) at 2741px, clean boundary, and a *scrolling* pad list (short window) keeps its
+scrollbar inside the pane.
 
 **"Pads (N)" list — keyboard focus + nav.** The big audio view's left column shows the 16-pad list
 (`audio_sample_list` when `big && pad_list_visible()` — the kit editor, OR the normal audio view
