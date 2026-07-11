@@ -5474,45 +5474,61 @@ impl PixelView {
                 .max_height(list_h)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    for (i, (name, source, has, color)) in pads.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.set_min_height(22.0);
-                            if *has
-                                && ui
-                                    .add(egui::Button::new(icons::DOWNLOAD).small().frame(false))
-                                    .on_hover_text("Export this pad as WAV")
-                                    .clicked()
-                            {
-                                pad_export = Some(i);
-                            }
-                            // A color chip on every row (default when untagged) so the names align.
-                            let chip = color.unwrap_or(if *has {
-                                [90, 100, 120]
-                            } else {
-                                [42, 45, 54]
-                            });
-                            let (cr, _) =
-                                ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
-                            ui.painter().rect_filled(
-                                cr,
-                                1.0,
-                                egui::Color32::from_rgb(chip[0], chip[1], chip[2]),
-                            );
-                            let label = if *has {
-                                format!("{:>2}. {}", i + 1, name)
-                            } else {
-                                format!("{:>2}. —", i + 1)
-                            };
-                            let mut r =
-                                ui.add_enabled(*has, egui::Button::selectable(focused == Some(i), label));
-                            if let Some(src) = source {
-                                r = r.on_hover_text(src.as_str());
-                            }
-                            if r.clicked() {
-                                pad_focus = Some(i);
+                    // Inner margin so the focus outline (drawn on the viewport edge) has a gap and
+                    // doesn't sit on top of the row controls / first row.
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(6, 4))
+                        .show(ui, |ui| {
+                            for (i, (name, source, has, color)) in pads.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.set_min_height(22.0);
+                                    if *has
+                                        && ui
+                                            .add(
+                                                egui::Button::new(icons::DOWNLOAD)
+                                                    .small()
+                                                    .frame(false),
+                                            )
+                                            .on_hover_text("Export this pad as WAV")
+                                            .clicked()
+                                    {
+                                        pad_export = Some(i);
+                                    }
+                                    // A color chip on every row (default when untagged) so the
+                                    // names align.
+                                    let chip = color.unwrap_or(if *has {
+                                        [90, 100, 120]
+                                    } else {
+                                        [42, 45, 54]
+                                    });
+                                    let (cr, _) = ui.allocate_exact_size(
+                                        egui::vec2(9.0, 9.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(
+                                        cr,
+                                        1.0,
+                                        egui::Color32::from_rgb(chip[0], chip[1], chip[2]),
+                                    );
+                                    ui.add_space(5.0); // so the name doesn't touch the chip
+                                    let label = if *has {
+                                        format!("{:>2}. {}", i + 1, name)
+                                    } else {
+                                        format!("{:>2}. —", i + 1)
+                                    };
+                                    let mut r = ui.add_enabled(
+                                        *has,
+                                        egui::Button::selectable(focused == Some(i), label),
+                                    );
+                                    if let Some(src) = source {
+                                        r = r.on_hover_text(src.as_str());
+                                    }
+                                    if r.clicked() {
+                                        pad_focus = Some(i);
+                                    }
+                                });
                             }
                         });
-                    }
                 });
             // Renoise-style focus outline — this list owns the keyboard (↑/↓/Enter).
             if list_focus {
