@@ -2967,6 +2967,13 @@ impl PixelView {
             buf.sample_rate.get(),
         );
         let old = self.pads[i].clone();
+        // Honor the sample's embedded loop (WAV `smpl` chunk / tracker loop) if it has one: seed the
+        // pad's loop region + type and turn looping on. Else a fresh whole-sample, non-looping pad
+        // (keeping the replaced pad's loop_type as before).
+        let (loop_on, loop_start, loop_end, loop_type) = match buf.loop_region {
+            Some((ls, le, lt)) => (true, ls, le, lt),
+            None => (false, 0.0, 0.0, if old.is_empty() { 0 } else { old.loop_type }),
+        };
         self.pads[i] = Pad {
             name,
             buf: Some(std::sync::Arc::new(buf)),
@@ -2975,10 +2982,10 @@ impl PixelView {
             muted: old.muted,
             soloed: old.soloed,
             pitch: if old.is_empty() { 0 } else { old.pitch },
-            loop_on: false,
-            loop_start: 0.0,
-            loop_end: 0.0,
-            loop_type: if old.is_empty() { 0 } else { old.loop_type },
+            loop_on,
+            loop_start,
+            loop_end,
+            loop_type,
             vel_track: if old.is_empty() { true } else { old.vel_track },
             color: old.color,
             source,
@@ -3007,6 +3014,7 @@ impl PixelView {
                     sample_rate: d.sample_rate,
                     duration: d.duration,
                     peaks: d.peaks,
+                    loop_region: d.loop_region,
                 };
                 self.set_pad(
                     i,
@@ -3349,6 +3357,7 @@ impl PixelView {
                             sample_rate: d.sample_rate,
                             duration: d.duration,
                             peaks: d.peaks,
+                            loop_region: d.loop_region, // pad WAVs carry no smpl chunk → None
                         }));
                     }
                 } else {
@@ -3639,6 +3648,7 @@ impl PixelView {
             duration: 1.0,
             peaks: vec![0.0f32; 256],
             tracker_samples: Vec::new(),
+            loop_region: None,
         };
         if let Ok(mut ap) = AudioPlayer::from_decoded(&kit_editor_path(), d) {
             ap.volume = self.audio_volume;
@@ -3677,6 +3687,7 @@ impl PixelView {
                         sample_rate: d.sample_rate,
                         duration: d.duration,
                         peaks: d.peaks,
+                        loop_region: d.loop_region, // seeds the editor selection to the loop
                     });
                     // Audition on click (like the tracker sample list) — loop only if Autoplay is
                     // on, so a clicked sample is actually heard. This is the "autoplay on select".
@@ -3814,17 +3825,30 @@ impl PixelView {
                 return;
             }
         };
+        let loop_region = d.loop_region;
         self.pads[p].buf = Some(std::sync::Arc::new(SampleBuf {
             samples: d.samples,
             channels: d.channels,
             sample_rate: d.sample_rate,
             duration: d.duration,
             peaks: d.peaks,
+            loop_region,
         }));
         self.pads[p].name = short_name(path);
         self.pads[p].source = Some(path.to_string_lossy().into_owned());
-        self.pads[p].loop_start = 0.0; // fresh sample → whole-sample loop
-        self.pads[p].loop_end = 0.0;
+        // Honor the file's embedded loop (WAV `smpl`) if it has one, else a whole-sample loop.
+        match loop_region {
+            Some((ls, le, lt)) => {
+                self.pads[p].loop_start = ls;
+                self.pads[p].loop_end = le;
+                self.pads[p].loop_type = lt;
+                self.pads[p].loop_on = true;
+            }
+            None => {
+                self.pads[p].loop_start = 0.0;
+                self.pads[p].loop_end = 0.0;
+            }
+        }
         self.focus_pad(p); // editor follows the pad; the "Editing pad N" context stays
         let autoplay = self.audio_autoplay;
         if let Some(ap) = &mut self.audio_player {
@@ -4160,13 +4184,23 @@ impl PixelView {
             .or(meta_dur)
             .unwrap_or(0.0)
             .max(0.1);
-        let (pos, playing, looping, sel_lo, sel_hi) = self
+        let (pos, playing, looping, sel_lo, sel_hi, ap_loop_type) = self
             .audio_player
             .as_ref()
             .filter(|_| loaded)
-            .map(|ap| (ap.pos(), ap.is_playing(), ap.looping, ap.sel_start, ap.sel_end))
-            .unwrap_or((0.0, false, self.audio_autoplay, 0.0, dur));
+            .map(|ap| {
+                (
+                    ap.pos(),
+                    ap.is_playing(),
+                    ap.looping,
+                    ap.sel_start,
+                    ap.sel_end,
+                    ap.loop_type,
+                )
+            })
+            .unwrap_or((0.0, false, self.audio_autoplay, 0.0, dur, 0));
 
+        let mut want_loop_type: Option<u8> = None; // editor loop-direction combo
         let mut want_toggle = false;
         let mut want_stop = false;
         let mut want_panic = false; // stop ALL sound (main + pads)
@@ -4335,6 +4369,37 @@ impl PixelView {
                         ui.weak("· drag the waveform to set the loop · click the pad / press its key to audition");
                     });
                 }
+            }
+            // (c) Loop controls for the EDITOR (a loaded song/sample, NOT a pad drill-in): a labeled
+            // Loop toggle + a loop-direction combo. These are the same controls the pad row has, but
+            // they edit the player — so the loop honored from the file's `smpl` chunk (or one you set)
+            // is visible and adjustable here, not only after the sample is on a pad.
+            if loaded
+                && !matches!(self.edit_focus, EditFocus::Pad(_))
+                && (self.editor_source.is_some() || path != kit_editor_path().as_path())
+            {
+                ui.horizontal_wrapped(|ui| {
+                    let mut lp = looping;
+                    if ui
+                        .checkbox(&mut lp, "Loop")
+                        .on_hover_text("Loop the selection (same as the 🔁 button)")
+                        .changed()
+                    {
+                        want_loop = Some(lp);
+                    }
+                    ui.weak("Type");
+                    let cur = (ap_loop_type as usize).min(2);
+                    egui::ComboBox::from_id_salt("editor_loop_type")
+                        .selected_text(LOOP_TYPES[cur])
+                        .show_ui(ui, |ui| {
+                            for (t, name) in LOOP_TYPES.iter().enumerate() {
+                                if ui.selectable_label(cur == t, *name).clicked() {
+                                    want_loop_type = Some(t as u8);
+                                }
+                            }
+                        });
+                    ui.weak("· forward / reverse / ping-pong while looping");
+                });
             }
             // Pad the slot out to the constant target so the waveform never jumps.
             let used = ui.cursor().top() - y0;
@@ -5217,6 +5282,14 @@ impl PixelView {
                 ap.looping = b;
                 if ap.is_playing() {
                     ap.play_region();
+                }
+            }
+        }
+        if let Some(t) = want_loop_type {
+            if let Some(ap) = &mut self.audio_player {
+                ap.loop_type = t;
+                if ap.is_playing() {
+                    ap.play_region(); // re-render the region so the new direction takes effect
                 }
             }
         }
@@ -7226,6 +7299,7 @@ impl PixelView {
     fn load_full(&mut self, ctx: &egui::Context, path: PathBuf) {
         self.kit_editor = false; // opening any file leaves the standalone pad editor
         self.editor_source = None;
+        self.edit_focus = EditFocus::Song; // a freshly-opened file isn't a pad drill-in
         let already = self
             .full_tex
             .as_ref()
@@ -17543,6 +17617,9 @@ struct SampleBuf {
     sample_rate: rodio::SampleRate,
     duration: f32,
     peaks: Vec<f32>,
+    /// Embedded loop from the file (WAV `smpl` chunk): `(start_sec, end_sec, pad_loop_type)`.
+    /// `None` = no loop metadata. Used to seed the editor selection + a pad's loop on load.
+    loop_region: Option<(f32, f32, u8)>,
 }
 
 /// One explorable, named sample extracted from a tracker module (later: a SoundFont).
@@ -17936,6 +18013,7 @@ fn decode_sample_buf(path: &Path) -> Option<SampleBuf> {
         sample_rate: d.sample_rate,
         duration: d.duration,
         peaks: d.peaks,
+        loop_region: d.loop_region,
     })
 }
 
@@ -17972,6 +18050,8 @@ struct DecodedAudio {
     duration: f32,
     peaks: Vec<f32>,
     tracker_samples: Vec<NamedSample>,
+    /// Embedded loop from a WAV `smpl` chunk: `(start_sec, end_sec, pad_loop_type)`.
+    loop_region: Option<(f32, f32, u8)>,
 }
 
 impl DecodedAudio {
@@ -18020,6 +18100,12 @@ struct AudioPlayer {
     sel_start: f32,  // playback region start (seconds); 0 = file start
     sel_end: f32,    // playback region end (seconds); == duration = to the end
     looping: bool,
+    /// The current buffer's embedded loop from its file (WAV `smpl`): `(start, end, pad_loop_type)`.
+    /// Kept so committing the editor buffer to a pad (`load_pad`) can honor the file's loop type.
+    loop_region: Option<(f32, f32, u8)>,
+    /// Live, editable loop direction for the editor preview (0 forward / 1 reverse / 2 ping-pong),
+    /// seeded from the file's embedded loop. `play_source` honors it while looping.
+    loop_type: u8,
     region_start: f32, // start of the currently-appended source (for the playhead)
     region_len: f32,   // its length (for the loop-modulo playhead)
     started: bool,     // a source has been appended at least once
@@ -18056,6 +18142,12 @@ impl AudioPlayer {
         let stream = rodio::DeviceSinkBuilder::open_default_sink().map_err(|e| e.to_string())?;
         let player = rodio::Player::connect_new(stream.mixer());
         let duration = d.duration;
+        // Seed the selection from the file's embedded loop (WAV `smpl`) if present, else the whole
+        // file — so opening a looped sample shows its loop as the selection.
+        let (sel_start, sel_end) = match d.loop_region {
+            Some((s, e, _)) => (s, e),
+            None => (0.0, duration),
+        };
         Ok(Self {
             _stream: stream,
             player,
@@ -18065,9 +18157,11 @@ impl AudioPlayer {
             sample_rate: d.sample_rate,
             duration,
             peaks: d.peaks,
-            sel_start: 0.0,
-            sel_end: duration,
+            sel_start,
+            sel_end,
             looping: false,
+            loop_region: d.loop_region,
+            loop_type: d.loop_region.map_or(0, |(_, _, t)| t),
             region_start: 0.0,
             region_len: duration.max(0.0001),
             started: false,
@@ -18090,18 +18184,23 @@ impl AudioPlayer {
             sample_rate: self.sample_rate,
             duration: self.duration,
             peaks: std::mem::take(&mut self.peaks),
+            loop_region: self.loop_region,
         }
     }
 
-    /// Install `b` as the live buffer and reset the selection/region to cover all of it.
+    /// Install `b` as the live buffer, seeding the selection from its embedded loop (WAV `smpl`) if
+    /// present, else covering all of it. Carries the loop so a later `load_pad` honors its type.
     fn put_buffer(&mut self, b: SampleBuf) {
         self.samples = b.samples;
         self.channels = b.channels;
         self.sample_rate = b.sample_rate;
         self.duration = b.duration;
         self.peaks = b.peaks;
-        self.sel_start = 0.0;
-        self.sel_end = b.duration;
+        self.loop_region = b.loop_region;
+        self.loop_type = b.loop_region.map_or(0, |(_, _, t)| t);
+        let (s, e) = b.loop_region.map_or((0.0, b.duration), |(s, e, _)| (s, e));
+        self.sel_start = s;
+        self.sel_end = e;
         self.region_start = 0.0;
         self.region_len = b.duration.max(0.0001);
         self.started = false;
@@ -18263,12 +18362,16 @@ impl AudioPlayer {
         let region: Vec<rodio::Sample> = self.samples[s..e].to_vec();
         let duration = (region.len() / ch.max(1)) as f32 / sr;
         let peaks = compute_peaks(&region, ch, 512);
+        // The captured region IS the (whole) new buffer; if the source had an embedded loop, keep
+        // its TYPE so the pad loops the captured region in the right direction (start/end span it all).
+        let loop_region = self.loop_region.map(|(_, _, t)| (0.0, duration, t));
         SampleBuf {
             samples: region,
             channels: self.channels,
             sample_rate: self.sample_rate,
             duration,
             peaks,
+            loop_region,
         }
     }
 
@@ -18283,12 +18386,25 @@ impl AudioPlayer {
         let end = self.sel_end.clamp(start, self.duration);
         let s = (((start * sr) as usize) * ch).min(n);
         let e = (((end * sr) as usize) * ch).min(n).max(s);
-        let region: Vec<rodio::Sample> = self.samples[s..e].to_vec();
+        let looping = self.looping && !one_shot;
+        // While looping, honor the loop TYPE by shaping the region: reverse plays it backwards, and
+        // ping-pong is forward-then-backward (so a repeat_infinite alternates). Forward / one-shot
+        // is the plain region.
+        let fwd = &self.samples[s..e];
+        let region: Vec<rodio::Sample> = match (looping, self.loop_type) {
+            (true, 1) => reverse_frames(fwd, ch),
+            (true, 2) => {
+                let mut v = fwd.to_vec();
+                v.extend(reverse_frames(fwd, ch));
+                v
+            }
+            _ => fwd.to_vec(),
+        };
         let buf = rodio::buffer::SamplesBuffer::new(self.channels, self.sample_rate, region)
             .speed(self.play_speed);
         let player = rodio::Player::connect_new(self._stream.mixer());
         player.set_volume(self.effective_volume()); // a fresh player defaults to full gain
-        if self.looping && !one_shot {
+        if looping {
             player.append(buf.repeat_infinite());
         } else {
             player.append(buf);
@@ -18589,6 +18705,9 @@ fn decode_audio(
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
+    // Embedded loop points from a WAV `smpl` chunk (frames), converted to seconds once the rate is
+    // known. Only the PCM branch sets it; other formats have none.
+    let mut wav_loop_frames: Option<(u32, u32, u8)> = None;
     let (samples, channels, sample_rate, tracker_samples) = if is_tracker_ext(&ext) {
         // A tracker module: synthesize the whole song for the transport, and separately
         // pull out its individual samples for the explorer/keyboard/export.
@@ -18613,6 +18732,9 @@ fn decode_audio(
         let (s, c, r) = render_midi(&bytes, &sf)?;
         (s, c, r, Vec::new())
     } else {
+        // Parse the WAV loop BEFORE the bytes are moved into the decoder (returns None for
+        // non-WAV/loop-less files).
+        wav_loop_frames = parse_wav_loop(&bytes);
         let decoder = rodio::Decoder::new(std::io::Cursor::new(bytes))
             .map_err(|_| "can't decode this audio format in-app".to_string())?;
         let channels = decoder.channels();
@@ -18625,6 +18747,16 @@ fn decode_audio(
     let frames = samples.len() / ch.max(1);
     let duration = frames as f32 / sr;
     let peaks = compute_peaks(&samples, ch, 2400);
+    // Frames → seconds, clamped to the real duration (ignore loops that point past the data).
+    let loop_region = wav_loop_frames.and_then(|(s, e, t)| {
+        (sr > 0.0 && e > s).then(|| {
+            (
+                (s as f32 / sr).min(duration),
+                (e as f32 / sr).min(duration),
+                t,
+            )
+        })
+    });
     Ok(DecodedAudio {
         samples,
         channels,
@@ -18632,7 +18764,43 @@ fn decode_audio(
         duration,
         peaks,
         tracker_samples,
+        loop_region,
     })
+}
+
+/// Parse an embedded loop from a WAV `smpl` chunk. Returns the first loop's
+/// `(start_frame, end_frame, pad_loop_type)` in **sample frames**, or `None` when there's no RIFF/
+/// WAVE header, no `smpl` chunk, or no loops. `rodio`'s decoder drops this chunk, so we scan the raw
+/// bytes ourselves. The WAV loop *type* (0 forward / 1 alternating / 2 backward) is mapped to this
+/// app's `Pad::loop_type` (0 forward / 1 reverse / 2 ping-pong) — note the 1↔2 swap.
+fn parse_wav_loop(bytes: &[u8]) -> Option<(u32, u32, u8)> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let rd = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+    let mut pos = 12usize; // first chunk after the RIFF/WAVE header
+    while pos + 8 <= bytes.len() {
+        let size = rd(pos + 4) as usize;
+        let body = pos + 8;
+        if &bytes[pos..pos + 4] == b"smpl" {
+            // Fixed 36-byte smpl header, then 24-byte loop records; read the first loop.
+            if body + 60 <= bytes.len() && rd(body + 28) >= 1 {
+                let lp = body + 36;
+                let (ltype, start, end) = (rd(lp + 4), rd(lp + 8), rd(lp + 12));
+                if end > start {
+                    let pad_type = match ltype {
+                        1 => 2u8, // alternating → ping-pong
+                        2 => 1u8, // backward → reverse
+                        _ => 0u8, // forward
+                    };
+                    return Some((start, end, pad_type));
+                }
+            }
+            return None;
+        }
+        pos = body + size + (size & 1); // chunks are word-aligned (pad odd sizes)
+    }
+    None
 }
 
 /// Extensions we play through the OPL3 FM synth (Reality Adlib Tracker modules).
@@ -18726,6 +18894,19 @@ fn extract_tracker_samples(bytes: &[u8]) -> Vec<NamedSample> {
             let rate = (base.round() as u32).clamp(1000, 192_000);
             let dur = pcm.len() as f32 / rate as f32;
             let peaks = compute_peaks(&pcm, 1, 1200);
+            // Honor a tracker sample's own loop (samples → seconds at the derived rate). xmrs has
+            // Forward / PingPong (no reverse); map to this app's Pad::loop_type (0 fwd, 2 ping-pong).
+            let loop_region = if smp.loop_length > 0 {
+                let ls = (smp.loop_start as f32 / rate as f32).min(dur);
+                let le = ((smp.loop_start + smp.loop_length) as f32 / rate as f32).min(dur);
+                match smp.loop_flag {
+                    xmrs::core::sample::LoopType::Forward if le > ls => Some((ls, le, 0u8)),
+                    xmrs::core::sample::LoopType::PingPong if le > ls => Some((ls, le, 2u8)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             let name = if smp.name.trim().is_empty() {
                 let iname = instr.name.trim();
                 if iname.is_empty() {
@@ -18744,6 +18925,7 @@ fn extract_tracker_samples(bytes: &[u8]) -> Vec<NamedSample> {
                     sample_rate: std::num::NonZeroU32::new(rate).unwrap(),
                     duration: dur,
                     peaks,
+                    loop_region,
                 },
             });
         }
@@ -20665,6 +20847,44 @@ mod tests {
         // Decoded frame count should match (mono → one sample per input sample).
         assert!((buf.samples.len() as i64 - samples.len() as i64).abs() <= 2);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parses_wav_smpl_loop_and_maps_type() {
+        let u = |v: u32| v.to_le_bytes();
+        // A minimal WAV: RIFF/WAVE, a fmt chunk + an ODD-sized data chunk (both skipped, exercising
+        // word-alignment), then a `smpl` chunk carrying one loop of the given type/start/end.
+        let build = |loop_type: u32, start: u32, end: u32| -> Vec<u8> {
+            let mut smpl = Vec::new();
+            for v in [0, 0, 0, 60, 0, 0, 0, 1, 0] {
+                smpl.extend_from_slice(&u(v)); // 36-byte header; num_loops=1 at index 7
+            }
+            for v in [0, loop_type, start, end, 0, 0] {
+                smpl.extend_from_slice(&u(v)); // 24-byte loop record: id/type/start/end/frac/count
+            }
+            let mut w = Vec::new();
+            w.extend_from_slice(b"RIFF");
+            w.extend_from_slice(&u(0)); // RIFF size (unused by the parser)
+            w.extend_from_slice(b"WAVE");
+            w.extend_from_slice(b"fmt ");
+            w.extend_from_slice(&u(16));
+            w.extend_from_slice(&[0u8; 16]);
+            w.extend_from_slice(b"data");
+            w.extend_from_slice(&u(3)); // odd size → the parser must skip the pad byte
+            w.extend_from_slice(&[0u8; 3]);
+            w.push(0); // word-align pad
+            w.extend_from_slice(b"smpl");
+            w.extend_from_slice(&u(smpl.len() as u32));
+            w.extend_from_slice(&smpl);
+            w
+        };
+        // WAV loop type → this app's Pad::loop_type (0 fwd, 1 reverse, 2 ping-pong).
+        assert_eq!(parse_wav_loop(&build(0, 100, 200)), Some((100, 200, 0))); // forward
+        assert_eq!(parse_wav_loop(&build(1, 10, 50)), Some((10, 50, 2))); // alternating → ping-pong
+        assert_eq!(parse_wav_loop(&build(2, 5, 9)), Some((5, 9, 1))); // backward → reverse
+        // Degenerate loop (end <= start) and non-WAV bytes yield None.
+        assert_eq!(parse_wav_loop(&build(0, 200, 200)), None);
+        assert_eq!(parse_wav_loop(b"not a wav file at all!!"), None);
     }
 
     #[test]

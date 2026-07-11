@@ -818,14 +818,26 @@ inside `caught(||…)` (the same panic guard as `decode_caught`). Both always re
   leaves an unpainted **clear-color (8,8,8) gap** between the dock and the central panel. So those
   rows are gated `if big` (the transport row uses `horizontal_wrapped` so it's safe); keep new
   compact-view rows narrow/wrapping or `big`-only.
-  **Stable header (reserved control slot):** between the transport row and the waveform sit two
-  CONDITIONAL rows — the "Editing: <source>" row and the per-pad Loop/Pitch row — each of which used to
-  appear/disappear (drilling in/out of a pad, starting a browser-sample edit) and **shove the waveform +
-  keyboard + pads up/down**. So the big view reserves a **constant 2-row slot** there: record
-  `ui.cursor().top()`, render whichever rows apply, then `add_space(target - used)` up to
-  `2·(interact_size.y + item_spacing.y)`. The waveform's Y is then fixed regardless of edit state
-  (measure-and-pad, robust to which 0/1/2 rows render). Confirmed by the user ("the UI no longer pushed
-  down").
+  **Stable header (reserved control slot):** between the transport row and the waveform sit
+  CONDITIONAL rows — the "Editing: <source>" row, the per-pad Loop/Pitch row (pad drill-in), and the
+  **editor Loop/Type row** (Song/Sample focus) — which appear/disappear (drilling in/out of a pad,
+  starting a browser-sample edit) and would **shove the waveform + keyboard + pads up/down**. So the big
+  view reserves a **constant 2-row slot** there: record `ui.cursor().top()`, render whichever rows apply,
+  then `add_space(target - used)` up to `2·(interact_size.y + item_spacing.y)`. The waveform's Y is then
+  fixed regardless of edit state (measure-and-pad, robust to which 0/1/2 rows render). Confirmed by the
+  user ("the UI no longer pushed down").
+  **Embedded loop points (WAV `smpl` / tracker):** `decode_audio` parses a WAV's `smpl` chunk
+  (`parse_wav_loop`, which `rodio` drops) — first loop's start/end frames + type — and
+  `extract_tracker_samples` reads xmrs sample loops; both land in `DecodedAudio.loop_region` /
+  `SampleBuf.loop_region` = `(start_sec, end_sec, pad_loop_type)`. **WAV loop type maps 0 fwd→0, 1
+  alternating→2 ping-pong, 2 backward→1 reverse** (tracker: Forward→0, PingPong→2). On load the loop is
+  honored: `from_decoded`/`put_buffer` seed the editor **selection** (`sel_start/sel_end`) + `loop_type`
+  from it; `set_pad`/`audition_on_pad` seed a pad's `loop_start/end/type` + turn `loop_on` on. The editor
+  **Loop + Type combo** (the reserved-slot row above) edits `AudioPlayer.loop_type`, and `play_source`
+  honors it — reverse plays the region backwards, ping-pong appends `reverse_frames` so a `repeat_infinite`
+  alternates (same shaping as `build_pad_region`). Pad WAVs written by `write_wav_16` carry no `smpl`
+  chunk, so a pad's loop persists via its `Pad` record, not re-parsing. `load_full` resets `edit_focus`
+  to `Song` so a freshly-opened file shows the editor Loop row, not a stale pad drill-in.
   It draws an **interactive waveform** (hi-res peaks + a moving loop-aware playhead + shaded
   region): drag = set loop region, click = seek; plus a loop toggle, an **Autoplay** checkbox
   (persisted: play on select + loop until Stop), a Stop button, and **Spacebar** play/pause. The
