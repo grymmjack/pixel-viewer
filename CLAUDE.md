@@ -1013,7 +1013,10 @@ the sample browser** (`pad_list_enter` → open the Samples tab on the pad's sou
 arm a hot-swap, hand focus to the browser — or, for a kit pad with no source file, just arm the
 hot-swap so once you pick a Samples location ↑/↓ audition on the pad), **Esc** unfocuses. Same
 `consume_key` gating as the Samples pane so the arrows never leak to grid/viewer nav; clicking a pad
-row / a pad tile / navigating (`show_folder`) clears the focus.
+row / a pad tile / navigating (`show_folder`) clears the focus. **While drilled into a pad the big
+view's heading shows the PAD's sample** (`Pad N — <name>`), not the file you opened from the grid, so
+it's clear which sound you're editing (the pad's buffer *is* in the editor — `focus_pad` swapped it in;
+only the heading used to still read the opened file's name). Back-to-Song ⇒ the file name again.
 
 **Standalone Sample-Pads editor (`kit_editor`).** Clicking the Kits tab or loading a kit shows the
 pad grid + keyboard + a **silent waveform** with no audio file open (`enter_kit_editor` → `mode =

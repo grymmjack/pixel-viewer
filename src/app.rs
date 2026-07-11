@@ -11686,7 +11686,20 @@ impl PixelView {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         ui.add_space(8.0);
-                        ui.heading(short_name(&path));
+                        // While drilled into a pad, the heading shows the PAD's sample (the sound
+                        // being edited) — not the file we came in from — so it's clear you're
+                        // editing the pad, not the opened file (the transport also shows "Editing
+                        // pad N"). Back to Song ⇒ the file name again.
+                        let title = match self.edit_focus {
+                            EditFocus::Pad(i) => self
+                                .pads
+                                .get(i)
+                                .filter(|p| !p.is_empty())
+                                .map(|p| format!("Pad {} — {}", i + 1, p.name))
+                                .unwrap_or_else(|| short_name(&path)),
+                            _ => short_name(&path),
+                        };
+                        ui.heading(title);
                     });
                     ui.add_space(10.0);
                     // A margin frame (not a horizontal→vertical nest) keeps the vertical flow, so
