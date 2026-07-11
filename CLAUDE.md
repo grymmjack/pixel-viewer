@@ -946,9 +946,12 @@ vertical fader on the right edge costs no vertical row. It's drawn in a **non-ad
 (so it can't disturb the cell's horizontal layout — same gotcha as the pad-grid `scope_builder` bug).
 Its **height FILLS the tile** (`fader_top = rect.top()+24`, `fader_bottom = rect.bottom()-14`) so it
 stretches on big tiles and shrinks as the window is resized down; a degenerate guard skips it on an
-ultra-short tile. **`fchild.set_clip_rect(rect)`** (the tile) is the hard guarantee that the slider
-handle's circular overhang can never bleed into the pad below — which is what lets the fader safely run
-the full tile height (an unclipped full-height fader's bottom handle used to poke into the pad below).
+ultra-short tile. **Critical:** a vertical `Slider`'s LENGTH is `spacing.slider_width` (default ~100px),
+**not the container height** — so it must be pinned per-tile: `fchild.spacing_mut().slider_width =
+fader_bottom - fader_top`. Without that it fell short on a big tile (empty space below) AND overflowed a
+small tile's fader rect (the default 100px length spilling past the bottom, clipped right at the border
+— the "touching the bottom line" bug). **`fchild.set_clip_rect(rect)`** (the tile) is then the hard
+guarantee that the slider handle's circular overhang can never bleed into the pad below.
 A pad is triggered by clicking it, or a matching note (onscreen/MIDI) via
 `route_note_on`. **A pad click's X-position sets its velocity** (far left = soft 10 → far right =
 127), passed to `trigger_pad` which still gates it — only heard with the pad's **V** on (fixed 127

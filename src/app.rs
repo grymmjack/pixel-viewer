@@ -5993,6 +5993,12 @@ impl PixelView {
                                 ),
                             );
                             fchild.set_clip_rect(rect.intersect(parent_clip));
+                            // A vertical Slider's LENGTH is `spacing.slider_width` (default ~100px),
+                            // NOT the container height — so on a big tile it fell short (empty space
+                            // below) and on a small tile the default length overflowed + got clipped
+                            // right at the bottom border. Pin it to the fader's own height so it fills
+                            // the tile and never overflows.
+                            fchild.spacing_mut().slider_width = (fader_bottom - fader_top).max(8.0);
                             if fchild
                                 .add(
                                     egui::Slider::new(&mut volume, 0.0..=1.0)
