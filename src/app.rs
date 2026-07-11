@@ -839,7 +839,6 @@ pub struct PixelView {
     edit_focus: EditFocus,     // what the waveform editor is pointed at (Song / Sample / a Pad drill-in)
     editor_stash: Option<EditorStash>, // saved editor state during a pad drill-in (restored on Back)
     note_flash: HashMap<i32, f32>, // MIDI note → last-played ctx time, for the keyboard key lights (transient)
-    kb_hover_pad: Option<usize>,   // pad whose mapped key is hovered on the keyboard → outline it (transient)
     last_midi_t: f32,              // ctx time of the last hardware-MIDI event, for the activity LED (transient)
     kit_name: String,   // current kit's name ("Untitled" by default; persisted)
     kit_editor: bool,   // standalone Sample-Pads view (no audio file needed); transient
@@ -1794,7 +1793,6 @@ impl PixelView {
             edit_focus: EditFocus::Song,
             editor_stash: None,
             note_flash: HashMap::new(),
-            kb_hover_pad: None,
             last_midi_t: -10.0,
             kit_name,
             octave_lock,
@@ -5490,14 +5488,13 @@ impl PixelView {
             })
             .collect();
         let kb_h = if big { self.audio_kb_h } else { 66.0 };
-        let (picked, hovered) = piano_keyboard(ui, oct, kb_h, &highlights, &pad_keys);
+        // `hovered` (the key under the pointer) is ignored: hovering a mapped key no longer outlines
+        // its pad — the colored pad chips on the keys already show the key↔pad mapping, and the
+        // outline read as a selection jumping around the grid.
+        let (picked, _) = piano_keyboard(ui, oct, kb_h, &highlights, &pad_keys);
         if let Some(semi) = picked {
             *want_note = Some(semi);
         }
-        // Hovering a mapped key outlines its pad (draw_pad_grid reads `kb_hover_pad`).
-        self.kb_hover_pad = hovered.and_then(|s| {
-            (0..self.pads.len()).find(|&i| !self.pads[i].is_empty() && self.pad_note(i) == s + 60)
-        });
         if big {
             // Resize the keyboard height (pads below get the remaining space).
             let dy = drag_h_divider(ui, ui.available_width());
@@ -5957,10 +5954,6 @@ impl PixelView {
                         egui::Stroke::new(2.5, egui::Color32::from_rgb(120, 230, 140)) // clone (Alt)
                     } else if drop_hover {
                         egui::Stroke::new(2.5, egui::Color32::from_rgb(90, 180, 255)) // drop target
-                    } else if self.kb_hover_pad == Some(i) && !empty {
-                        // Hovering this pad's key on the keyboard → light outline so you can see
-                        // the key↔pad mapping.
-                        egui::Stroke::new(2.5, egui::Color32::from_rgb(225, 230, 245))
                     } else if assigning {
                         egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 190, 70)) // MIDI-learn
                     } else if soloed {

@@ -881,9 +881,11 @@ Both player surfaces also have an **onscreen piano keyboard** (`piano_keyboard(u
 highlights, pad_keys) -> (picked, hovered)` — `h` sizes it big vs compact) + Oct −/+ to audition
 the sample as a one-shot instrument — a key plays the selected region pitch-shifted via rodio
 `speed()` (2^(semitone/12)); `AudioPlayer::play_note` / `play_speed` keep the playhead correct at a
-pitched tempo. Keys a **pad** is mapped to get a little **pad chip** (in the pad's tag colour);
-**hovering a mapped key** returns that key so the caller sets `kb_hover_pad` and `draw_pad_grid`
-gives that pad a **light outline** — so you can see which key drives which pad. The keyboard
+pitched tempo. Keys a **pad** is mapped to get a little **pad chip** (in the pad's tag colour) — the
+sole key↔pad mapping indicator. (`piano_keyboard` still returns the `hovered` key, but the caller
+ignores it: an earlier "hover a mapped key → outline its pad" highlight was removed — the bright
+outline jumping to a distant pad as the pointer crossed the keyboard read as a selection, not a hint.)
+The keyboard
 **auto-ranges to keep every mapped pad visible**: `piano_keyboard` starts no higher than the
 lowest mapped pad note's octave (`start = octave.min(floor(min pad_key / 12))`) and draws enough
 octaves to reach the highest, so pads mapped **below the default C4 view** (the common case with a
