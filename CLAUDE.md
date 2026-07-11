@@ -812,6 +812,12 @@ inside `caught(||…)` (the same panic guard as `decode_caught`). Both always re
   shared method, **`draw_audio_controls(ui, path, big, meta_dur)`**, called two ways: `ui_single`
   draws it `big` (220px waveform + 130px keyboard) filling the viewer when the open file
   `is_audio_ext`; `ui_details` draws it compact (`big=false`, 96px/66px) under the metadata grid.
+  **Compact-view width gotcha:** any wide, non-wrapping row in the `big=false` player (a long
+  single-line `ui.weak(...)` hint in an unbounded `ui.horizontal`, the pad-edit Loop/Pitch row, the
+  editor-source path) forces the whole **left dock** wider than its `size_range` max — and egui then
+  leaves an unpainted **clear-color (8,8,8) gap** between the dock and the central panel. So those
+  rows are gated `if big` (the transport row uses `horizontal_wrapped` so it's safe); keep new
+  compact-view rows narrow/wrapping or `big`-only.
   It draws an **interactive waveform** (hi-res peaks + a moving loop-aware playhead + shaded
   region): drag = set loop region, click = seek; plus a loop toggle, an **Autoplay** checkbox
   (persisted: play on select + loop until Stop), a Stop button, and **Spacebar** play/pause. The
@@ -1008,7 +1014,13 @@ play-from-here (`want_play_at`/`play_from`). **Off-editor drag:** an active drag
 `resp.dragged()`/`interact_pointer_pos()`, which egui ties to the widget and reads a stale/wrong X once
 the cursor leaves the rect — that was what inverted the selection to span the far edge), so dragging
 past the editor edge (or releasing over other UI entirely) stays clamped at the far left/right instead
-of being dropped; it ends on the global button release wherever the pointer is. **Undo/redo selections** (`sel_undo`/`sel_redo`
+of being dropped; it ends on the global button release wherever the pointer is. **Dual-waveform
+ownership (`wave_drag_big`):** the SAME audio is drawn in BOTH the big central player *and* the compact
+Details-pane player at once (both call `draw_audio_controls`, sharing the single `wave_drag`). Only the
+instance that STARTED the drag (`big` recorded at `drag_started`) may process/commit it — otherwise the
+non-owner maps the global pointer through *its own* far-away rect (→ `t` clamps to `dur`) and, on the
+release frame (it draws first), commits that bogus `(anchor, dur)` selection + clears `wave_drag` before
+the owner runs, so the selection "reverted to the far-right edge on release." **Undo/redo selections** (`sel_undo`/`sel_redo`
 stacks, ↶/↷ in the Transients row): every commit pushes the pre-change selection; cleared by
 `clear_sel_history()` when the editor's sample changes. A middle-click also drops a **neon-green ▶
 play-from marker** (`play_from_mark`) at the slice/seek origin so you can see where playback began

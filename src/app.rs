@@ -801,6 +801,9 @@ pub struct PixelView {
     audio_loading: Option<AudioLoading>, // a background audio decode in flight (spinner while pending)
     audio_autoplay: bool,      // start playing on select + loop until stopped (persisted)
     wave_drag: Option<WaveDrag>, // active waveform-editor drag (transient)
+    wave_drag_big: bool, // which waveform owns the active drag (big central vs. compact Details) —
+    // the SAME audio is drawn in BOTH at once, sharing `wave_drag`; only the owner may process/commit
+    // it, else the non-owner maps the global pointer through its own (far-away) rect and clobbers it
     nudge_lock: Option<(Edge, f32)>, // (edge, last wheel-nudge time): keep nudging it as it drifts
     wave_view: Option<(f32, f32)>, // zoomed view window (start,end secs); None = whole file (transient)
     sel_undo: Vec<(f32, f32)>,   // selection history: previous (start,end)s for undo (transient)
@@ -1736,6 +1739,7 @@ impl PixelView {
             audio_player: None,
             audio_autoplay,
             wave_drag: None,
+            wave_drag_big: false,
             sel_undo: Vec::new(),
             sel_redo: Vec::new(),
             sel_undo_pending: None,
@@ -4156,6 +4160,9 @@ impl PixelView {
                             fresh: true,
                         },
                     });
+                    // This waveform instance now OWNS the drag (big central vs. compact Details) — the
+                    // other instance, drawn in the same frame with the same `wave_drag`, must ignore it.
+                    self.wave_drag_big = big;
                     // Remember the pre-drag selection so the commit can push it to the undo stack.
                     self.sel_undo_pending = Some((sel_lo, sel_hi));
                 }
@@ -4166,7 +4173,11 @@ impl PixelView {
             // which inverted the selection). `latest_pos` is the true current pointer position even
             // over other UI; `t_at` clamps X to the visible range, so the moving edge just pins to
             // the far left/right. The drag ends on the GLOBAL button release, wherever the pointer is.
-            if self.wave_drag.is_some() {
+            // ONLY the instance that started the drag processes it — the SAME audio shows in both the
+            // big central + compact Details waveforms sharing `wave_drag`; letting the non-owner run
+            // would map the global pointer through its own far-away rect (→ t clamps to dur) and, on
+            // the release frame, commit that bogus selection + clear `wave_drag` before the owner runs.
+            if self.wave_drag.is_some() && self.wave_drag_big == big {
                 let ptr = ui
                     .input(|i| i.pointer.latest_pos())
                     .or_else(|| resp.interact_pointer_pos())
@@ -4641,7 +4652,12 @@ impl PixelView {
                 }
             }
             ui.horizontal(|ui| {
-                ui.weak("drag: select · edges: ↔ · wheel: zoom · over edge → wheel nudge ±1 (Shift 10, +Alt zero-x)");
+                // Big view only — this long single-line hint sits in an unbounded `horizontal`, so
+                // it can't wrap and would force the compact Details dock wider than its size_range
+                // max (leaving a clear-color gap between the dock and the central panel).
+                if big {
+                    ui.weak("drag: select · edges: ↔ · wheel: zoom · over edge → wheel nudge ±1 (Shift 10, +Alt zero-x)");
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     egui::ComboBox::from_id_salt("zoom_edit_pct")
                         .selected_text(if self.zoom_edit_pct == 0 {
