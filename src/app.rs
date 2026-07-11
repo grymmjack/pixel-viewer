@@ -5973,13 +5973,14 @@ impl PixelView {
                     // stacked controls taller than the short tile and overflowed into the pad below.
                     // Non-advancing `new_child` so it can't disturb the cell's horizontal layout.
                     if !empty {
-                        // The fader height SCALES with the tile — it shrinks as the window is resized
-                        // down — and is capped so it's not too tall on big tiles. `set_clip_rect(rect)`
-                        // clips the child to THIS tile, a hard guarantee that the slider handle's
-                        // circular overhang can never bleed into the pad below ("faders overlap the
-                        // pads when resized down"). A degenerate guard skips it on an ultra-short tile.
+                        // The fader FILLS the tile's height (below the note to a bottom margin), so it
+                        // stretches on big tiles and shrinks as the window is resized down.
+                        // `set_clip_rect(rect)` clips the child to THIS tile — a hard guarantee that
+                        // the slider handle's circular overhang can never bleed into the pad below (so
+                        // the fader can safely run the full tile height). Degenerate guard skips it on
+                        // an ultra-short tile.
                         let fader_top = rect.top() + 24.0;
-                        let fader_bottom = (rect.bottom() - 14.0).min(fader_top + 46.0);
+                        let fader_bottom = rect.bottom() - 14.0;
                         if fader_bottom - fader_top >= 12.0 {
                             let fader = egui::Rect::from_min_max(
                                 egui::pos2(rect.right() - 30.0, fader_top),
