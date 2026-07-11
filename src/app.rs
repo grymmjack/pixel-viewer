@@ -5026,17 +5026,34 @@ impl PixelView {
                     .map(|ap| ap.pad_levels())
                     .unwrap_or([0.0; PAD_COUNT]);
                 let avail = ui.available_width();
-                let left_w = self.audio_left_w.clamp(140.0, (avail - 220.0).max(160.0));
+                // A wider minimum when the pane shows the "Pads (N)" list, so the truncated names
+                // stay readable (the pad grid gets the rest).
+                let left_min = if self.pad_list_visible() { 300.0 } else { 140.0 };
+                let left_w = self
+                    .audio_left_w
+                    .clamp(left_min, (avail - 220.0).max(left_min));
                 let mut new_left_w = left_w;
+                let sx = ui.spacing().item_spacing.x;
                 ui.add_space(6.0);
                 ui.separator();
                 ui.horizontal_top(|ui| {
                     let h = ui.available_height();
+                    // The left pane's ROWS (full pad-sample names) overflow the narrow `left_w`
+                    // allocation, so the pane actually renders WIDER — capture its real rendered
+                    // width from the response and compute the right column from THAT. `avail` (the
+                    // split total, captured before this row) is reliable; `ui.available_width()`
+                    // inside the right column is NOT (the keyboard's non-wrapping MIDI row inflates
+                    // it), which is what sized the pad cells too wide → overflow + overlap.
                     ui.allocate_ui_with_layout(
                         egui::vec2(left_w, h),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| self.audio_sample_list(ui, true, &mut want_sample, &mut want_export),
                     );
+                    // The left pane fits EXACTLY `left_w` (its rows truncate — see `audio_sample_list`),
+                    // so the right column is deterministic: `avail` minus the pane, divider, and the
+                    // two item-spacings. Computed from `left_w` (not the rendered rect, which egui
+                    // reports inconsistently across frames → the pad cells jittered wide → overlap).
+                    let right_w = (avail - left_w - 7.0 - sx * 2.0).max(220.0);
                     // Draggable divider — resize the sample-list pane (persisted).
                     let (dr, dresp) =
                         ui.allocate_exact_size(egui::vec2(7.0, h), egui::Sense::drag());
@@ -5061,17 +5078,9 @@ impl PixelView {
                             (left_w + dresp.drag_delta().x).clamp(140.0, (avail - 220.0).max(160.0));
                     }
                     ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), h),
+                        egui::vec2(right_w, h),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
-                            // The right-column width, captured BEFORE the keyboard/MIDI rows draw:
-                            // the MIDI-picker row (long controller name + hint + Kit-Map buttons)
-                            // doesn't wrap, so it expands this column's ui past its allocated width —
-                            // which `draw_pad_grid` would then read as `available_width`, sizing the
-                            // 4 pad cells too wide (they overflow + OVERLAP). `set_max_width` won't
-                            // shrink an already-grown ui, so draw the pads in a fresh child ui HARD-
-                            // constrained to `col_w`.
-                            let col_w = ui.available_width();
                             self.audio_keyboard_section(
                                 ui,
                                 true,
@@ -5082,12 +5091,8 @@ impl PixelView {
                                 &mut want_midi_refresh,
                                 &mut want_kitmap,
                             );
-                            let grid_h = ui.available_height();
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(col_w, grid_h),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| self.draw_pad_grid(ui, now, levels),
-                            );
+                            // Pads sized from the EXPLICIT `right_w` (not the ui's inflated width).
+                            self.draw_pad_grid(ui, now, levels, right_w);
                         },
                     );
                 });
@@ -5524,8 +5529,12 @@ impl PixelView {
                                         egui::Color32::from_rgb(chip[0], chip[1], chip[2]),
                                     );
                                     ui.add_space(5.0); // so the name doesn't touch the chip
+                                    // Elide the name to the remaining row width so the pane stays
+                                    // EXACTLY its allocated width (a jittering pane width cascades into
+                                    // the pad grid, sizing its cells too wide → overlap).
+                                    let max_chars = ((ui.available_width() - 6.0) / 7.0).max(4.0) as usize;
                                     let label = if *has {
-                                        format!("{:>2}. {}", i + 1, name)
+                                        elide(&format!("{:>2}. {}", i + 1, name), max_chars)
                                     } else {
                                         format!("{:>2}. —", i + 1)
                                     };
@@ -5630,7 +5639,7 @@ impl PixelView {
     /// The 4×4 sample-pad grid (a mini Battery). `levels` are the per-pad VU peaks (from
     /// `AudioPlayer::pad_levels`) and `now` is `ctx` time (for the trigger flash). Collects its
     /// own `want_pad_*` and applies them at the end (it's a `&mut self` method, not a closure).
-    fn draw_pad_grid(&mut self, ui: &mut egui::Ui, now: f32, levels: [f32; PAD_COUNT]) {
+    fn draw_pad_grid(&mut self, ui: &mut egui::Ui, now: f32, levels: [f32; PAD_COUNT], width: f32) {
         let mut want_load: Option<usize> = None;
         let mut want_clear: Option<usize> = None;
         let mut want_download: Option<usize> = None;
@@ -5730,7 +5739,11 @@ impl PixelView {
         // Pads FILL the pad pane: width divides the pane width, height divides the *remaining*
         // vertical space (so the 4 rows fit the bottom pane exactly). The user shapes the rectangle
         // by dragging the waveform/keyboard dividers above, which changes how much height is left.
-        let cell_w = ((ui.available_width() - gap * (cols as f32 - 1.0)) / cols as f32).max(80.0);
+        // Use the EXPLICIT `width` the caller computed for the right column — NOT
+        // `ui.available_width()`, which the keyboard's non-wrapping MIDI row inflates unpredictably
+        // (frame-to-frame), sizing cells too wide → overflow/overlap.
+        let grid_w = width.min(ui.available_width().max(80.0));
+        let cell_w = ((grid_w - gap * (cols as f32 - 1.0)) / cols as f32).max(80.0);
         let cell_h = ((ui.available_height() - gap * 3.0) / 4.0).clamp(72.0, 400.0);
         let old_spacing = ui.spacing().item_spacing;
         ui.spacing_mut().item_spacing = egui::vec2(gap, gap);

@@ -1001,6 +1001,17 @@ focus a click just loads into the editor as before. The key handler is gated on 
 **visible** (`sample_focus && show_explorer && places_tab == 3 && sample_browse.is_some()`) so a stale
 flag can't hijack the keyboard.
 
+**Pad-grid width (overflow/overlap gotcha).** The 4×4 pad grid must be sized from an EXPLICIT
+width, never `ui.available_width()` in the split's right column — the keyboard's non-wrapping MIDI
+row inflates that ui, AND the left "Pads (N)" pane's width was **non-deterministic frame-to-frame**
+(its long rows overflowed the allocated `left_w`, and egui reported the rendered rect inconsistently),
+so `right_w`/`cell_w` jittered and the cells intermittently grew wide enough to overlap. Fixed by
+making the pane a FIXED width — its rows **truncate** (`elide` to the row's available width) and a
+readable **minimum `left_w` (300px) when `pad_list_visible()`** — then `right_w = avail - left_w -
+divider - 2·item_spacing` (deterministic; `avail` is reliable, captured before the split) is threaded
+into `draw_pad_grid(…, width)`, which sizes cells from `width.min(available)`. Verified stable
+(pixel-identical tile rects across frames) + non-overlapping at a 2741px window.
+
 **"Pads (N)" list — keyboard focus + nav.** The big audio view's left column shows the 16-pad list
 (`audio_sample_list` when `big && pad_list_visible()` — the kit editor, OR the normal audio view
 whenever a kit has loaded pads and there's no tracker "Samples (N)" list to show instead; that's why
