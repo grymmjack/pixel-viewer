@@ -5064,6 +5064,14 @@ impl PixelView {
                         egui::vec2(ui.available_width(), h),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
+                            // The right-column width, captured BEFORE the keyboard/MIDI rows draw:
+                            // the MIDI-picker row (long controller name + hint + Kit-Map buttons)
+                            // doesn't wrap, so it expands this column's ui past its allocated width —
+                            // which `draw_pad_grid` would then read as `available_width`, sizing the
+                            // 4 pad cells too wide (they overflow + OVERLAP). `set_max_width` won't
+                            // shrink an already-grown ui, so draw the pads in a fresh child ui HARD-
+                            // constrained to `col_w`.
+                            let col_w = ui.available_width();
                             self.audio_keyboard_section(
                                 ui,
                                 true,
@@ -5074,7 +5082,12 @@ impl PixelView {
                                 &mut want_midi_refresh,
                                 &mut want_kitmap,
                             );
-                            self.draw_pad_grid(ui, now, levels);
+                            let grid_h = ui.available_height();
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(col_w, grid_h),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| self.draw_pad_grid(ui, now, levels),
+                            );
                         },
                     );
                 });
