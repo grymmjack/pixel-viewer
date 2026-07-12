@@ -478,6 +478,14 @@ The audio player goes further than playback:
   and every individual sample is listed below the keyboard. Click one to load it — the
   waveform, transport and keyboard all follow it — or **export it as a WAV**. A *Full song*
   row jumps back to the whole module.
+- **Build a drum kit and export it to your DAW.** The big player has a **4×4 sample-pad grid**
+  (a mini Battery): drop or load samples onto pads, map them to MIDI notes (or MIDI-learn from a
+  hardware grid controller), and set per-pad volume / pitch / loop points / velocity response.
+  Save the working kit as a `.pvkit`, export every pad as a **zip of WAVs**, or export the whole
+  thing as an **SFZ instrument** — a `.sfz` next to a `<name>_samples/` folder of 16-bit WAVs that
+  loads in any SFZ-capable sampler or DAW (Bitwig, sforzando, TX16Wx, Kontakt via convert, …). Each
+  pad becomes a mapped region carrying its note, volume, pitch, loop (forward/reverse) and velocity
+  tracking.
 - **Browse a sample bank as a folder.** A **SoundFont (`.sf2`)**, **SFZ (`.sfz`)**, **DLS
   (`.dls`)**, **FastTracker II instrument (`.xi`)**, or **Renoise song/instrument
   (`.xrns`/`.xrni`)** shows as an enterable "folder"; its Details pane reports what's inside

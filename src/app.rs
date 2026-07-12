@@ -3416,6 +3416,14 @@ impl PixelView {
                 20.0 * pad.volume.log10()
             };
             sfz.push_str(&format!("volume={db:.2}\n"));
+            // Velocity → amplitude: full when the pad tracks velocity, off when it plays
+            // fixed (its V toggle off) or the kit forces one global velocity.
+            let veltrack = if self.kit_global_vel || !pad.vel_track {
+                0
+            } else {
+                100
+            };
+            sfz.push_str(&format!("amp_veltrack={veltrack}\n"));
             if pad.loop_on {
                 let (ls, le) = pad.loop_region(*dur);
                 let (sf, ef) = (
