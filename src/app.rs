@@ -8562,6 +8562,7 @@ impl PixelView {
         FxPreset {
             name,
             color: None,
+            fg: None,
             adjust_vals: self.adjust.to_array(),
             order: self.adjust.order_to_u8().to_vec(),
             postfx: self.postfx.to_record(),
@@ -8771,11 +8772,14 @@ impl PixelView {
         apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
         let color = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
         // Match the plain-thumb path: a downscaled (area-averaged) tile displays
-        // LINEAR so it isn't re-aliased; a source-res sprite stays crisp NEAREST.
-        let downscaled = self
-            .img_meta
-            .get(path)
-            .is_some_and(|m| m.w as usize > w || m.h as usize > h);
+        // LINEAR so it isn't re-aliased; a source-res sprite stays crisp NEAREST. A
+        // 16colo piece is a rendered PNG preview (like the plain remote thumb), so it
+        // stays LINEAR too — a nearest pass at tile size would shimmer.
+        let downscaled = crate::sixteen::is_remote(path)
+            || self
+                .img_meta
+                .get(path)
+                .is_some_and(|m| m.w as usize > w || m.h as usize > h);
         let opts = if downscaled {
             egui::TextureOptions::LINEAR
         } else {
@@ -8856,7 +8860,12 @@ impl PixelView {
             // path keyed by the virtual `path`); keep `path` as the cache key. Without this,
             // recoloring an opened 16colo piece read the virtual path off disk and failed.
             let real = self.resolve_local(path);
-            let (w, h, rgba) = crate::thumb::decode_thumb(&reg, &real, THUMB_PX)?;
+            let (w, h, rgba) = match crate::thumb::decode_thumb(&reg, &real, THUMB_PX) {
+                Some(d) => d,
+                // Not decodable yet (a 16colo piece not downloaded) → recolor its rendered
+                // thumbnail so the details preview still reflects the pipeline / PixelFX.
+                None => self.thumb_rgba.get(path).cloned()?,
+            };
             self.preview_src = Some((path.to_path_buf(), w, h, rgba));
         }
         let (w, h, mut rgba) = {
@@ -15071,7 +15080,8 @@ impl PixelView {
         let mut fx_save = false; // save current stack as a new preset
         let mut fx_apply: Option<usize> = None; // apply preset i
         let mut fx_remove: Option<usize> = None;
-        let mut fx_color: Option<(usize, Option<[u8; 3]>)> = None;
+        let mut fx_color: Option<(usize, Option<[u8; 3]>)> = None; // set background tint
+        let mut fx_fg: Option<(usize, Option<[u8; 3]>)> = None; // set text color
         let mut fx_rename_start: Option<usize> = None;
         let mut fx_rename_commit: Option<(usize, String)> = None;
         // Tabs: Places | Folders (one at a time, to save vertical room).
@@ -15223,12 +15233,11 @@ impl PixelView {
                         if self.pixelfx.is_empty() {
                             ui.weak("(no presets — build a look, name it, Save)");
                         }
-                        let items: Vec<(String, Option<[u8; 3]>)> = self
-                            .pixelfx
-                            .iter()
-                            .map(|p| (p.name.clone(), p.color))
-                            .collect();
-                        for (i, (name, color)) in items.iter().enumerate() {
+                        for i in 0..self.pixelfx.len() {
+                            let (name, color, fg) = {
+                                let p = &self.pixelfx[i];
+                                (p.name.clone(), p.color, p.fg)
+                            };
                             // Inline rename replaces the button while this row is renamed.
                             if matches!(&self.pixelfx_rename, Some((ri, _)) if *ri == i) {
                                 let mut buf = match &self.pixelfx_rename {
@@ -15247,17 +15256,21 @@ impl PixelView {
                                 }
                                 continue;
                             }
-                            let r = ui
-                                .add(egui::Button::new(elide(name, 22)).fill(
-                                    if let Some(c) = color {
-                                        egui::Color32::from_rgb(c[0], c[1], c[2])
-                                    } else {
-                                        ui.visuals().widgets.inactive.bg_fill
-                                    },
-                                ))
-                                .on_hover_text(
-                                    "Apply this preset · right-click to rename / colorize / remove",
-                                );
+                            let bg = color
+                                .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
+                                .unwrap_or(ui.visuals().widgets.inactive.bg_fill);
+                            // Text: an explicit fg wins; else auto black/white against the
+                            // background tag so a light tint (e.g. "1bit") stays readable.
+                            let text_col = fg
+                                .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
+                                .or_else(|| color.map(contrast_text));
+                            let mut label = egui::RichText::new(elide(&name, 22));
+                            if let Some(tc) = text_col {
+                                label = label.color(tc);
+                            }
+                            let r = ui.add(egui::Button::new(label).fill(bg)).on_hover_text(
+                                "Apply this preset · right-click to rename / recolor / remove",
+                            );
                             if r.clicked() {
                                 fx_apply = Some(i);
                             }
@@ -15271,49 +15284,25 @@ impl PixelView {
                                     ui.close();
                                 }
                                 ui.separator();
-                                if ui.button("× Clear color").clicked() {
+                                ui.weak("Background");
+                                if ui.button("× Clear").clicked() {
                                     fx_color = Some((i, None));
                                     ui.close();
                                 }
-                                egui::Grid::new(("pixelfx_color_grid", i))
-                                    .spacing([1.0, 1.0])
-                                    .min_col_width(0.0)
-                                    .show(ui, |ui| {
-                                        for (n, &c) in ansi32_palette().iter().enumerate() {
-                                            if n > 0 && n % 8 == 0 {
-                                                ui.end_row();
-                                            }
-                                            let (rect, resp) = ui.allocate_exact_size(
-                                                egui::vec2(18.0, 18.0),
-                                                egui::Sense::click(),
-                                            );
-                                            ui.painter().rect_filled(
-                                                rect,
-                                                0.0,
-                                                egui::Color32::from_rgb(c[0], c[1], c[2]),
-                                            );
-                                            let outline = if *color == Some(c) {
-                                                egui::Stroke::new(2.0, egui::Color32::WHITE)
-                                            } else if resp.hovered() {
-                                                egui::Stroke::new(1.0, egui::Color32::WHITE)
-                                            } else {
-                                                egui::Stroke::new(
-                                                    1.0,
-                                                    egui::Color32::from_black_alpha(70),
-                                                )
-                                            };
-                                            ui.painter().rect_stroke(
-                                                rect,
-                                                0.0,
-                                                outline,
-                                                egui::StrokeKind::Inside,
-                                            );
-                                            if resp.clicked() {
-                                                fx_color = Some((i, Some(c)));
-                                                ui.close();
-                                            }
-                                        }
-                                    });
+                                if let Some(c) = ansi32_swatch_grid(ui, ("pixelfx_bg", i), color) {
+                                    fx_color = Some((i, Some(c)));
+                                    ui.close();
+                                }
+                                ui.separator();
+                                ui.weak("Text");
+                                if ui.button("× Clear (auto)").clicked() {
+                                    fx_fg = Some((i, None));
+                                    ui.close();
+                                }
+                                if let Some(c) = ansi32_swatch_grid(ui, ("pixelfx_fg", i), fg) {
+                                    fx_fg = Some((i, Some(c)));
+                                    ui.close();
+                                }
                             });
                         }
                     } else {
@@ -15661,11 +15650,12 @@ impl PixelView {
                 }
             };
             let preset = self.capture_fx_preset(name.clone());
-            // Overwrite a same-named preset (keeping its color tag), else append.
+            // Overwrite a same-named preset (keeping its color tags), else append.
             if let Some(slot) = self.pixelfx.iter_mut().find(|p| p.name == name) {
-                let color = slot.color;
+                let (color, fg) = (slot.color, slot.fg);
                 *slot = preset;
                 slot.color = color;
+                slot.fg = fg;
             } else {
                 self.pixelfx.push(preset);
             }
@@ -15688,6 +15678,11 @@ impl PixelView {
         if let Some((i, c)) = fx_color {
             if let Some(p) = self.pixelfx.get_mut(i) {
                 p.color = c;
+            }
+        }
+        if let Some((i, c)) = fx_fg {
+            if let Some(p) = self.pixelfx.get_mut(i) {
+                p.fg = c;
             }
         }
         if let Some(i) = fx_rename_start {
@@ -15988,6 +15983,12 @@ impl eframe::App for PixelView {
                 color,
                 egui::TextureOptions::LINEAR,
             );
+            // Keep the rendered PNG's CPU pixels so the recolor pipeline (adjustments /
+            // PixelFX / reduce / dither, "Apply to grid" + the details preview) can run
+            // on a 16colo piece — it's a rendered preview, not our decode, but recoloring
+            // it gives live feedback without downloading the raw art.
+            self.thumb_rgba
+                .insert(r.path.clone(), (r.width, r.height, r.rgba));
             self.thumb_tex.insert(r.path, tex);
             self.want_repaint = true;
         }
@@ -17189,6 +17190,44 @@ fn contrast_text(c: [u8; 3]) -> egui::Color32 {
     }
 }
 
+/// Draw the bundled ANSI32 palette as a compact clickable swatch grid (for a
+/// color-tag menu). `current` gets a white outline. Returns the clicked color, if any
+/// — the caller stores it and closes the menu. Shared by the PixelFX bg/text pickers.
+fn ansi32_swatch_grid(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    current: Option<[u8; 3]>,
+) -> Option<[u8; 3]> {
+    let mut picked = None;
+    egui::Grid::new(id)
+        .spacing([1.0, 1.0])
+        .min_col_width(0.0)
+        .show(ui, |ui| {
+            for (n, &c) in ansi32_palette().iter().enumerate() {
+                if n > 0 && n % 8 == 0 {
+                    ui.end_row();
+                }
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                ui.painter()
+                    .rect_filled(rect, 0.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
+                let outline = if current == Some(c) {
+                    egui::Stroke::new(2.0, egui::Color32::WHITE)
+                } else if resp.hovered() {
+                    egui::Stroke::new(1.0, egui::Color32::WHITE)
+                } else {
+                    egui::Stroke::new(1.0, egui::Color32::from_black_alpha(70))
+                };
+                ui.painter()
+                    .rect_stroke(rect, 0.0, outline, egui::StrokeKind::Inside);
+                if resp.clicked() {
+                    picked = Some(c);
+                }
+            }
+        });
+    picked
+}
+
 /// Blend `base` a fraction `t` (0..1) toward the sRGB accent `accent`. A cheap linear mix in
 /// gamma space — plenty for a subtle tile-background tint (see `tile_category_bg`).
 fn blend_toward(base: egui::Color32, accent: [u8; 3], t: f32) -> egui::Color32 {
@@ -17853,7 +17892,8 @@ impl PostFx {
 #[serde(default)]
 struct FxPreset {
     name: String,
-    color: Option<[u8; 3]>, // Places button tint (ANSI32 swatch), like favorites
+    color: Option<[u8; 3]>, // Places button background tint (ANSI32 swatch)
+    fg: Option<[u8; 3]>,    // button text color override (else auto black/white for contrast)
     adjust_vals: [f32; 12], // Adjust::to_array()
     order: Vec<u8>,         // Adjust::order_to_u8() — portable across op additions
     postfx: Vec<f32>,       // PostFx::to_record()
@@ -17883,6 +17923,7 @@ impl Default for FxPreset {
         Self {
             name: String::new(),
             color: None,
+            fg: None,
             adjust_vals: Adjust::default().to_array(),
             order: Adjust::default().order_to_u8().to_vec(),
             postfx: PostFx::default().to_record(),
