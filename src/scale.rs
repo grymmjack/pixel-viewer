@@ -8,11 +8,13 @@
 //! byte buffers, comparing whole `[u8; 4]` pixels for equality, so it's self-contained
 //! (no image-crate/version coupling) and unit-testable.
 //!
-//! Implemented so far: the classic hard-edge family (Scale2x/EPX, Scale3x, Eagle 2×/3×),
-//! **xBR 2×/3×/4×** (edge-directed blending — 2×/3× ported faithfully from
-//! libxbr-standalone's FILT2/FILT3, 4× = 2× chained), and **HQ2x/3x/4x** (the
-//! lookup-table family, via the `hqx` crate — bridged through `hqx_scale`). `Scaler`
-//! is the enum the UI + persistence key off; a new algorithm is one variant + one fn.
+//! Implemented: the hard-edge family (Scale2x/EPX, Scale3x, Eagle 2×/3×), **xBR
+//! 2×/3×/4×** (edge-directed blending — 2×/3× ported from libxbr-standalone's
+//! FILT2/FILT3, 4× = 2× chained), **HQ2x/3x/4x** (lookup-table family, via the `hqx`
+//! crate through `hqx_scale`), and the **2xSaI / Super2xSaI / SuperEagle** trio (ported
+//! verbatim from snes9x's `2xsai.cpp`, RGBA per-channel averaging in place of the C's
+//! 16-bit colour-mask tricks). `Scaler` is the enum the UI + persistence key off; a new
+//! algorithm is one variant + one fn.
 
 /// Which pixel-art upscaler to apply (or `None` = leave the source untouched).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -29,11 +31,14 @@ pub enum Scaler {
     Hq2x,
     Hq3x,
     Hq4x,
+    Sai2x,
+    Super2xSai,
+    SuperEagle,
 }
 
 impl Scaler {
     /// Every scaler, in menu order. `ALL[i] as u8 == i`, so the index persists.
-    pub const ALL: [Scaler; 11] = [
+    pub const ALL: [Scaler; 14] = [
         Scaler::None,
         Scaler::Scale2x,
         Scaler::Scale3x,
@@ -45,6 +50,9 @@ impl Scaler {
         Scaler::Hq2x,
         Scaler::Hq3x,
         Scaler::Hq4x,
+        Scaler::Sai2x,
+        Scaler::Super2xSai,
+        Scaler::SuperEagle,
     ];
 
     pub fn from_u8(b: u8) -> Scaler {
@@ -64,6 +72,9 @@ impl Scaler {
             Scaler::Hq2x => "HQ2x",
             Scaler::Hq3x => "HQ3x",
             Scaler::Hq4x => "HQ4x",
+            Scaler::Sai2x => "2xSaI",
+            Scaler::Super2xSai => "Super2xSaI",
+            Scaler::SuperEagle => "SuperEagle",
         }
     }
 
@@ -71,9 +82,9 @@ impl Scaler {
     pub fn factor(self) -> usize {
         match self {
             Scaler::None => 1,
-            Scaler::Scale2x | Scaler::Eagle2x | Scaler::Xbr2x | Scaler::Hq2x => 2,
             Scaler::Scale3x | Scaler::Eagle3x | Scaler::Xbr3x | Scaler::Hq3x => 3,
             Scaler::Xbr4x | Scaler::Hq4x => 4,
+            _ => 2, // Scale2x, Eagle2x, xBR2x, HQ2x, 2xSaI, Super2xSaI, SuperEagle
         }
     }
 
@@ -96,6 +107,9 @@ impl Scaler {
             Scaler::Hq2x => hqx_scale(&src, 2),
             Scaler::Hq3x => hqx_scale(&src, 3),
             Scaler::Hq4x => hqx_scale(&src, 4),
+            Scaler::Sai2x => sai2x(&src),
+            Scaler::Super2xSai => super_2xsai(&src),
+            Scaler::SuperEagle => super_eagle(&src),
         }
     }
 }
@@ -554,6 +568,327 @@ fn hqx_scale(s: &Grid, factor: usize) -> (Vec<u8>, usize, usize) {
         .iter()
         .flat_map(|&v| [(v >> 16) as u8, (v >> 8) as u8, v as u8, (v >> 24) as u8])
         .collect();
+    (out, ow, oh)
+}
+
+// ---------------------------------------------------------------------------------
+// 2xSaI family (Derek Liauw Kie Fa / "Kreed") — ported verbatim from the snes9x
+// `2xsai.cpp` (2xSaI / Super2xSaI / SuperEagle). `INTERPOLATE` = 2-pixel average,
+// `Q_INTERPOLATE` = 4-pixel average (here per-channel RGBA; the C's colour-mask
+// bit-tricks are just that). `GetResult*` vote on pixel equality and port directly.
+// ---------------------------------------------------------------------------------
+
+/// 2-pixel average (INTERPOLATE), per channel.
+#[inline]
+fn avg2(a: [u8; 4], b: [u8; 4]) -> [u8; 4] {
+    std::array::from_fn(|k| ((a[k] as u16 + b[k] as u16) >> 1) as u8)
+}
+
+/// 4-pixel average (Q_INTERPOLATE), per channel.
+#[inline]
+fn avg4(a: [u8; 4], b: [u8; 4], c: [u8; 4], d: [u8; 4]) -> [u8; 4] {
+    std::array::from_fn(|k| ((a[k] as u16 + b[k] as u16 + c[k] as u16 + d[k] as u16) >> 2) as u8)
+}
+
+/// `GetResult` / `GetResult1` (GetResult1's 5th arg is unused in the C).
+#[inline]
+fn gr(a: [u8; 4], b: [u8; 4], c: [u8; 4], d: [u8; 4]) -> i32 {
+    let (mut x, mut y, mut r) = (0, 0, 0);
+    if a == c {
+        x += 1;
+    } else if b == c {
+        y += 1;
+    }
+    if a == d {
+        x += 1;
+    } else if b == d {
+        y += 1;
+    }
+    if x <= 1 {
+        r += 1;
+    }
+    if y <= 1 {
+        r -= 1;
+    }
+    r
+}
+
+/// `GetResult2` — same as `gr` but the two increments are sign-swapped.
+#[inline]
+fn gr2(a: [u8; 4], b: [u8; 4], c: [u8; 4], d: [u8; 4]) -> i32 {
+    -gr(a, b, c, d)
+}
+
+/// **2xSaI** — the original. 4×4 neighbourhood colorA..P (A = centre). Output 2×2 is
+/// [A (TL), product (TR), product1 (BL), product2 (BR)].
+#[allow(clippy::nonminimal_bool)]
+fn sai2x(s: &Grid) -> (Vec<u8>, usize, usize) {
+    let (ow, oh) = (s.w * 2, s.h * 2);
+    let mut out = vec![0u8; ow * oh * 4];
+    for y in 0..s.h as isize {
+        for x in 0..s.w as isize {
+            let (ci, ce, cf, cj) = (
+                s.at(x - 1, y - 1),
+                s.at(x, y - 1),
+                s.at(x + 1, y - 1),
+                s.at(x + 2, y - 1),
+            );
+            let (cg, ca, cb, ck) = (s.at(x - 1, y), s.at(x, y), s.at(x + 1, y), s.at(x + 2, y));
+            let (ch, cc, cd, cl) = (
+                s.at(x - 1, y + 1),
+                s.at(x, y + 1),
+                s.at(x + 1, y + 1),
+                s.at(x + 2, y + 1),
+            );
+            let (cm, cn, co, cp) = (
+                s.at(x - 1, y + 2),
+                s.at(x, y + 2),
+                s.at(x + 1, y + 2),
+                s.at(x + 2, y + 2),
+            );
+            let _ = (ck, cp); // read for completeness; unused by 2xSaI's rules
+            let (product, product1, product2) = if ca == cd && cb != cc {
+                let p = if (ca == ce && cb == cl) || (ca == cc && ca == cf && cb != ce && cb == cj)
+                {
+                    ca
+                } else {
+                    avg2(ca, cb)
+                };
+                let p1 = if (ca == cg && cc == co) || (ca == cb && ca == ch && cg != cc && cc == cm)
+                {
+                    ca
+                } else {
+                    avg2(ca, cc)
+                };
+                (p, p1, ca)
+            } else if cb == cc && ca != cd {
+                let p = if (cb == cf && ca == ch) || (cb == ce && cb == cd && ca != cf && ca == ci)
+                {
+                    cb
+                } else {
+                    avg2(ca, cb)
+                };
+                let p1 = if (cc == ch && ca == cf) || (cc == cg && cc == cd && ca != ch && ca == ci)
+                {
+                    cc
+                } else {
+                    avg2(ca, cc)
+                };
+                (p, p1, cb)
+            } else if ca == cd && cb == cc {
+                if ca == cb {
+                    (ca, ca, ca)
+                } else {
+                    let p1 = avg2(ca, cc);
+                    let p = avg2(ca, cb);
+                    let r = gr(ca, cb, cg, ce)
+                        + gr2(cb, ca, ck, cf)
+                        + gr2(cb, ca, ch, cn)
+                        + gr(ca, cb, cl, co);
+                    let p2 = if r > 0 {
+                        ca
+                    } else if r < 0 {
+                        cb
+                    } else {
+                        avg4(ca, cb, cc, cd)
+                    };
+                    (p, p1, p2)
+                }
+            } else {
+                let p = if ca == cc && ca == cf && cb != ce && cb == cj {
+                    ca
+                } else if cb == ce && cb == cd && ca != cf && ca == ci {
+                    cb
+                } else {
+                    avg2(ca, cb)
+                };
+                let p1 = if ca == cb && ca == ch && cg != cc && cc == cm {
+                    ca
+                } else if cc == cg && cc == cd && ca != ch && ca == ci {
+                    cc
+                } else {
+                    avg2(ca, cc)
+                };
+                (p, p1, avg4(ca, cb, cc, cd))
+            };
+            put_cell(
+                &mut out,
+                ow,
+                x as usize,
+                y as usize,
+                2,
+                &[ca, product, product1, product2],
+            );
+        }
+    }
+    (out, ow, oh)
+}
+
+/// The Super2xSaI / SuperEagle 4×4 neighbourhood (centre = c5; c2 is the pixel below).
+#[rustfmt::skip]
+struct Sai {
+    b0: [u8;4], b1: [u8;4], b2: [u8;4], b3: [u8;4],
+    c4: [u8;4], c5: [u8;4], c6: [u8;4], s2: [u8;4],
+    c1: [u8;4], c2: [u8;4], c3: [u8;4], s1: [u8;4],
+    a0: [u8;4], a1: [u8;4], a2: [u8;4], a3: [u8;4],
+}
+
+#[rustfmt::skip]
+fn read_sai(s: &Grid, x: isize, y: isize) -> Sai {
+    Sai {
+        b0: s.at(x-1,y-1), b1: s.at(x,y-1), b2: s.at(x+1,y-1), b3: s.at(x+2,y-1),
+        c4: s.at(x-1,y),   c5: s.at(x,y),   c6: s.at(x+1,y),   s2: s.at(x+2,y),
+        c1: s.at(x-1,y+1), c2: s.at(x,y+1), c3: s.at(x+1,y+1), s1: s.at(x+2,y+1),
+        a0: s.at(x-1,y+2), a1: s.at(x,y+2), a2: s.at(x+1,y+2), a3: s.at(x+2,y+2),
+    }
+}
+
+/// **Super2xSaI**. Output 2×2 = [p1a (TL), p1b (TR), p2a (BL), p2b (BR)].
+#[allow(clippy::nonminimal_bool)]
+fn super_2xsai(s: &Grid) -> (Vec<u8>, usize, usize) {
+    let (ow, oh) = (s.w * 2, s.h * 2);
+    let mut out = vec![0u8; ow * oh * 4];
+    for y in 0..s.h as isize {
+        for x in 0..s.w as isize {
+            let n = read_sai(s, x, y);
+            let (c1, c2, c3, c4, c5, c6) = (n.c1, n.c2, n.c3, n.c4, n.c5, n.c6);
+            let (a0, a1, a2, a3, b0, b1, b2, b3, s1, s2) =
+                (n.a0, n.a1, n.a2, n.a3, n.b0, n.b1, n.b2, n.b3, n.s1, n.s2);
+            // Right column (p1b top-right, p2b bottom-right).
+            let (p1b, p2b) = if c2 == c6 && c5 != c3 {
+                (c2, c2)
+            } else if c5 == c3 && c2 != c6 {
+                (c5, c5)
+            } else if c5 == c3 && c2 == c6 && c5 != c6 {
+                let r = gr(c6, c5, c1, a1)
+                    + gr(c6, c5, c4, b1)
+                    + gr(c6, c5, a2, s1)
+                    + gr(c6, c5, b2, s2);
+                let v = if r > 0 {
+                    c6
+                } else if r < 0 {
+                    c5
+                } else {
+                    avg2(c5, c6)
+                };
+                (v, v)
+            } else {
+                let p2b = if c6 == c3 && c3 == a1 && c2 != a2 && c3 != a0 {
+                    avg4(c3, c3, c3, c2)
+                } else if c5 == c2 && c2 == a2 && a1 != c3 && c2 != a3 {
+                    avg4(c2, c2, c2, c3)
+                } else {
+                    avg2(c2, c3)
+                };
+                let p1b = if c6 == c3 && c6 == b1 && c5 != b2 && c6 != b0 {
+                    avg4(c6, c6, c6, c5)
+                } else if c5 == c2 && c5 == b2 && b1 != c6 && c5 != b3 {
+                    avg4(c6, c5, c5, c5)
+                } else {
+                    avg2(c5, c6)
+                };
+                (p1b, p2b)
+            };
+            // Left column.
+            let p2a = if (c5 == c3 && c2 != c6 && c4 == c5 && c5 != a2)
+                || (c5 == c1 && c6 == c5 && c4 != c2 && c5 != a0)
+            {
+                avg2(c2, c5)
+            } else {
+                c2
+            };
+            let p1a = if (c2 == c6 && c5 != c3 && c1 == c2 && c2 != b2)
+                || (c4 == c2 && c3 == c2 && c1 != c5 && c2 != b0)
+            {
+                avg2(c2, c5)
+            } else {
+                c5
+            };
+            put_cell(
+                &mut out,
+                ow,
+                x as usize,
+                y as usize,
+                2,
+                &[p1a, p1b, p2a, p2b],
+            );
+        }
+    }
+    (out, ow, oh)
+}
+
+/// **SuperEagle**. Output 2×2 = [p1a (TL), p1b (TR), p2a (BL), p2b (BR)].
+fn super_eagle(s: &Grid) -> (Vec<u8>, usize, usize) {
+    let (ow, oh) = (s.w * 2, s.h * 2);
+    let mut out = vec![0u8; ow * oh * 4];
+    for y in 0..s.h as isize {
+        for x in 0..s.w as isize {
+            let n = read_sai(s, x, y);
+            let (c1, c2, c3, c4, c5, c6) = (n.c1, n.c2, n.c3, n.c4, n.c5, n.c6);
+            let (a1, a2, b1, b2, s1, s2) = (n.a1, n.a2, n.b1, n.b2, n.s1, n.s2);
+            let (p1a, p1b, p2a, p2b);
+            if c2 == c6 && c5 != c3 {
+                p1b = c2;
+                p2a = c2;
+                if (c1 == c2 && c6 == s2) || (c2 == a1 && c6 == b2) {
+                    p1a = avg2(c2, avg2(c2, c5));
+                    p2b = avg2(c2, avg2(c2, c3));
+                } else {
+                    p1a = avg2(c5, c6);
+                    p2b = avg2(c2, c3);
+                }
+            } else if c5 == c3 && c2 != c6 {
+                p2b = c5;
+                p1a = c5;
+                if (b1 == c5 && c3 == a2) || (c4 == c5 && c3 == s1) {
+                    p1b = avg2(c5, avg2(c5, c6));
+                    p2a = avg2(c5, avg2(c5, c2));
+                } else {
+                    p1b = avg2(c5, c6);
+                    p2a = avg2(c2, c3);
+                }
+            } else if c5 == c3 && c2 == c6 && c5 != c6 {
+                let r = gr(c6, c5, c1, a1)
+                    + gr(c6, c5, c4, b1)
+                    + gr(c6, c5, a2, s1)
+                    + gr(c6, c5, b2, s2);
+                if r > 0 {
+                    p1b = c2;
+                    p2a = c2;
+                    p1a = avg2(c5, c6);
+                    p2b = avg2(c5, c6);
+                } else if r < 0 {
+                    p2b = c5;
+                    p1a = c5;
+                    p1b = avg2(c5, c6);
+                    p2a = avg2(c5, c6);
+                } else {
+                    p2b = c5;
+                    p1a = c5;
+                    p1b = c2;
+                    p2a = c2;
+                }
+            } else if c2 == c5 || c3 == c6 {
+                p1a = c5;
+                p2a = c2;
+                p1b = c6;
+                p2b = c3;
+            } else {
+                p1a = avg2(c5, avg2(c5, c6));
+                p1b = avg2(c6, avg2(c5, c6));
+                p2a = avg2(c2, avg2(c2, c3));
+                p2b = avg2(c3, avg2(c2, c3));
+            }
+            put_cell(
+                &mut out,
+                ow,
+                x as usize,
+                y as usize,
+                2,
+                &[p1a, p1b, p2a, p2b],
+            );
+        }
+    }
     (out, ow, oh)
 }
 
