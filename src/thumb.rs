@@ -616,7 +616,7 @@ fn nearest_color(c: [u8; 3], palette: &[[u8; 4]]) -> [u8; 3] {
 /// downscaled thumbnail would (a 15×392 sprite must NOT become 10×256). Only
 /// images larger than `max_dim` in either axis are scaled down — by **area
 /// averaging** (box filter), so dithered block art shrinks to faithful tones.
-fn make_thumb(img: &PixImage, max_dim: u32) -> (usize, usize, Vec<u8>) {
+pub fn make_thumb(img: &PixImage, max_dim: u32) -> (usize, usize, Vec<u8>) {
     let (sw, sh) = (img.width as usize, img.height as usize);
     let max = max_dim.max(1) as usize;
 

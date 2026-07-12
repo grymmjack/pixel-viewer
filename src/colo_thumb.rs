@@ -5,6 +5,7 @@
 //! local-file decode. Results are keyed by the piece's *virtual* display path, so the
 //! grid/table upload them into `thumb_tex` exactly like a locally-decoded thumbnail.
 
+use crate::decode::Registry;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -21,6 +22,9 @@ struct Job {
     path: PathBuf,
     url: String,
     target: u32,
+    // 16colo has no pre-rendered PNG for a PDF piece (its `tn`/`x1` render 404s), so
+    // `url` is the *raw* PDF and we render page 1 ourselves via the registry (pdftoppm).
+    is_pdf: bool,
 }
 
 pub struct RemoteThumbs {
@@ -30,7 +34,7 @@ pub struct RemoteThumbs {
 }
 
 impl RemoteThumbs {
-    pub fn new(workers: usize) -> Self {
+    pub fn new(workers: usize, registry: Arc<Registry>) -> Self {
         let queue: Arc<(Mutex<Vec<Job>>, Condvar)> =
             Arc::new((Mutex::new(Vec::new()), Condvar::new()));
         let (tx, rx): (Sender<RemoteThumbResult>, Receiver<RemoteThumbResult>) = channel();
@@ -38,6 +42,7 @@ impl RemoteThumbs {
         for _ in 0..workers.max(1) {
             let queue = Arc::clone(&queue);
             let tx = tx.clone();
+            let registry = Arc::clone(&registry);
             std::thread::spawn(move || loop {
                 let job = {
                     let (lock, cvar) = &*queue;
@@ -48,7 +53,7 @@ impl RemoteThumbs {
                     // LIFO: the most-recently-requested (visible) thumbnail first.
                     q.pop().unwrap()
                 };
-                if let Some(res) = fetch(&job) {
+                if let Some(res) = fetch(&job, &registry) {
                     let _ = tx.send(res);
                 }
             });
@@ -61,14 +66,17 @@ impl RemoteThumbs {
         }
     }
 
-    /// Enqueue once per path. Cheap to call every frame for visible rows.
-    pub fn request(&mut self, path: &Path, url: &str, target: u32) {
+    /// Enqueue once per path. Cheap to call every frame for visible rows. `is_pdf` picks
+    /// the render path: `false` = fetch 16colo's pre-rendered PNG at `url`; `true` = `url`
+    /// is the raw PDF, rendered locally (page 1) since 16colo serves no PDF thumbnail.
+    pub fn request(&mut self, path: &Path, url: &str, target: u32, is_pdf: bool) {
         if self.requested.insert(path.to_path_buf()) {
             let (lock, cvar) = &*self.queue;
             lock.lock().unwrap().push(Job {
                 path: path.to_path_buf(),
                 url: url.to_string(),
                 target,
+                is_pdf,
             });
             cvar.notify_one();
         }
@@ -79,11 +87,23 @@ impl RemoteThumbs {
     }
 }
 
-/// Download + decode one thumbnail PNG, area-downscaling if it's bigger than `target`.
-/// The PNG is immutable (a pre-rendered preview), so it goes through the persistent
-/// disk cache — re-browsing a pack/artist doesn't re-fetch it.
-fn fetch(job: &Job) -> Option<RemoteThumbResult> {
+/// Download + decode one thumbnail, area-downscaling if it's bigger than `target`. A
+/// PDF piece (`is_pdf`) downloads its raw file and renders page 1 through the registry
+/// (poppler `pdftoppm`, with a labeled placeholder fallback), since 16colo has no PDF
+/// render; everything else fetches 16colo's pre-rendered PNG. Both go through the
+/// persistent disk cache — re-browsing a pack/artist doesn't re-fetch.
+fn fetch(job: &Job, registry: &Registry) -> Option<RemoteThumbResult> {
     let buf = crate::cache::get_bytes(&job.url, None).ok()?;
+    if job.is_pdf {
+        let img = registry.decode_bytes(&buf, &job.path).ok()?;
+        let (w, h, rgba) = crate::thumb::make_thumb(&img, job.target);
+        return Some(RemoteThumbResult {
+            path: job.path.clone(),
+            width: w,
+            height: h,
+            rgba,
+        });
+    }
     let img = image::load_from_memory(&buf).ok()?.to_rgba8();
     let (sw, sh) = (img.width() as usize, img.height() as usize);
     if sw == 0 || sh == 0 {

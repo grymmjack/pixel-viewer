@@ -1390,7 +1390,7 @@ impl PixelView {
             .unwrap_or(4);
         let thumbs = ThumbBuilder::new(Arc::clone(&registry), workers);
         // A few HTTP workers for 16colo.rs thumbnail PNGs (don't hammer the server).
-        let colo_thumbs = RemoteThumbs::new(workers.min(6));
+        let colo_thumbs = RemoteThumbs::new(workers.min(6), registry.clone());
 
         // Restore the UI scale the user last set with Ctrl +/- (defaults to 1.0).
         let ui_zoom = cc
@@ -11289,10 +11289,15 @@ impl PixelView {
                                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                                 paint_audio_tile(&ui.painter_at(rect), rect, ext);
                             } else {
-                                // 16colo piece → fetch its pre-rendered PNG over HTTP;
-                                // any other file → decode locally.
+                                // 16colo piece → fetch its pre-rendered PNG over HTTP (or,
+                                // for a PDF, its raw file rendered locally — 16colo has no
+                                // PDF thumbnail); any other file → decode locally.
                                 if let Some(p) = self.colo_pieces.get(path) {
-                                    self.colo_thumbs.request(path, &p.tn_url, THUMB_PX);
+                                    if is_pdf_path(path) {
+                                        self.colo_thumbs.request(path, &p.raw_url, THUMB_PX, true);
+                                    } else {
+                                        self.colo_thumbs.request(path, &p.tn_url, THUMB_PX, false);
+                                    }
                                 } else {
                                     self.thumbs.request(path, THUMB_PX);
                                 }
@@ -12006,7 +12011,12 @@ impl PixelView {
                 let colo_audio = piece.is_some() && is_audio_ext(&path);
                 if tex.is_none() && !entry.is_dir && !colo_audio {
                     if let Some(p) = &piece {
-                        self.colo_thumbs.request(&path, &p.tn_url, THUMB_PX);
+                        // PDF piece → render its raw file locally (no 16colo PDF render).
+                        if is_pdf_path(&path) {
+                            self.colo_thumbs.request(&path, &p.raw_url, THUMB_PX, true);
+                        } else {
+                            self.colo_thumbs.request(&path, &p.tn_url, THUMB_PX, false);
+                        }
                     } else {
                         self.thumbs.request(&path, THUMB_PX);
                     }
