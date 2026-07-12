@@ -180,6 +180,72 @@ pub fn distinct_opaque_colors(rgba: &[u8]) -> Vec<[u8; 4]> {
     v
 }
 
+/// Estimate the integer upscale factor of (pixel-)art: the largest cell size S in
+/// 2..=16 whose colour-change *edges* (on both axes) cluster onto a period-S grid —
+/// i.e. the image looks like native pixels blown up S×. Returns 1 when there's no
+/// clean grid (genuinely detailed / 1× art, or too few edges to tell). Drives the
+/// dither "Auto" button so the dither cell matches the art's own pixel size.
+///
+/// How: an *edge* is where a pixel's RGB differs from its left (or upper) neighbour
+/// by more than `THRESH` (skips anti-alias gradients). For each S we bucket edge
+/// positions by `pos % S` and take the fullest bucket's share — so a grid offset by
+/// a crop still scores ~1.0 at its true period. Rows/cols are sampled for speed.
+pub fn detect_pixel_scale(rgba: &[u8], w: usize, h: usize) -> usize {
+    if w < 4 || h < 4 || rgba.len() < w * h * 4 {
+        return 1;
+    }
+    const THRESH: i32 = 24; // min |ΔR|+|ΔG|+|ΔB| to count as an edge (skip AA)
+    let opaque = |i: usize| rgba[i * 4 + 3] == 255;
+    let diff = |a: usize, b: usize| {
+        (rgba[a * 4] as i32 - rgba[b * 4] as i32).abs()
+            + (rgba[a * 4 + 1] as i32 - rgba[b * 4 + 1] as i32).abs()
+            + (rgba[a * 4 + 2] as i32 - rgba[b * 4 + 2] as i32).abs()
+            > THRESH
+    };
+    // Sample up to ~64 rows / 64 columns evenly so huge images stay cheap.
+    let row_step = (h / 64).max(1);
+    let col_step = (w / 64).max(1);
+    let mut hx: Vec<usize> = Vec::new(); // x of horizontal colour changes
+    let mut y = 0;
+    while y < h {
+        for x in 1..w {
+            let (i, j) = (y * w + x, y * w + x - 1);
+            if opaque(i) && opaque(j) && diff(i, j) {
+                hx.push(x);
+            }
+        }
+        y += row_step;
+    }
+    let mut vy: Vec<usize> = Vec::new(); // y of vertical colour changes
+    let mut x = 0;
+    while x < w {
+        for y in 1..h {
+            let (i, j) = (y * w + x, (y - 1) * w + x);
+            if opaque(i) && opaque(j) && diff(i, j) {
+                vy.push(y);
+            }
+        }
+        x += col_step;
+    }
+    if hx.len() < 16 || vy.len() < 16 {
+        return 1; // not enough signal → treat as 1× (detailed / flat)
+    }
+    // Fraction of edges falling in the fullest `pos % s` bucket (phase-aware).
+    let aligned = |edges: &[usize], s: usize| -> f32 {
+        let mut buckets = vec![0u32; s];
+        for &e in edges {
+            buckets[e % s] += 1;
+        }
+        *buckets.iter().max().unwrap_or(&0) as f32 / edges.len() as f32
+    };
+    for s in (2..=16).rev() {
+        if aligned(&hx, s) >= 0.80 && aligned(&vy, s) >= 0.80 {
+            return s;
+        }
+    }
+    1
+}
+
 /// Parse a GIMP `.gpl` palette into opaque RGBA colors. Skips the header lines
 /// (`GIMP Palette`, `Name:`, `Columns:`), `#` comments and blanks; each color
 /// line is `R G B [name]` with space- or tab-separated 0..255 channels.
@@ -890,6 +956,43 @@ mod tests {
         assert_eq!(at(&s2, 0, 0), at(&s2, 0, 1), "same 2×2 cell → equal");
         assert_eq!(at(&s2, 0, 0), at(&s2, 1, 1), "same 2×2 cell → equal");
         assert_ne!(at(&s2, 0, 0), at(&s2, 2, 0), "next cell differs");
+    }
+
+    #[test]
+    fn detect_pixel_scale_finds_the_upscale_factor() {
+        // A 4×-upscaled 4×4 checkerboard: each cell is a solid 4×4 px block, so every
+        // colour edge sits on a period-4 grid → detected scale is 4.
+        let n = 16;
+        let mut up = vec![0u8; n * n * 4];
+        for y in 0..n {
+            for x in 0..n {
+                let v = if ((x / 4) + (y / 4)) % 2 == 0 { 255 } else { 0 };
+                let i = (y * n + x) * 4;
+                up[i] = v;
+                up[i + 1] = v;
+                up[i + 2] = v;
+                up[i + 3] = 255;
+            }
+        }
+        assert_eq!(detect_pixel_scale(&up, n, n), 4);
+
+        // A 1-px checkerboard has a period-1 grid (native detail) → stays 1.
+        let mut fine = vec![0u8; n * n * 4];
+        for y in 0..n {
+            for x in 0..n {
+                let v = if (x + y) % 2 == 0 { 255 } else { 0 };
+                let i = (y * n + x) * 4;
+                fine[i] = v;
+                fine[i + 1] = v;
+                fine[i + 2] = v;
+                fine[i + 3] = 255;
+            }
+        }
+        assert_eq!(detect_pixel_scale(&fine, n, n), 1);
+
+        // A flat field has no edges → 1.
+        let flat = vec![128u8; n * n * 4];
+        assert_eq!(detect_pixel_scale(&flat, n, n), 1);
     }
 
     #[test]

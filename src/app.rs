@@ -8331,6 +8331,22 @@ impl PixelView {
         ((self.dither_scale as f32 * buf_w as f32 / native_w as f32).round() as usize).max(1)
     }
 
+    /// Auto-detect a good dither cell size for `path` by estimating the art's native
+    /// pixel scale (see [`thumb::detect_pixel_scale`]). Decodes native pixels (the
+    /// factor is defined at native res) — the cached full pixels when present, else a
+    /// fresh decode of the real file. None only if it can't be decoded.
+    fn detect_dither_scale(&mut self, path: &Path) -> Option<usize> {
+        let (w, h, rgba) = match &self.full_src {
+            Some((p, sz, px)) if p == path => (sz[0], sz[1], px.clone()),
+            _ => {
+                let real = self.resolve_local(path);
+                let img = self.registry.decode_path(&real).ok()?;
+                (img.width as usize, img.height as usize, img.rgba_bytes())
+            }
+        };
+        Some(crate::thumb::detect_pixel_scale(&rgba, w, h).clamp(1, 16))
+    }
+
     /// The resample target dims for a `w`×`h` pipeline buffer: the buffer scaled by
     /// the resize factors (min 1px, never up). Equals `(w, h)` when Resize is off, so
     /// callers can unconditionally pass the result to [`apply_pipeline_resized`].
@@ -10039,6 +10055,21 @@ impl PixelView {
                             );
                             middle_reset(ui, &resp, &mut self.dither_scale, 1usize);
                             wheel_adjust(ui, &resp, &mut self.dither_scale, 1.0, 1usize, 16usize);
+                            // Detect the art's native pixel size + match the dither cell.
+                            if ui
+                                .button("Auto")
+                                .on_hover_text(
+                                    "Detect the art's pixel size (upscaled pixel art) and \
+                                     set the dither cell to match. Stays 1 for genuinely \
+                                     hi-res / detailed art.",
+                                )
+                                .clicked()
+                            {
+                                if let Some(s) = self.detect_dither_scale(&entry.path) {
+                                    self.dither_scale = s;
+                                    self.status = format!("Auto dither scale: {s}px");
+                                }
+                            }
                         });
                     }
                     if matches!(self.dither_method, 4 | 5) && recolor.is_none() {
