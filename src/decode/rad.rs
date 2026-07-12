@@ -429,7 +429,8 @@ impl RadPlayer {
         }
 
         // Locate the riffs (version 2 only).
-        let mut riffs: [[Option<usize>; K_CHANNELS]; K_RIFF_TRACKS] = [[None; K_CHANNELS]; K_RIFF_TRACKS];
+        let mut riffs: [[Option<usize>; K_CHANNELS]; K_RIFF_TRACKS] =
+            [[None; K_CHANNELS]; K_RIFF_TRACKS];
         if version >= 2 {
             loop {
                 if s >= len {
@@ -1103,7 +1104,11 @@ impl RadPlayer {
             let fb1 = self.instruments[idx].feedback[1];
             let v1 = (((p1 ^ 3) as u16) << 4)
                 | ((fb1 as u16) << 1)
-                | (if alg == 3 || alg == 5 || alg == 6 { 1 } else { 0 });
+                | (if alg == 3 || alg == 5 || alg == 6 {
+                    1
+                } else {
+                    0
+                });
             self.set_opl3(0xC0 + CHAN_OFFSETS3[channum], v1 as u8);
 
             let p0 = self.instruments[idx].panning[0];

@@ -141,7 +141,10 @@ fn parse_opcodes(text: &str) -> Vec<(String, String)> {
             if let Some(kv) = cur.take() {
                 out.push(kv);
             }
-            out.push(("<header>".to_string(), tok.trim_matches(['<', '>']).to_string()));
+            out.push((
+                "<header>".to_string(),
+                tok.trim_matches(['<', '>']).to_string(),
+            ));
             continue;
         }
         // A token that starts a new opcode looks like `name=` with an identifier before `=`.
@@ -257,9 +260,11 @@ fn cache_dir(sfz: &Path) -> io::Result<PathBuf> {
         .unwrap_or(0);
     let key = format!("{}|{}|{}", sfz.display(), meta.len(), mtime);
     let stem = sfz.file_name().and_then(|s| s.to_str()).unwrap_or("sfz");
-    Ok(std::env::temp_dir()
-        .join("pixelview-sfz")
-        .join(format!("{}-{:016x}", sanitize(stem), hash_str(&key))))
+    Ok(std::env::temp_dir().join("pixelview-sfz").join(format!(
+        "{}-{:016x}",
+        sanitize(stem),
+        hash_str(&key)
+    )))
 }
 
 fn hash_str(s: &str) -> u64 {
@@ -310,7 +315,12 @@ mod tests {
             .map(|(_, v)| v)
             .collect();
         assert_eq!(samples, vec!["Grand Piano/C4 note.wav", "kick.wav"]);
-        assert_eq!(ops.iter().filter(|(k, v)| k == "<header>" && v == "region").count(), 2);
+        assert_eq!(
+            ops.iter()
+                .filter(|(k, v)| k == "<header>" && v == "region")
+                .count(),
+            2
+        );
     }
 
     #[test]

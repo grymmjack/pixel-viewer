@@ -16,8 +16,8 @@ mod sfz;
 mod sixteen;
 mod soundfont;
 mod thumb;
-mod xi;
 mod viewdb;
+mod xi;
 
 use eframe::egui;
 

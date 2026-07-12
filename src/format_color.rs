@@ -104,21 +104,18 @@ fn defaults() -> HashMap<String, [u8; 3]> {
         ("midi", [240, 130, 190]),
         ("kar", [240, 130, 190]),
         ("rmi", [240, 130, 190]),
-        ("rad", [255, 95, 175]), // bright pink
-        ("mod", [70, 130, 245]), // bright blue
-        ("s3m", [55, 215, 235]), // bright cyan
-        ("xm", [55, 220, 185]),  // bright teal
-        ("it", [90, 240, 200]),  // brighter teal
-        ("sf2", [170, 110, 225]), // purple
-        ("sfz", [200, 160, 240]), // light purple
-        ("dls", [70, 200, 220]),  // cyan
-        ("xi", [225, 205, 70]),   // yellow
-        ("xrni", [250, 230, 55]), // bright yellow
-        ("xrns", [240, 70, 70]),  // bright red
+        ("rad", [255, 95, 175]),   // bright pink
+        ("mod", [70, 130, 245]),   // bright blue
+        ("s3m", [55, 215, 235]),   // bright cyan
+        ("xm", [55, 220, 185]),    // bright teal
+        ("it", [90, 240, 200]),    // brighter teal
+        ("sf2", [170, 110, 225]),  // purple
+        ("sfz", [200, 160, 240]),  // light purple
+        ("dls", [70, 200, 220]),   // cyan
+        ("xi", [225, 205, 70]),    // yellow
+        ("xrni", [250, 230, 55]),  // bright yellow
+        ("xrns", [240, 70, 70]),   // bright red
         ("other", [80, 200, 220]), // cyan
     ];
-    entries
-        .iter()
-        .map(|(k, v)| (k.to_string(), *v))
-        .collect()
+    entries.iter().map(|(k, v)| (k.to_string(), *v)).collect()
 }

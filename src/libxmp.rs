@@ -87,7 +87,12 @@ unsafe fn render_into(ctx: XmpContext, bytes: &[u8], rate: c_int, cap: usize) ->
     loop {
         // `size` is in BYTES. The last arg is a LOOP COUNT, not a bool: `1` = play through once
         // then stop (returns -1); `0` would play forever (only a non-looping module ever ends).
-        let ret = xmp_play_buffer(ctx, buf.as_mut_ptr() as *mut c_void, (buf.len() * 2) as c_int, 1);
+        let ret = xmp_play_buffer(
+            ctx,
+            buf.as_mut_ptr() as *mut c_void,
+            (buf.len() * 2) as c_int,
+            1,
+        );
         if ret != 0 {
             break;
         }
@@ -145,7 +150,9 @@ unsafe fn module_info_into(ctx: XmpContext, bytes: &[u8]) -> Option<TrackerInfo>
         let read_i32 = |off: usize| mod_ptr.add(off).cast::<i32>().read_unaligned();
         let type_bytes = std::slice::from_raw_parts(mod_ptr.add(64), 64);
         let end = type_bytes.iter().position(|&b| b == 0).unwrap_or(64);
-        let format = String::from_utf8_lossy(&type_bytes[..end]).trim().to_string();
+        let format = String::from_utf8_lossy(&type_bytes[..end])
+            .trim()
+            .to_string();
         Some(TrackerInfo {
             patterns: read_i32(128).max(0) as u32,
             channels: read_i32(136).max(0) as u32,

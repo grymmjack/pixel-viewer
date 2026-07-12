@@ -182,9 +182,11 @@ fn cache_dir(dls: &Path) -> io::Result<PathBuf> {
         .unwrap_or(0);
     let key = format!("{}|{}|{}", dls.display(), meta.len(), mtime);
     let stem = dls.file_name().and_then(|s| s.to_str()).unwrap_or("dls");
-    Ok(std::env::temp_dir()
-        .join("pixelview-dls")
-        .join(format!("{}-{:016x}", sanitize(stem), hash_str(&key))))
+    Ok(std::env::temp_dir().join("pixelview-dls").join(format!(
+        "{}-{:016x}",
+        sanitize(stem),
+        hash_str(&key)
+    )))
 }
 
 fn hash_str(s: &str) -> u64 {

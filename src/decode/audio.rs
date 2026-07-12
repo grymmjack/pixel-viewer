@@ -259,8 +259,8 @@ fn render_icon(ext: &str) -> PixImage {
     let (w, h) = (320usize, 240usize);
     let mut px = vec![BG; w * h];
     let (note, dim) = accent(ext); // colored by file format
-    // Two beamed note-heads (symmetric ♫). A one-row `dim` under-edge gives the heads a little
-    // roundness/depth against the dark background.
+                                   // Two beamed note-heads (symmetric ♫). A one-row `dim` under-edge gives the heads a little
+                                   // roundness/depth against the dark background.
     fill_ellipse(&mut px, w, 116, 151, 34, 23, dim);
     fill_ellipse(&mut px, w, 204, 151, 34, 23, dim);
     fill_ellipse(&mut px, w, 116, 149, 34, 23, note);
@@ -273,7 +273,15 @@ fn render_icon(ext: &str) -> PixImage {
     let label = ext.to_ascii_uppercase();
     let tscale = 3usize;
     let tw = label.len() * 8 * tscale;
-    blit_text(&mut px, w, (w.saturating_sub(tw)) / 2, 184, &label, note, tscale);
+    blit_text(
+        &mut px,
+        w,
+        (w.saturating_sub(tw)) / 2,
+        184,
+        &label,
+        note,
+        tscale,
+    );
     PixImage::from_rgba(w as u32, h as u32, px)
 }
 
