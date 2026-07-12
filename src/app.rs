@@ -964,9 +964,10 @@ pub struct PixelView {
     resize_fx: f32,                                         // width factor  (0,1] of native
     resize_fy: f32,                                         // height factor (0,1] of native
     resize_lock: bool,                                      // lock aspect (fx == fy)
+    postfx: PostFx, // CRT post-filters (scanlines/glow/vignette/phosphor markers)
     balance_color: [u8; 3], // color-balance op: ±offset color (128 = neutral)
-    balance_strength: f32,  // color-balance op: 0..1 amount
-    balance_hex: String,    // live buffer for the hex paste field
+    balance_strength: f32, // color-balance op: 0..1 amount
+    balance_hex: String, // live buffer for the hex paste field
     quantize_cache: Option<(PathBuf, usize, Vec<[u8; 4]>)>, // memoized reduction
     // Colors to feed the Reduce median-cut when the image has too many colors to
     // extract a swatch palette (`palettes[path]` is `Some(None)`): its pixels
@@ -1291,6 +1292,7 @@ impl PixelView {
     const DITHER_SCALE_KEY: &'static str = "dither_scale"; // legacy single value → X
     const DITHER_SCALE_Y_KEY: &'static str = "dither_scale_y";
     const DITHER_SCALE_LOCK_KEY: &'static str = "dither_scale_lock";
+    const POSTFX_KEY: &'static str = "postfx"; // CRT post-filters (record)
     const RESIZE_ON_KEY: &'static str = "resize_on";
     const RESIZE_FX_KEY: &'static str = "resize_fx";
     const RESIZE_FY_KEY: &'static str = "resize_fy";
@@ -1503,19 +1505,28 @@ impl PixelView {
                     })
             })
             .unwrap_or_default();
-        // Apply order: current = [u8; 15]; fall back to the legacy [u8; 12] order
-        // (with_order appends any ops that didn't exist when it was saved).
+        // Apply order: current = [u8; 19]; fall back to the legacy [u8; 15] / [u8; 12]
+        // orders (with_order appends any ops that didn't exist when it was saved, so
+        // the 4 post-FX ops land at the end for an older config).
         let adjust = cc
             .storage
             .and_then(|s| {
-                eframe::get_value::<[u8; 15]>(s, Self::ADJUST_ORDER_KEY)
+                eframe::get_value::<[u8; 19]>(s, Self::ADJUST_ORDER_KEY)
                     .map(|o| o.to_vec())
+                    .or_else(|| {
+                        eframe::get_value::<[u8; 15]>(s, Self::ADJUST_ORDER_KEY).map(|o| o.to_vec())
+                    })
                     .or_else(|| {
                         eframe::get_value::<[u8; 12]>(s, Self::ADJUST_ORDER_KEY).map(|o| o.to_vec())
                     })
             })
             .map(|o| adjust.with_order(&o))
             .unwrap_or(adjust);
+        let postfx = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Vec<f32>>(s, Self::POSTFX_KEY))
+            .map(|v| PostFx::from_record(&v))
+            .unwrap_or_default();
         let img_zoom = cc
             .storage
             .and_then(|s| eframe::get_value::<f32>(s, Self::IMG_ZOOM_KEY))
@@ -1938,6 +1949,7 @@ impl PixelView {
             resize_fx,
             resize_fy,
             resize_lock,
+            postfx,
             balance_color,
             balance_strength,
             balance_hex,
@@ -8461,6 +8473,7 @@ impl PixelView {
             dither_n: self.dither_custom_n,
             dither_scale_x: dscale_x,
             dither_scale_y: dscale_y,
+            fx: self.postfx,
             balance: self.balance_offset(),
             palette,
         }
@@ -8525,6 +8538,7 @@ impl PixelView {
             || self.balance_offset() != [0, 0, 0]
             || (self.dither_method != 0 && self.dither_amount > 0.0)
             || self.resize_active()
+            || self.postfx.active()
     }
 
     /// True when the Resize/resample actually downsamples (on + a factor below 1).
@@ -8556,7 +8570,7 @@ impl PixelView {
             self.resize_on as u8,
             self.resize_fx,
             self.resize_fy,
-        )
+        ) + &format!("|FX{}", self.postfx.key())
     }
 
     /// The palette to remap the inspected image to right now, plus a cache key
@@ -8692,6 +8706,7 @@ impl PixelView {
             dither_n: 0,
             dither_scale_x: 1,
             dither_scale_y: 1,
+            fx: PostFx::default(),
             balance: self.balance_offset(),
             palette: palette.as_deref(),
         };
@@ -9452,6 +9467,7 @@ impl PixelView {
                 self.dither_custom = crate::thumb::bayer_values(4);
                 self.dither_scale_x = 1;
                 self.dither_scale_y = 1;
+                self.postfx = PostFx::default();
                 self.resize_on = false;
                 self.resize_fx = 1.0;
                 self.resize_fy = 1.0;
@@ -9864,6 +9880,38 @@ impl PixelView {
                                                 },
                                                 "Per-channel R/G/B offset — set color & strength in the Color balance section; drag to reorder",
                                             ),
+                                            OpKind::Scanlines => (
+                                                if self.postfx.scan_amt > 0.0 {
+                                                    egui::RichText::new("Scanlines").strong().color(active)
+                                                } else {
+                                                    egui::RichText::new("Scanlines (off)").weak()
+                                                },
+                                                "CRT scanlines — set amount/spacing/direction/color in the Post FX section; drag to reorder",
+                                            ),
+                                            OpKind::Glow => (
+                                                if self.postfx.glow_amt > 0.0 {
+                                                    egui::RichText::new("Glow").strong().color(active)
+                                                } else {
+                                                    egui::RichText::new("Glow (off)").weak()
+                                                },
+                                                "Phosphor bloom — set amount/radius in the Post FX section; drag to reorder",
+                                            ),
+                                            OpKind::Vignette => (
+                                                if self.postfx.vig_amt > 0.0 {
+                                                    egui::RichText::new("Vignette").strong().color(active)
+                                                } else {
+                                                    egui::RichText::new("Vignette (off)").weak()
+                                                },
+                                                "Edge darkening — set amount/feather in the Post FX section; drag to reorder",
+                                            ),
+                                            OpKind::Phosphor => (
+                                                if self.postfx.phos_amt > 0.0 {
+                                                    egui::RichText::new("Phosphor").strong().color(active)
+                                                } else {
+                                                    egui::RichText::new("Phosphor (off)").weak()
+                                                },
+                                                "RGB phosphor mask — set amount/size in the Post FX section; drag to reorder",
+                                            ),
                                             _ => unreachable!("non-marker in marker branch"),
                                         };
                                         ui.add_sized(
@@ -9964,7 +10012,7 @@ impl PixelView {
                                         let item = v.remove(from);
                                         let at = if from < to { to - 1 } else { to };
                                         v.insert(at.min(v.len()), item);
-                                        if let Ok(arr) = <[OpKind; 15]>::try_from(v) {
+                                        if let Ok(arr) = <[OpKind; 19]>::try_from(v) {
                                             a.order = arr;
                                         }
                                         self.adjust_drag = None;
@@ -10095,6 +10143,108 @@ impl PixelView {
                                 self.balance_strength = 0.0;
                                 self.balance_hex = "808080".into();
                             }
+                        });
+                }
+
+                // ----- Post FX (CRT-style filters: scanlines / glow / vignette /
+                //       phosphor). Each is a marker op in the Adjustments list above —
+                //       drag it to position where it applies in the stack. -----
+                {
+                    let header = if self.postfx.active() {
+                        "Post FX *"
+                    } else {
+                        "Post FX"
+                    };
+                    egui::CollapsingHeader::new(header)
+                        .id_salt("postfx")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            let fx = &mut self.postfx;
+                            ui.weak("Baked into the image (so they save). Reorder each in the Adjustments list above.");
+
+                            // --- Scanlines ---
+                            ui.add_space(2.0);
+                            ui.strong("Scanlines");
+                            ui.horizontal(|ui| {
+                                ui.label("Amount");
+                                let r = ui.add(egui::Slider::new(&mut fx.scan_amt, 0.0..=1.0));
+                                middle_reset(ui, &r, &mut fx.scan_amt, 0.0f32);
+                                wheel_adjust(ui, &r, &mut fx.scan_amt, 0.05, 0.0f32, 1.0f32);
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Spacing");
+                                let r = ui.add(egui::Slider::new(&mut fx.scan_period, 2..=16).suffix("px"));
+                                middle_reset(ui, &r, &mut fx.scan_period, 3u32);
+                                wheel_adjust(ui, &r, &mut fx.scan_period, 1.0, 2u32, 16u32);
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Dir");
+                                for (d, sym, tip) in [
+                                    (0u8, "==", "Horizontal"),
+                                    (1u8, "||", "Vertical"),
+                                    (2u8, "\\\\", "Diagonal ＼"),
+                                    (3u8, "//", "Diagonal ／"),
+                                ] {
+                                    if ui
+                                        .selectable_label(fx.scan_dir == d, sym)
+                                        .on_hover_text(tip)
+                                        .clicked()
+                                    {
+                                        fx.scan_dir = d;
+                                    }
+                                }
+                                ui.separator();
+                                ui.label("Color");
+                                ui.color_edit_button_srgb(&mut fx.scan_color);
+                            });
+
+                            // --- Glow (phosphor bloom) ---
+                            ui.add_space(4.0);
+                            ui.strong("Glow");
+                            ui.horizontal(|ui| {
+                                ui.label("Amount");
+                                let r = ui.add(egui::Slider::new(&mut fx.glow_amt, 0.0..=2.0));
+                                middle_reset(ui, &r, &mut fx.glow_amt, 0.0f32);
+                                wheel_adjust(ui, &r, &mut fx.glow_amt, 0.05, 0.0f32, 2.0f32);
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Radius");
+                                let r = ui.add(egui::Slider::new(&mut fx.glow_radius, 1.0..=16.0).suffix("px"));
+                                middle_reset(ui, &r, &mut fx.glow_radius, 3.0f32);
+                                wheel_adjust(ui, &r, &mut fx.glow_radius, 1.0, 1.0f32, 16.0f32);
+                            });
+
+                            // --- Vignette ---
+                            ui.add_space(4.0);
+                            ui.strong("Vignette");
+                            ui.horizontal(|ui| {
+                                ui.label("Amount");
+                                let r = ui.add(egui::Slider::new(&mut fx.vig_amt, 0.0..=1.0));
+                                middle_reset(ui, &r, &mut fx.vig_amt, 0.0f32);
+                                wheel_adjust(ui, &r, &mut fx.vig_amt, 0.05, 0.0f32, 1.0f32);
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Feather");
+                                let r = ui.add(egui::Slider::new(&mut fx.vig_feather, 0.0..=1.0));
+                                middle_reset(ui, &r, &mut fx.vig_feather, 0.35f32);
+                                wheel_adjust(ui, &r, &mut fx.vig_feather, 0.05, 0.0f32, 1.0f32);
+                            });
+
+                            // --- Phosphor RGB mask ---
+                            ui.add_space(4.0);
+                            ui.strong("Phosphor");
+                            ui.horizontal(|ui| {
+                                ui.label("Amount");
+                                let r = ui.add(egui::Slider::new(&mut fx.phos_amt, 0.0..=1.0));
+                                middle_reset(ui, &r, &mut fx.phos_amt, 0.0f32);
+                                wheel_adjust(ui, &r, &mut fx.phos_amt, 0.05, 0.0f32, 1.0f32);
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Size");
+                                let r = ui.add(egui::Slider::new(&mut fx.phos_size, 1..=8).suffix("px"));
+                                middle_reset(ui, &r, &mut fx.phos_size, 1u32);
+                                wheel_adjust(ui, &r, &mut fx.phos_size, 1.0, 1u32, 8u32);
+                            });
                         });
                 }
 
@@ -16400,6 +16550,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::RESIZE_FX_KEY, &self.resize_fx);
         eframe::set_value(storage, Self::RESIZE_FY_KEY, &self.resize_fy);
         eframe::set_value(storage, Self::RESIZE_LOCK_KEY, &self.resize_lock);
+        eframe::set_value(storage, Self::POSTFX_KEY, &self.postfx.to_record());
         eframe::set_value(storage, Self::BALANCE_COLOR_KEY, &self.balance_color);
         eframe::set_value(storage, Self::BALANCE_STRENGTH_KEY, &self.balance_strength);
         eframe::set_value(storage, Self::PALETTE_DIR_KEY, &self.palette_dir);
@@ -16803,12 +16954,18 @@ enum OpKind {
     /// The dither step. A marker op — method/amount/custom matrix live in the
     /// Dither section. Ordered methods bias here; the Palette op snaps later.
     Dither,
+    /// CRT post-filters — each a marker op, params in the Post FX section. Baked into
+    /// the pixels (so they save), positionable anywhere in the stack.
+    Scanlines,
+    Glow,
+    Vignette,
+    Phosphor,
 }
 
 impl OpKind {
     /// Every op, in declaration order. `ALL[i] as u8 == i`. New ops are appended
-    /// so persisted order indices (0..=11) stay valid across upgrades.
-    const ALL: [OpKind; 15] = [
+    /// so persisted order indices stay valid across upgrades.
+    const ALL: [OpKind; 19] = [
         OpKind::Brightness,
         OpKind::Contrast,
         OpKind::Gamma,
@@ -16824,6 +16981,10 @@ impl OpKind {
         OpKind::Invert,
         OpKind::ColorBalance,
         OpKind::Dither,
+        OpKind::Scanlines,
+        OpKind::Glow,
+        OpKind::Vignette,
+        OpKind::Phosphor,
     ];
 
     fn from_u8(b: u8) -> Option<OpKind> {
@@ -16835,7 +16996,13 @@ impl OpKind {
     fn is_marker(self) -> bool {
         matches!(
             self,
-            OpKind::Palette | OpKind::ColorBalance | OpKind::Dither
+            OpKind::Palette
+                | OpKind::ColorBalance
+                | OpKind::Dither
+                | OpKind::Scanlines
+                | OpKind::Glow
+                | OpKind::Vignette
+                | OpKind::Phosphor
         )
     }
 
@@ -16859,6 +17026,10 @@ impl OpKind {
             OpKind::Palette => ("Palette", 0.0, 0.0, 0.0, 0.0),
             OpKind::ColorBalance => ("Color balance", 0.0, 0.0, 0.0, 0.0),
             OpKind::Dither => ("Dither", 0.0, 0.0, 0.0, 0.0),
+            OpKind::Scanlines => ("Scanlines", 0.0, 0.0, 0.0, 0.0),
+            OpKind::Glow => ("Glow", 0.0, 0.0, 0.0, 0.0),
+            OpKind::Vignette => ("Vignette", 0.0, 0.0, 0.0, 0.0),
+            OpKind::Phosphor => ("Phosphor", 0.0, 0.0, 0.0, 0.0),
         }
     }
 }
@@ -16891,7 +17062,7 @@ struct Adjust {
     /// The order ops are applied in — a permutation of `OpKind::ALL`, and also the
     /// order the sliders are shown in. Not part of `is_identity` (it only matters
     /// when some op is active) but it *is* part of `key()` so the cache invalidates.
-    order: [OpKind; 15],
+    order: [OpKind; 19],
 }
 
 impl Default for Adjust {
@@ -16918,7 +17089,7 @@ impl Adjust {
     /// The default pipeline order: pixelate → tone curve → invert → color →
     /// balance → sharpen → dither → palette rematch. Dither sits right before the
     /// palette snap so the default behaves like the historical dithered reduce.
-    const DEFAULT_ORDER: [OpKind; 15] = [
+    const DEFAULT_ORDER: [OpKind; 19] = [
         OpKind::Pixelate,
         OpKind::Brightness,
         OpKind::Contrast,
@@ -16934,6 +17105,12 @@ impl Adjust {
         OpKind::Sharpen,
         OpKind::Dither,
         OpKind::Palette,
+        // CRT post-filters default to the end of the stack (applied last), in CRT
+        // order: mask → scanlines → bloom → vignette. Reorderable like any op.
+        OpKind::Phosphor,
+        OpKind::Scanlines,
+        OpKind::Glow,
+        OpKind::Vignette,
     ];
 
     fn is_identity(&self) -> bool {
@@ -16973,7 +17150,7 @@ impl Adjust {
         )
     }
     /// The apply order as op indices, for persistence.
-    fn order_to_u8(&self) -> [u8; 15] {
+    fn order_to_u8(&self) -> [u8; 19] {
         self.order.map(|o| o as u8)
     }
     /// Adopt a persisted order, ignoring unknown/duplicate entries and appending any
@@ -16999,7 +17176,7 @@ impl Adjust {
                 ops.push(op);
             }
         }
-        if let Ok(order) = <[OpKind; 15]>::try_from(ops) {
+        if let Ok(order) = <[OpKind; 19]>::try_from(ops) {
             self.order = order;
         }
         self
@@ -17008,7 +17185,13 @@ impl Adjust {
     /// Only valid for value ops — never called for `OpKind::Palette` (no slider).
     fn field_mut(&mut self, op: OpKind) -> &mut f32 {
         match op {
-            OpKind::Palette | OpKind::ColorBalance | OpKind::Dither => {
+            OpKind::Palette
+            | OpKind::ColorBalance
+            | OpKind::Dither
+            | OpKind::Scanlines
+            | OpKind::Glow
+            | OpKind::Vignette
+            | OpKind::Phosphor => {
                 unreachable!("marker ops have no slider value")
             }
             OpKind::Invert => &mut self.invert,
@@ -17076,6 +17259,7 @@ struct PipeAux<'a> {
     dither_n: usize,
     dither_scale_x: usize, // ordered-dither cell width in pixels (≥1)
     dither_scale_y: usize, // ordered-dither cell height in pixels (≥1)
+    fx: PostFx,            // CRT post-filter params (scanlines/glow/vignette/phosphor)
     balance: [i16; 3],
     palette: Option<&'a [[u8; 4]]>,
 }
@@ -17107,7 +17291,271 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, a: &Adjust, aux: &PipeAux
                 aux.palette,
             ),
             OpKind::ColorBalance => color_balance(rgba, aux.balance),
+            OpKind::Scanlines => apply_scanlines(rgba, w, h, &aux.fx),
+            OpKind::Glow => apply_glow(rgba, w, h, &aux.fx),
+            OpKind::Vignette => apply_vignette(rgba, w, h, &aux.fx),
+            OpKind::Phosphor => apply_phosphor(rgba, w, h, &aux.fx),
             other => apply_op(rgba, w, h, other, a),
+        }
+    }
+}
+
+/// CRT-style post-filter parameters — the marker ops `Scanlines`/`Glow`/`Vignette`/
+/// `Phosphor` read these from `PipeAux.fx`. Each effect is off at amount 0. Grouped
+/// so they persist as one record and thread through the pipeline as one Copy value.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct PostFx {
+    scan_amt: f32,       // scanline darkness/opacity 0..1
+    scan_period: u32,    // line spacing in px (≥2)
+    scan_dir: u8,        // 0 == horizontal, 1 || vertical, 2 \\ diag, 3 // diag
+    scan_color: [u8; 3], // scanline tint (default black)
+    glow_amt: f32,       // phosphor bloom strength 0..2
+    glow_radius: f32,    // bloom radius in px (≥1)
+    vig_amt: f32,        // vignette darkness 0..1
+    vig_feather: f32,    // where the darkening starts (0 = center, 1 = only corners)
+    phos_amt: f32,       // phosphor RGB-mask strength 0..1
+    phos_size: u32,      // phosphor stripe width in px (≥1)
+}
+
+impl Default for PostFx {
+    fn default() -> Self {
+        Self {
+            scan_amt: 0.0,
+            scan_period: 3,
+            scan_dir: 0,
+            scan_color: [0, 0, 0],
+            glow_amt: 0.0,
+            glow_radius: 3.0,
+            vig_amt: 0.0,
+            vig_feather: 0.35,
+            phos_amt: 0.0,
+            phos_size: 1,
+        }
+    }
+}
+
+impl PostFx {
+    /// Any effect active? Drives the pipeline-active gate + the "Post FX *" marker.
+    fn active(&self) -> bool {
+        self.scan_amt > 0.0 || self.glow_amt > 0.0 || self.vig_amt > 0.0 || self.phos_amt > 0.0
+    }
+    /// A compact cache key: fold every parameter in so any change invalidates the caches.
+    fn key(&self) -> String {
+        format!(
+            "S{:.2}:{}:{}:{},{},{}|G{:.2}:{:.1}|V{:.2}:{:.2}|P{:.2}:{}",
+            self.scan_amt,
+            self.scan_period,
+            self.scan_dir,
+            self.scan_color[0],
+            self.scan_color[1],
+            self.scan_color[2],
+            self.glow_amt,
+            self.glow_radius,
+            self.vig_amt,
+            self.vig_feather,
+            self.phos_amt,
+            self.phos_size,
+        )
+    }
+    /// Flatten to an f32 record for persistence (append-only; `from_record` fills
+    /// missing trailing fields with defaults, so the layout can grow compatibly).
+    fn to_record(&self) -> Vec<f32> {
+        vec![
+            self.scan_amt,
+            self.scan_period as f32,
+            self.scan_dir as f32,
+            self.scan_color[0] as f32,
+            self.scan_color[1] as f32,
+            self.scan_color[2] as f32,
+            self.glow_amt,
+            self.glow_radius,
+            self.vig_amt,
+            self.vig_feather,
+            self.phos_amt,
+            self.phos_size as f32,
+        ]
+    }
+    fn from_record(v: &[f32]) -> Self {
+        let d = Self::default();
+        let g = |i: usize, def: f32| v.get(i).copied().unwrap_or(def);
+        let b = |x: f32| x.clamp(0.0, 255.0).round() as u8;
+        Self {
+            scan_amt: g(0, d.scan_amt),
+            scan_period: g(1, d.scan_period as f32).max(2.0) as u32,
+            scan_dir: g(2, 0.0) as u8 & 3,
+            scan_color: [b(g(3, 0.0)), b(g(4, 0.0)), b(g(5, 0.0))],
+            glow_amt: g(6, d.glow_amt),
+            glow_radius: g(7, d.glow_radius).max(1.0),
+            vig_amt: g(8, d.vig_amt),
+            vig_feather: g(9, d.vig_feather),
+            phos_amt: g(10, d.phos_amt),
+            phos_size: g(11, d.phos_size as f32).max(1.0) as u32,
+        }
+    }
+}
+
+/// Blend `from`→`to` by `t` (0..1) in u8 space.
+fn lerp_u8(from: u8, to: u8, t: f32) -> u8 {
+    (from as f32 + (to as f32 - from as f32) * t).clamp(0.0, 255.0) as u8
+}
+
+/// Scanlines: darken (or tint toward `scan_color`) one of every `scan_period` lines,
+/// along the chosen axis — horizontal `==`, vertical `||`, or the two 45° diagonals
+/// `\\` / `//` (the diagonal index is `x±y`, so the lines run at 45°). Baked into the
+/// buffer so it's part of the recolor/save, unlike the viewer's draw-time CRT.
+fn apply_scanlines(rgba: &mut [u8], w: usize, h: usize, fx: &PostFx) {
+    if fx.scan_amt <= 0.0 {
+        return;
+    }
+    let period = fx.scan_period.max(2) as i32;
+    let a = fx.scan_amt.clamp(0.0, 1.0);
+    let c = fx.scan_color;
+    for y in 0..h {
+        for x in 0..w {
+            let line = match fx.scan_dir {
+                1 => x as i32,
+                2 => x as i32 + y as i32,
+                3 => x as i32 - y as i32,
+                _ => y as i32,
+            };
+            if line.rem_euclid(period) == 0 {
+                let i = (y * w + x) * 4;
+                if rgba[i + 3] == 0 {
+                    continue;
+                }
+                rgba[i] = lerp_u8(rgba[i], c[0], a);
+                rgba[i + 1] = lerp_u8(rgba[i + 1], c[1], a);
+                rgba[i + 2] = lerp_u8(rgba[i + 2], c[2], a);
+            }
+        }
+    }
+}
+
+/// Vignette: darken toward the edges. `vig_feather` sets where the falloff begins
+/// (0 = from the center, →1 = only the extreme corners), smoothstepped to `vig_amt`.
+fn apply_vignette(rgba: &mut [u8], w: usize, h: usize, fx: &PostFx) {
+    if fx.vig_amt <= 0.0 || w == 0 || h == 0 {
+        return;
+    }
+    let (cx, cy) = ((w as f32 - 1.0) / 2.0, (h as f32 - 1.0) / 2.0);
+    let maxd = (cx * cx + cy * cy).sqrt().max(1.0);
+    let feather = fx.vig_feather.clamp(0.0, 0.99);
+    let amt = fx.vig_amt.clamp(0.0, 1.0);
+    for y in 0..h {
+        for x in 0..w {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let d = (dx * dx + dy * dy).sqrt() / maxd; // 0..1
+            let t = ((d - feather) / (1.0 - feather)).clamp(0.0, 1.0);
+            let s = t * t * (3.0 - 2.0 * t); // smoothstep
+            let f = 1.0 - s * amt;
+            let i = (y * w + x) * 4;
+            if rgba[i + 3] == 0 {
+                continue;
+            }
+            rgba[i] = (rgba[i] as f32 * f) as u8;
+            rgba[i + 1] = (rgba[i + 1] as f32 * f) as u8;
+            rgba[i + 2] = (rgba[i + 2] as f32 * f) as u8;
+        }
+    }
+}
+
+/// Phosphor bloom (glow): blur a luminance-weighted bright-pass and add it back
+/// additively, so bright glyphs halo into a soft glow (dark areas add ~nothing).
+fn apply_glow(rgba: &mut [u8], w: usize, h: usize, fx: &PostFx) {
+    if fx.glow_amt <= 0.0 || w == 0 || h == 0 {
+        return;
+    }
+    let radius = fx.glow_radius.round().max(1.0) as usize;
+    let mut bright: Vec<[f32; 3]> = vec![[0.0; 3]; w * h];
+    for p in 0..w * h {
+        if rgba[p * 4 + 3] == 0 {
+            continue;
+        }
+        let (r, g, b) = (
+            rgba[p * 4] as f32,
+            rgba[p * 4 + 1] as f32,
+            rgba[p * 4 + 2] as f32,
+        );
+        let lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
+        let wgt = lum * lum; // emphasize bright areas
+        bright[p] = [r * wgt, g * wgt, b * wgt];
+    }
+    box_blur_rgb(&mut bright, w, h, radius);
+    box_blur_rgb(&mut bright, w, h, radius); // twice ≈ a smoother (gaussian-ish) bloom
+    let amt = fx.glow_amt.clamp(0.0, 2.0);
+    for p in 0..w * h {
+        if rgba[p * 4 + 3] == 0 {
+            continue;
+        }
+        for c in 0..3 {
+            let v = rgba[p * 4 + c] as f32 + bright[p][c] * amt;
+            rgba[p * 4 + c] = v.clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+/// Separable box blur over an f32 RGB buffer (horizontal then vertical), radius `r`.
+fn box_blur_rgb(buf: &mut [[f32; 3]], w: usize, h: usize, r: usize) {
+    if r == 0 || w == 0 || h == 0 {
+        return;
+    }
+    let norm = 1.0 / (2 * r + 1) as f32;
+    // Horizontal.
+    let mut tmp = buf.to_vec();
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = [0.0f32; 3];
+            for k in 0..=2 * r {
+                let sx = (x + k).saturating_sub(r).min(w - 1);
+                let s = buf[y * w + sx];
+                acc[0] += s[0];
+                acc[1] += s[1];
+                acc[2] += s[2];
+            }
+            tmp[y * w + x] = [acc[0] * norm, acc[1] * norm, acc[2] * norm];
+        }
+    }
+    // Vertical.
+    for x in 0..w {
+        for y in 0..h {
+            let mut acc = [0.0f32; 3];
+            for k in 0..=2 * r {
+                let sy = (y + k).saturating_sub(r).min(h - 1);
+                let s = tmp[sy * w + x];
+                acc[0] += s[0];
+                acc[1] += s[1];
+                acc[2] += s[2];
+            }
+            buf[y * w + x] = [acc[0] * norm, acc[1] * norm, acc[2] * norm];
+        }
+    }
+}
+
+/// Phosphor RGB mask (aperture grille): dim two of every three vertical stripes so the
+/// image reads through R/G/B phosphors. `phos_size` is the stripe width; `phos_amt`
+/// the dimming depth (0 = off, 1 = full — off-channels go black in their stripe).
+fn apply_phosphor(rgba: &mut [u8], w: usize, h: usize, fx: &PostFx) {
+    if fx.phos_amt <= 0.0 {
+        return;
+    }
+    let size = fx.phos_size.max(1) as usize;
+    let a = fx.phos_amt.clamp(0.0, 1.0);
+    let dim = 1.0 - a;
+    for y in 0..h {
+        for x in 0..w {
+            let mask = match (x / size) % 3 {
+                0 => [1.0, dim, dim],
+                1 => [dim, 1.0, dim],
+                _ => [dim, dim, 1.0],
+            };
+            let i = (y * w + x) * 4;
+            if rgba[i + 3] == 0 {
+                continue;
+            }
+            rgba[i] = (rgba[i] as f32 * mask[0]) as u8;
+            rgba[i + 1] = (rgba[i + 1] as f32 * mask[1]) as u8;
+            rgba[i + 2] = (rgba[i + 2] as f32 * mask[2]) as u8;
         }
     }
 }
@@ -17203,6 +17651,7 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             dither_n: 0,
             dither_scale_x: 1,
             dither_scale_y: 1,
+            fx: PostFx::default(),
             balance: [0, 0, 0],
             palette: None,
         },
@@ -17323,7 +17772,13 @@ fn apply_op(rgba: &mut [u8], w: usize, h: usize, op: OpKind, a: &Adjust) {
             }
         }
         // Marker ops — handled directly by apply_pipeline, never here.
-        OpKind::Palette | OpKind::ColorBalance | OpKind::Dither => {}
+        OpKind::Palette
+        | OpKind::ColorBalance
+        | OpKind::Dither
+        | OpKind::Scanlines
+        | OpKind::Glow
+        | OpKind::Vignette
+        | OpKind::Phosphor => {}
     }
 }
 
@@ -22332,6 +22787,10 @@ mod tests {
             OpKind::ColorBalance,
             OpKind::Dither,
             OpKind::Palette,
+            OpKind::Scanlines,
+            OpKind::Glow,
+            OpKind::Vignette,
+            OpKind::Phosphor,
         ];
         let mut bright_first = post_first;
         bright_first.order.swap(0, 1); // brightness now before posterize
@@ -22379,6 +22838,10 @@ mod tests {
                 OpKind::ColorBalance,
                 OpKind::Dither,
                 OpKind::Palette,
+                OpKind::Scanlines,
+                OpKind::Glow,
+                OpKind::Vignette,
+                OpKind::Phosphor,
             ],
             ..Default::default()
         };
@@ -22392,6 +22855,7 @@ mod tests {
             dither_n: 0,
             dither_scale_x: 1,
             dither_scale_y: 1,
+            fx: PostFx::default(),
             balance: [0, 0, 0],
             palette: Some(&pal),
         };
@@ -22399,8 +22863,11 @@ mod tests {
         apply_pipeline(&mut last, 1, 1, &a, &aux);
         assert_eq!(&last[0..3], &[100, 0, 0], "remap last wins outright");
         // Palette FIRST: remap to red=100, THEN brightness lifts it above 100.
+        // (Palette is no longer last — 4 inactive post-FX ops trail it — so rotate the
+        // Palette op to the front by its actual position.)
         let mut b = a;
-        b.order.rotate_right(1); // Palette moves to the front
+        let pos = b.order.iter().position(|o| *o == OpKind::Palette).unwrap();
+        b.order.rotate_left(pos);
         let mut first = vec![10u8, 20, 30, 255];
         apply_pipeline(&mut first, 1, 1, &b, &aux);
         assert!(
@@ -22408,6 +22875,85 @@ mod tests {
             "brightness after remap lifts the red channel"
         );
         assert_ne!(last, first, "moving the palette op changes the result");
+    }
+
+    #[test]
+    fn postfx_record_roundtrips() {
+        let fx = PostFx {
+            scan_amt: 0.5,
+            scan_period: 4,
+            scan_dir: 2,
+            scan_color: [10, 20, 30],
+            glow_amt: 1.2,
+            glow_radius: 5.0,
+            vig_amt: 0.6,
+            vig_feather: 0.4,
+            phos_amt: 0.3,
+            phos_size: 2,
+        };
+        assert_eq!(PostFx::from_record(&fx.to_record()), fx);
+        // A short/empty record fills trailing fields with defaults (forward-compat).
+        assert_eq!(PostFx::from_record(&[]), PostFx::default());
+    }
+
+    #[test]
+    fn scanlines_darken_by_direction() {
+        let mk = || vec![255u8; 4 * 4 * 4];
+        let fx = |dir| PostFx {
+            scan_amt: 1.0,
+            scan_period: 2,
+            scan_dir: dir,
+            scan_color: [0, 0, 0],
+            ..Default::default()
+        };
+        let at = |b: &[u8], x: usize, y: usize| b[(y * 4 + x) * 4];
+        // Horizontal: even rows go black, odd rows stay bright.
+        let mut h = mk();
+        apply_scanlines(&mut h, 4, 4, &fx(0));
+        assert_eq!(at(&h, 0, 0), 0);
+        assert_eq!(at(&h, 0, 1), 255);
+        // Vertical: even columns go black.
+        let mut v = mk();
+        apply_scanlines(&mut v, 4, 4, &fx(1));
+        assert_eq!(at(&v, 0, 0), 0);
+        assert_eq!(at(&v, 1, 0), 255);
+    }
+
+    #[test]
+    fn vignette_darkens_corners_not_center() {
+        let mut b = vec![200u8; 9 * 9 * 4];
+        apply_vignette(
+            &mut b,
+            9,
+            9,
+            &PostFx {
+                vig_amt: 1.0,
+                vig_feather: 0.0,
+                ..Default::default()
+            },
+        );
+        let at = |x: usize, y: usize| b[(y * 9 + x) * 4] as i32;
+        assert_eq!(at(4, 4), 200, "center untouched");
+        assert!(at(0, 0) < at(2, 2), "further from center = darker");
+    }
+
+    #[test]
+    fn phosphor_masks_rgb_stripes() {
+        // White, 1px stripes, full amount → each column keeps one channel.
+        let mut b = vec![255u8; 3 * 4];
+        apply_phosphor(
+            &mut b,
+            3,
+            1,
+            &PostFx {
+                phos_amt: 1.0,
+                phos_size: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(&b[0..3], &[255, 0, 0], "col 0 = red phosphor");
+        assert_eq!(&b[4..7], &[0, 255, 0], "col 1 = green");
+        assert_eq!(&b[8..11], &[0, 0, 255], "col 2 = blue");
     }
 
     #[test]
@@ -22423,6 +22969,7 @@ mod tests {
             dither_n: 0,
             dither_scale_x: 1,
             dither_scale_y: 1,
+            fx: PostFx::default(),
             balance: [0, 0, 0],
             palette: None,
         };
