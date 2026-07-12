@@ -68,7 +68,8 @@ and the rest of the demoscene / textmode art world — right down to baud-rate
 - **Recolor pane** — a fully reorderable pipeline: adjustments
   (brightness/contrast/gamma/hue/vibrance/posterize/invert/…), per-axis **pixelate**,
   palette rematch, **reduce-to-N** (on any image), **dithering** (with a zoomable,
-  per-axis cell + Auto-detect), **resize/resample**, and bakeable **CRT post-FX**
+  per-axis cell + Auto-detect), **resize/resample** with **pixel-art upscalers**
+  (Scale2x/3x, Eagle, xBR, HQx, 2xSaI…), and bakeable **CRT post-FX**
   (scanlines / glow / vignette / phosphor). Save the whole stack as a named
   **PixelFX preset** and re-apply it in one click — and it all works on 16colo.rs art too.
 - **A library of 55 bundled palettes** (CGA, EGA, VGA, Game Boy, NES, C64, PICO-8,
@@ -354,7 +355,11 @@ including the effects:
   pipeline at that lower resolution, then upscale back so it displays at the *same*
   on-screen size — to judge low-res degradation and dither at single-pixel scale.
   Width/Height sliders with a Lock, **Quick** 100/75/50/25 %, and `/2 · ×2 · ×¼ · ÷¼`
-  steps.
+  steps. An **Upscale** dropdown runs a pixel-art scaling algorithm *first* (so the
+  enlarged art flows through the whole stack + Save): **Scale2x/EPX · Scale3x ·
+  Eagle 2×/3× · xBR 2×/3×/4× · HQ2x/3x/4x · 2xSaI · Super2xSaI · SuperEagle** — the
+  smooth [pixel-art scalers](https://en.wikipedia.org/wiki/Pixel-art_scaling_algorithms)
+  that enlarge sprites with edge-aware interpolation instead of blocky nearest.
 - **CRT post-FX** (bake into the image, positionable anywhere in the stack):
   **Scanlines** (amount, spacing, horizontal `==` / vertical `||` / 45° diagonal
   `\\` `//` direction, and a tint color), **Glow** (phosphor bloom), **Vignette**

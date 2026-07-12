@@ -91,6 +91,12 @@ src/
                      tracker formats xmrs doesn't (669/far/okt/med/amf/ult/mtm/stm)
   format_color.rs    per-format tile/waveform/badge accent colors — a process-global ext→RGB
                      map (Preferences-editable, persisted), read by the grid AND thumbnailer
+  scale.rs           pixel-art UPSCALERS for the Recolor Resize→Upscale dropdown (a `Scaler`
+                     enum + `apply(rgba,w,h)->(out,ow,oh)`): Scale2x/EPX, Scale3x, Eagle 2×/3×
+                     (hand-rolled hard-edge), xBR 2×/3×/4× (ported from libxbr FILT2/FILT3;
+                     4× = 2× chained), 2xSaI/Super2xSaI/SuperEagle (ported from snes9x
+                     2xsai.cpp), and HQ2x/3x/4x (via the `hqx` crate, bridged u8-RGBA↔u32-ARGB).
+                     Runs as a PRE-pipeline step in the 4 recolor consumers (`scale_source`).
 build.rs             compiles vendor/libxmp (C) into a static lib via the cc crate
 vendor/libxmp/       vendored libxmp 4.6.3 source (MIT) — src/ + include/ + libxmp-sources.cmake
   decode/
@@ -167,7 +173,7 @@ cargo build --release
 cargo check              # fast type-check during edits
 cargo clippy             # lint
 cargo fmt                # format
-cargo test               # 213 tests (203 unit + 10 headless egui_kittest GUI tests; +11 ignored network/real-trash)
+cargo test               # 218 tests (208 unit + 10 headless egui_kittest GUI tests; +11 ignored network/real-trash)
 cargo test gui_tests     # just the egui_kittest UI tests; cargo test <name> for one
 ```
 
@@ -440,6 +446,16 @@ rematch**, and the *order* of all of it is user-controlled.
   runs at the reduced resolution. Factor-based (`resize_on`/`resize_fx`/`resize_fy`/
   `resize_lock`, all `PixelView` fields); `resize_target(w,h)` computes `(tw,th)`. Every
   recolor path calls this instead of `apply_pipeline` directly.
+- **Pixel-art upscalers (`scale.rs`, `scale_algo: Scaler`, `SCALE_ALGO_KEY`).** The
+  Resize section's **Upscale** dropdown runs an integer pixel-art scaler (Scale2x/3x,
+  Eagle, xBR 2×/3×/4×, HQ2x/3x/4x, 2xSaI/Super2xSaI/SuperEagle) as a **pre-pipeline**
+  step: `self.scale_source(w,h,rgba)` enlarges the source *before* the pipeline, so the
+  whole stack + Save operate on the blown-up art. It's applied in all 4 recolor consumers
+  (make_preview / make_full_reduced / grid_recolored_tex / save_recolored) right after
+  the source decode; the dither `eff_dither_scale` native dims are multiplied by the scale
+  factor so the small preview still predicts the full view. In `pipeline_active`/`_key` +
+  captured in `FxPreset`. Adding a scaler = one `Scaler` variant + one fn (the UI/persist
+  iterate `Scaler::ALL`). Still to add: MMPX + LQx (need their exact reference source).
 - **Dither is decoupled from the snap.** Ordered/Bayer + the editable **Custom** matrix
   (`dither_custom`/`dither_custom_n`, seeded by `thumb::bayer_values`) are a *pure bias*
   applied at the `Dither` slot via `thumb::ordered_bias` — the later `Palette` op does
@@ -1375,7 +1391,7 @@ than assuming a logic bug. Already hit and migrated for 0.34.3:
 
 ## Testing
 
-`cargo test` runs 213 tests, all headless (203 unit + 10 GUI; plus 11 `#[ignore]`
+`cargo test` runs 218 tests, all headless (208 unit + 10 GUI; plus 11 `#[ignore]`
 network / real-trash tests that hit the live 16colo.rs API or the system trash):
 - **Unit tests** (`#[cfg(test)] mod tests` per module): PCX decode + sniff,
   `Registry` dispatch (incl. a real PNG via the `image` crate), `make_thumb` /
