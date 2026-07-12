@@ -799,32 +799,32 @@ pub struct PixelView {
     audio_player: Option<AudioPlayer>, // in-app play/pause/seek preview (rodio), None = idle
     audio_decode_cache: Vec<(PathBuf, u64, DecodedAudio)>, // LRU of decoded audio (key: path+sig)
     audio_loading: Option<AudioLoading>, // a background audio decode in flight (spinner while pending)
-    audio_autoplay: bool,      // start playing on select + loop until stopped (persisted)
-    wave_drag: Option<WaveDrag>, // active waveform-editor drag (transient)
+    audio_autoplay: bool,                // start playing on select + loop until stopped (persisted)
+    wave_drag: Option<WaveDrag>,         // active waveform-editor drag (transient)
     wave_drag_big: bool, // which waveform owns the active drag (big central vs. compact Details) —
     // the SAME audio is drawn in BOTH at once, sharing `wave_drag`; only the owner may process/commit
     // it, else the non-owner maps the global pointer through its own (far-away) rect and clobbers it
     nudge_lock: Option<(Edge, f32)>, // (edge, last wheel-nudge time): keep nudging it as it drifts
     wave_view: Option<(f32, f32)>, // zoomed view window (start,end secs); None = whole file (transient)
-    sel_undo: Vec<(f32, f32)>,   // selection history: previous (start,end)s for undo (transient)
-    sel_redo: Vec<(f32, f32)>,   // undone selections, for redo (transient)
+    sel_undo: Vec<(f32, f32)>,     // selection history: previous (start,end)s for undo (transient)
+    sel_redo: Vec<(f32, f32)>,     // undone selections, for redo (transient)
     sel_undo_pending: Option<(f32, f32)>, // pre-change selection, pushed to sel_undo on commit
-    play_from_mark: Option<f32>, // where the last middle-click started playback (neon ▶ marker)
+    play_from_mark: Option<f32>,   // where the last middle-click started playback (neon ▶ marker)
     zoom_edit_pct: u32, // "Zoom Edit %": magnification of the edge inset (0 = off); persisted
     wave_amp: f32,      // waveform vertical magnification (1 = normal); persisted
     // Transient / BPM / musical-grid state (item 10). Marks are detected times (secs), cached for
     // the current buffer and recomputed when the sensitivity or buffer changes.
-    transients_on: bool,        // detect + draw transient guideline markers (persisted)
-    snap_transient: bool,       // snap selection edges to the nearest transient (persisted)
-    transient_sens: f32,        // detection sensitivity 0..1 (persisted)
-    transient_marks: Vec<f32>,  // detected transient times (secs), for markers + Alt-snap
-    transient_dirty: bool,      // recompute marks next frame (buffer/sensitivity changed)
-    bpm: f32,                   // tempo for the musical grid (persisted)
-    musical_on: bool,           // draw a musical (beat-division) grid (persisted)
-    musical_div: u8,            // 0=whole 1=half 2=quarter 3=eighth 4=sixteenth 5=32nd (persisted)
-    audio_octave: i32,         // onscreen-keyboard octave offset (transient)
-    audio_volume: f32,         // master playback volume 0..1 (menu-bar slider, persisted)
-    audio_muted: bool,         // master mute (menu-bar speaker toggle, persisted)
+    transients_on: bool,  // detect + draw transient guideline markers (persisted)
+    snap_transient: bool, // snap selection edges to the nearest transient (persisted)
+    transient_sens: f32,  // detection sensitivity 0..1 (persisted)
+    transient_marks: Vec<f32>, // detected transient times (secs), for markers + Alt-snap
+    transient_dirty: bool, // recompute marks next frame (buffer/sensitivity changed)
+    bpm: f32,             // tempo for the musical grid (persisted)
+    musical_on: bool,     // draw a musical (beat-division) grid (persisted)
+    musical_div: u8,      // 0=whole 1=half 2=quarter 3=eighth 4=sixteenth 5=32nd (persisted)
+    audio_octave: i32,    // onscreen-keyboard octave offset (transient)
+    audio_volume: f32,    // master playback volume 0..1 (menu-bar slider, persisted)
+    audio_muted: bool,    // master mute (menu-bar speaker toggle, persisted)
     // 4×4 sample-pad grid (a mini Battery) — a persistent, cross-file "kit" of favorite samples
     // for quick auditioning. Always length 16. Metadata persists (PADS_KEY); each pad's audio is
     // a WAV under `<data_dir>/pads/` (write-through). Saveable/loadable as a named `.pvkit`.
@@ -834,18 +834,18 @@ pub struct PixelView {
     kit_global_vel_amt: u8, // the fixed velocity (0..127) used for all pads when global vel is on
     audio_left_w: f32,  // width of the resizable sample-list pane in the big audio view; persisted
     audio_wave_h: f32,  // height of the resizable waveform in the big audio view; persisted
-    audio_kb_h: f32,    // height of the resizable onscreen keyboard in the big audio view; persisted
+    audio_kb_h: f32, // height of the resizable onscreen keyboard in the big audio view; persisted
     pad_assign: Option<usize>, // "MIDI-learn" mode: the next note-on assigns this pad's note (transient)
-    edit_focus: EditFocus,     // what the waveform editor is pointed at (Song / Sample / a Pad drill-in)
+    edit_focus: EditFocus, // what the waveform editor is pointed at (Song / Sample / a Pad drill-in)
     editor_stash: Option<EditorStash>, // saved editor state during a pad drill-in (restored on Back)
     note_flash: HashMap<i32, f32>, // MIDI note → last-played ctx time, for the keyboard key lights (transient)
-    last_midi_t: f32,              // ctx time of the last hardware-MIDI event, for the activity LED (transient)
-    kit_name: String,   // current kit's name ("Untitled" by default; persisted)
-    kit_editor: bool,   // standalone Sample-Pads view (no audio file needed); transient
-    midi_follow: bool,  // note-triggered pads auto-drill into the editor (persisted)
+    last_midi_t: f32, // ctx time of the last hardware-MIDI event, for the activity LED (transient)
+    kit_name: String, // current kit's name ("Untitled" by default; persisted)
+    kit_editor: bool, // standalone Sample-Pads view (no audio file needed); transient
+    midi_follow: bool, // note-triggered pads auto-drill into the editor (persisted)
     kit_map_lock: bool, // lock the pad→MIDI-note map (MIDI-learn won't reassign); persisted
-    octave_lock: bool,  // lock the onscreen-keyboard octave across editor views (persisted)
-    data_dir: PathBuf,  // eframe data dir (pads WAVs + saved kits live under here)
+    octave_lock: bool, // lock the onscreen-keyboard octave across editor views (persisted)
+    data_dir: PathBuf, // eframe data dir (pads WAVs + saved kits live under here)
     // Hardware MIDI controller → play the loaded sample. The callback runs on midir's thread
     // and sends note events over `midi_rx`; `midi_conn` must be kept alive (drop = close).
     midi_rx: Option<std::sync::mpsc::Receiver<MidiNoteEvent>>,
@@ -856,7 +856,7 @@ pub struct PixelView {
     egui_ctx: egui::Context,
     midi_port: Option<String>, // chosen MIDI input device name (persisted)
     midi_ports: Vec<String>,   // last-enumerated device names (for the picker combo)
-    midi_sf: Option<PathBuf>,  // General MIDI SoundFont for playing .mid files (persisted; None = auto-detect)
+    midi_sf: Option<PathBuf>, // General MIDI SoundFont for playing .mid files (persisted; None = auto-detect)
     midi_sf_cache: Option<(PathBuf, std::sync::Arc<rustysynth::SoundFont>)>, // loaded GM SoundFont (once/session)
     palettes: HashMap<PathBuf, Option<Vec<[u8; 4]>>>, // details swatches; None = too many colors
     thumb_rgba: HashMap<PathBuf, (usize, usize, Vec<u8>)>, // thumb CPU pixels (for grid recolor)
@@ -890,12 +890,12 @@ pub struct PixelView {
     custom_palette: Option<Vec<[u8; 4]>>,    // a generated/edited palette (e.g. Random)
     flash: Option<[u8; 4]>,                  // swatch held down: highlight this color
     editing_color: Option<(usize, [u8; 4])>, // swatch right-click: editing palette[idx]
-    swatch_rect: Option<egui::Rect>,         // screen rect of the palette swatch row (Edit-color anchor)
-    adjust: Adjust,                          // tone adjustments applied before the palette map
-    explorer_filter: String,                 // folder-tree search box (runtime only)
-    colo_search: String,                     // 16colo.rs nav-bar search box (runtime only)
-    explorer_tab: u8,                        // 0 = Places, 1 = Folders
-    places_tab: u8,                          // Places sub-tab: 0 = Local, 1 = 16colo.rs, 2 = Kits, 3 = Samples
+    swatch_rect: Option<egui::Rect>, // screen rect of the palette swatch row (Edit-color anchor)
+    adjust: Adjust,                  // tone adjustments applied before the palette map
+    explorer_filter: String,         // folder-tree search box (runtime only)
+    colo_search: String,             // 16colo.rs nav-bar search box (runtime only)
+    explorer_tab: u8,                // 0 = Places, 1 = Folders
+    places_tab: u8, // Places sub-tab: 0 = Local, 1 = 16colo.rs, 2 = Kits, 3 = Samples
     // User-managed "Samples" locations (name, dir, optional color tag) — quick jumps to sample
     // folders to drag/assign into pads. Add/rename/colorize/remove from the Samples sub-tab.
     sample_places: Vec<(String, PathBuf, Option<[u8; 3]>)>,
@@ -931,11 +931,11 @@ pub struct PixelView {
     opener_icons: HashMap<PathBuf, Option<egui::TextureHandle>>,
 
     // preferences (round 2 #10)
-    theme: u8,                                              // 0 = dark, 1 = light
-    grid_gap: f32,           // horizontal spacing between grid tiles, in points
-    grid_gap_y: f32,         // vertical spacing between grid rows, in points
-    grid_tile_border: bool,  // draw a border + padding around each grid tile (persisted)
-    caption_fields: u16,     // bitmask: what to show under each grid thumbnail
+    theme: u8,              // 0 = dark, 1 = light
+    grid_gap: f32,          // horizontal spacing between grid tiles, in points
+    grid_gap_y: f32,        // vertical spacing between grid rows, in points
+    grid_tile_border: bool, // draw a border + padding around each grid tile (persisted)
+    caption_fields: u16,    // bitmask: what to show under each grid thumbnail
     // Per-category grid-tile backgrounds: a subtle accent behind folder / archive /
     // sample-bank tiles so container kinds read at a glance. Accents are blended into
     // the theme background (`tile_category_bg`); off = the plain default everywhere.
@@ -953,18 +953,20 @@ pub struct PixelView {
     dither_amount: f32,      // 0..1 dither strength
     dither_custom: Vec<u32>, // custom ordered-dither threshold matrix (row-major)
     dither_custom_n: usize,  // custom matrix dimension (n×n; 2/4/8)
-    dither_scale: usize,     // ordered-dither cell size in px (≥1; "zoom" the pattern)
+    dither_scale_x: usize,   // ordered-dither cell WIDTH in px (≥1; "zoom" the pattern)
+    dither_scale_y: usize,   // ordered-dither cell HEIGHT in px (≥1)
+    dither_scale_lock: bool, // lock the dither cell square (scale_x == scale_y)
     // Resize/resample preview: downsample the art to a fraction of native, run the
     // whole pipeline (dither/palette) at that lower resolution, then nearest-upscale
     // back to native — so it displays at the SAME screen size but shows the
     // degradation, and single-pixel dither operates at the reduced resolution.
-    resize_on: bool,   // is the resample active?
-    resize_fx: f32,    // width factor  (0,1] of native
-    resize_fy: f32,    // height factor (0,1] of native
-    resize_lock: bool, // lock aspect (fx == fy)
-    balance_color: [u8; 3],  // color-balance op: ±offset color (128 = neutral)
-    balance_strength: f32,   // color-balance op: 0..1 amount
-    balance_hex: String,     // live buffer for the hex paste field
+    resize_on: bool,                                        // is the resample active?
+    resize_fx: f32,                                         // width factor  (0,1] of native
+    resize_fy: f32,                                         // height factor (0,1] of native
+    resize_lock: bool,                                      // lock aspect (fx == fy)
+    balance_color: [u8; 3], // color-balance op: ±offset color (128 = neutral)
+    balance_strength: f32,  // color-balance op: 0..1 amount
+    balance_hex: String,    // live buffer for the hex paste field
     quantize_cache: Option<(PathBuf, usize, Vec<[u8; 4]>)>, // memoized reduction
     // Colors to feed the Reduce median-cut when the image has too many colors to
     // extract a swatch palette (`palettes[path]` is `Some(None)`): its pixels
@@ -1051,8 +1053,8 @@ pub struct PixelView {
     // dedupes so we only push a `ViewportCommand::Title` when the string actually changes.
     title_show_path: bool,
     title_last: String,
-    idle_t: f32,      // seconds of mouse stillness (immersive cursor auto-hide)
-    shuffle: bool,    // screensaver: at a pack's end, load another random pack (persisted)
+    idle_t: f32,   // seconds of mouse stillness (immersive cursor auto-hide)
+    shuffle: bool, // screensaver: at a pack's end, load another random pack (persisted)
     // screensaver: a worker picking a random 16colo.rs pack → (year, name, download URL)
     random_rx: Option<std::sync::mpsc::Receiver<RandomPick>>,
     pending_autoplay: bool, // open the first art file once a (random) pack finishes mounting
@@ -1286,7 +1288,9 @@ impl PixelView {
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
     const DITHER_CUSTOM_KEY: &'static str = "dither_custom";
     const DITHER_CUSTOM_N_KEY: &'static str = "dither_custom_n";
-    const DITHER_SCALE_KEY: &'static str = "dither_scale";
+    const DITHER_SCALE_KEY: &'static str = "dither_scale"; // legacy single value → X
+    const DITHER_SCALE_Y_KEY: &'static str = "dither_scale_y";
+    const DITHER_SCALE_LOCK_KEY: &'static str = "dither_scale_lock";
     const RESIZE_ON_KEY: &'static str = "resize_on";
     const RESIZE_FX_KEY: &'static str = "resize_fx";
     const RESIZE_FY_KEY: &'static str = "resize_fy";
@@ -1670,11 +1674,19 @@ impl PixelView {
             .and_then(|s| eframe::get_value::<Vec<u32>>(s, Self::DITHER_CUSTOM_KEY))
             .filter(|v| v.len() == dither_custom_n * dither_custom_n)
             .unwrap_or_else(|| crate::thumb::bayer_values(dither_custom_n));
-        let dither_scale = cc
+        // Legacy `dither_scale` (single square value) seeds X; Y follows it if unset,
+        // so an older config migrates to a square cell.
+        let dither_scale_x = cc
             .storage
             .and_then(|s| eframe::get_value::<usize>(s, Self::DITHER_SCALE_KEY))
             .unwrap_or(1)
-            .clamp(1, 32);
+            .clamp(1, 16);
+        let dither_scale_y = cc
+            .storage
+            .and_then(|s| eframe::get_value::<usize>(s, Self::DITHER_SCALE_Y_KEY))
+            .unwrap_or(dither_scale_x)
+            .clamp(1, 16);
+        let dither_scale_lock = get_bool(Self::DITHER_SCALE_LOCK_KEY).unwrap_or(true);
         let resize_on = get_bool(Self::RESIZE_ON_KEY).unwrap_or(false);
         let resize_fx = cc
             .storage
@@ -1919,7 +1931,9 @@ impl PixelView {
             dither_amount,
             dither_custom,
             dither_custom_n,
-            dither_scale,
+            dither_scale_x,
+            dither_scale_y,
+            dither_scale_lock,
             resize_on,
             resize_fx,
             resize_fy,
@@ -2080,8 +2094,8 @@ impl PixelView {
     /// each name-sorted — the default order; Phase 5 makes this configurable).
     fn open_folder(&mut self, dir: PathBuf) {
         self.kit_editor = false; // navigating leaves the standalone pad editor
-        // Visiting a folder (incl. a 16colo.rs pack) marks it viewed — recorded here,
-        // before the remote/archive redirect, so the key is the tile's own path.
+                                 // Visiting a folder (incl. a 16colo.rs pack) marks it viewed — recorded here,
+                                 // before the remote/archive redirect, so the key is the tile's own path.
         self.mark_viewed(&dir);
         // The virtual 16colo.rs tree (years → packs → downloaded pack contents).
         if crate::sixteen::is_remote(&dir) {
@@ -2143,7 +2157,8 @@ impl PixelView {
                     .is_none_or(|x| self.registry.known_extension(x))
                     || crate::archive::is_archive(&p)
                     || is_sample_bank(&p)
-                    || (self.plugin_audio && is_kit_ext(&p)) // saved kits (click → load)
+                    || (self.plugin_audio && is_kit_ext(&p))
+                // saved kits (click → load)
                 {
                     all.push(make_entry(p, false));
                 }
@@ -2786,8 +2801,12 @@ impl PixelView {
         match self.pads.get(i).and_then(|p| p.buf.clone()) {
             Some(buf) => {
                 let _ = std::fs::create_dir_all(pads_dir(&self.data_dir));
-                let _ =
-                    write_wav_16(&path, &buf.samples, buf.channels.get(), buf.sample_rate.get());
+                let _ = write_wav_16(
+                    &path,
+                    &buf.samples,
+                    buf.channels.get(),
+                    buf.sample_rate.get(),
+                );
             }
             None => {
                 let _ = std::fs::remove_file(&path);
@@ -2842,7 +2861,10 @@ impl PixelView {
     /// (only every *other* parameter is cloned from the source), so the variation triggers on the
     /// pad's already-mapped MIDI key. Unlocked, the clone adopts the source's key. Persists the WAV.
     fn clone_pad(&mut self, src: usize, dst: usize) {
-        if src == dst || src >= self.pads.len() || dst >= self.pads.len() || self.pads[src].is_empty()
+        if src == dst
+            || src >= self.pads.len()
+            || dst >= self.pads.len()
+            || self.pads[src].is_empty()
         {
             return;
         }
@@ -3013,7 +3035,12 @@ impl PixelView {
         // (keeping the replaced pad's loop_type as before).
         let (loop_on, loop_start, loop_end, loop_type) = match buf.loop_region {
             Some((ls, le, lt)) => (true, ls, le, lt),
-            None => (false, 0.0, 0.0, if old.is_empty() { 0 } else { old.loop_type }),
+            None => (
+                false,
+                0.0,
+                0.0,
+                if old.is_empty() { 0 } else { old.loop_type },
+            ),
         };
         self.pads[i] = Pad {
             name,
@@ -3124,7 +3151,11 @@ impl PixelView {
         if !self.octave_lock {
             self.audio_octave = 0; // a fresh pad edit starts at octave 0 unless the octave is locked
         }
-        let dur = self.audio_player.as_ref().map(|a| a.duration).unwrap_or(0.0);
+        let dur = self
+            .audio_player
+            .as_ref()
+            .map(|a| a.duration)
+            .unwrap_or(0.0);
         let (ls, le) = self.pads[i].loop_region(dur);
         let loop_on = self.pads[i].loop_on;
         if let Some(ap) = self.audio_player.as_mut() {
@@ -3187,7 +3218,12 @@ impl PixelView {
             .add_filter("WAV", &["wav"])
             .save_file()
         {
-            match write_wav_16(&path, &buf.samples, buf.channels.get(), buf.sample_rate.get()) {
+            match write_wav_16(
+                &path,
+                &buf.samples,
+                buf.channels.get(),
+                buf.sample_rate.get(),
+            ) {
                 Ok(()) => self.status = format!("Exported {}", short_name(&path)),
                 Err(e) => self.status = format!("Export failed: {e}"),
             }
@@ -3229,7 +3265,11 @@ impl PixelView {
                 .compression_method(zip::CompressionMethod::Deflated);
             for (i, name, wav) in &items {
                 zw.start_file(
-                    format!("pad_{:02}_{}.wav", i + 1, sanitize_filename(strip_audio_ext(name))),
+                    format!(
+                        "pad_{:02}_{}.wav",
+                        i + 1,
+                        sanitize_filename(strip_audio_ext(name))
+                    ),
                     opts,
                 )?;
                 zw.write_all(wav)?;
@@ -3293,11 +3333,20 @@ impl PixelView {
         use std::io::Write;
         let mut manifest = String::new();
         manifest.push_str(&format!("name\t{}\n", self.kit_name));
-        manifest.push_str(&format!("midi\t{}\n", self.midi_port.as_deref().unwrap_or("")));
+        manifest.push_str(&format!(
+            "midi\t{}\n",
+            self.midi_port.as_deref().unwrap_or("")
+        ));
         manifest.push_str(&format!("base\t{}\n", self.pad_base_note));
         manifest.push_str(&format!("octave\t{}\n", self.audio_octave));
-        manifest.push_str(&format!("octlock\t{}\n", if self.octave_lock { 1 } else { 0 }));
-        manifest.push_str(&format!("gvel\t{}\n", if self.kit_global_vel { 1 } else { 0 }));
+        manifest.push_str(&format!(
+            "octlock\t{}\n",
+            if self.octave_lock { 1 } else { 0 }
+        ));
+        manifest.push_str(&format!(
+            "gvel\t{}\n",
+            if self.kit_global_vel { 1 } else { 0 }
+        ));
         manifest.push_str(&format!("gvelamt\t{}\n", self.kit_global_vel_amt));
         for (i, p) in self.pads.iter().enumerate() {
             manifest.push_str(&format!("pad\t{}\t{}\n", i, p.record().join("\t")));
@@ -3311,7 +3360,11 @@ impl PixelView {
             for (i, p) in self.pads.iter().enumerate() {
                 if let Some(b) = &p.buf {
                     zw.start_file(format!("pad_{i:02}.wav"), opts)?;
-                    zw.write_all(&wav_bytes_16(&b.samples, b.channels.get(), b.sample_rate.get()))?;
+                    zw.write_all(&wav_bytes_16(
+                        &b.samples,
+                        b.channels.get(),
+                        b.sample_rate.get(),
+                    ))?;
                 }
             }
             zw.finish()?;
@@ -3326,7 +3379,11 @@ impl PixelView {
     /// Save the current kit into the kits dir under `name` (→ `<data>/kits/<name>.pvkit`).
     fn save_kit_named(&mut self, name: &str) {
         let name = name.trim();
-        self.kit_name = if name.is_empty() { "Untitled".into() } else { name.to_string() };
+        self.kit_name = if name.is_empty() {
+            "Untitled".into()
+        } else {
+            name.to_string()
+        };
         let dir = self.kits_dir();
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(format!("{}.pvkit", sanitize_filename(&self.kit_name)));
@@ -3391,7 +3448,9 @@ impl PixelView {
                     .and_then(|mut f| f.read_to_end(&mut bytes).ok())
                     .is_some();
                 if ok {
-                    if let Ok(d) = decode_audio(Path::new("pad.wav"), std::mem::take(&mut bytes), None) {
+                    if let Ok(d) =
+                        decode_audio(Path::new("pad.wav"), std::mem::take(&mut bytes), None)
+                    {
                         pads[i].buf = Some(std::sync::Arc::new(SampleBuf {
                             samples: d.samples,
                             channels: d.channels,
@@ -3405,10 +3464,28 @@ impl PixelView {
                     pads[i].buf = None; // manifest said audio but the WAV is missing → empty
                 }
             }
-            Ok(KitManifest { name, pads, midi, base, octave, lock, gvel, gvelamt })
+            Ok(KitManifest {
+                name,
+                pads,
+                midi,
+                base,
+                octave,
+                lock,
+                gvel,
+                gvelamt,
+            })
         })();
         match parsed {
-            Ok(KitManifest { name, pads, midi, base, octave, lock, gvel, gvelamt }) => {
+            Ok(KitManifest {
+                name,
+                pads,
+                midi,
+                base,
+                octave,
+                lock,
+                gvel,
+                gvelamt,
+            }) => {
                 self.kit_name = name;
                 self.pads = pads;
                 self.pad_base_note = base.clamp(0, 115);
@@ -3580,10 +3657,7 @@ impl PixelView {
             "/usr/share/sounds/sf2/FluidR3_GM.sf2",
             "/usr/share/soundfonts/FluidR3_GM.sf2",
         ];
-        CANDIDATES
-            .iter()
-            .map(PathBuf::from)
-            .find(|p| p.is_file())
+        CANDIDATES.iter().map(PathBuf::from).find(|p| p.is_file())
     }
 
     /// (Dis)connect the chosen MIDI input device. `None` closes any open port. Dropping the
@@ -3904,7 +3978,11 @@ impl PixelView {
     fn hotswap_assign(&mut self) {
         if let Some(p) = self.hotswap_pad {
             self.persist_pad_wav(p); // the pad already holds the auditioned sample in memory
-            let n = self.pads.get(p).map(|pd| pd.name.clone()).unwrap_or_default();
+            let n = self
+                .pads
+                .get(p)
+                .map(|pd| pd.name.clone())
+                .unwrap_or_default();
             self.status = format!("Assigned {} → pad {}", n, p + 1);
         }
         self.hotswap_pad = None;
@@ -3966,14 +4044,20 @@ impl PixelView {
             self.sample_focus = true; // focus moves to the browser
             self.hotswap_pad = Some(p);
             self.hotswap_orig = Some(self.pads[p].clone());
-            self.status = format!("Pad {}: browse replacements (↑/↓ audition, Enter assign)", p + 1);
+            self.status = format!(
+                "Pad {}: browse replacements (↑/↓ audition, Enter assign)",
+                p + 1
+            );
         } else {
             // No source file to open — still arm the hot-swap so once you click into a Samples
             // location, ↑/↓ audition replacements on this pad (Enter assigns, Esc reverts).
             self.sample_focus = true;
             self.hotswap_pad = Some(p);
             self.hotswap_orig = Some(self.pads[p].clone());
-            self.status = format!("Pad {}: pick a Samples location, then ↑/↓ to audition", p + 1);
+            self.status = format!(
+                "Pad {}: pick a Samples location, then ↑/↓ to audition",
+                p + 1
+            );
         }
     }
 
@@ -4214,7 +4298,13 @@ impl PixelView {
     /// compact Details-pane strip. `meta_dur` is the parsed duration (a fallback before the
     /// player is loaded). A free-standing method (not a closure) so it can mutate `self`
     /// directly after drawing. Shared by the main viewer and the Details pane.
-    fn draw_audio_controls(&mut self, ui: &mut egui::Ui, path: &Path, big: bool, meta_dur: Option<f32>) {
+    fn draw_audio_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        path: &Path,
+        big: bool,
+        meta_dur: Option<f32>,
+    ) {
         let loaded = self.is_audio_loaded(path);
         let now = ui.input(|i| i.time) as f32; // for pad triggers + key-light timers
         let dur = self
@@ -4285,7 +4375,10 @@ impl PixelView {
             // ("jiggle"). A shared min_size (widest of the three glyphs) makes every state one width.
             let tbtn = fixed_btn_size(ui, &[icons::PAUSE, icons::PLAY, icons::STOP]);
             if ui
-                .add(egui::Button::new(if playing { icons::PAUSE } else { icons::PLAY }).min_size(tbtn))
+                .add(
+                    egui::Button::new(if playing { icons::PAUSE } else { icons::PLAY })
+                        .min_size(tbtn),
+                )
                 .on_hover_text("Play / pause (Space)")
                 .clicked()
             {
@@ -4301,7 +4394,9 @@ impl PixelView {
             if ui
                 .add(
                     egui::Button::new(
-                        egui::RichText::new("PANIC").color(egui::Color32::BLACK).strong(),
+                        egui::RichText::new("PANIC")
+                            .color(egui::Color32::BLACK)
+                            .strong(),
                     )
                     .fill(egui::Color32::from_rgb(230, 40, 40)),
                 )
@@ -4488,9 +4583,9 @@ impl PixelView {
 
             // ---- Interaction (resolved BEFORE drawing so the edges/shade track the live drag) --
             const EDGE_PX: f32 = 6.0; // pointer-to-edge grab tolerance
-            // A full-file selection (the default loop = play everything) is treated as "no
-            // selection" for interaction, so a drag anywhere starts a fresh sub-selection instead
-            // of uselessly trying to move/resize the whole thing.
+                                      // A full-file selection (the default loop = play everything) is treated as "no
+                                      // selection" for interaction, so a drag anywhere starts a fresh sub-selection instead
+                                      // of uselessly trying to move/resize the whole thing.
             let full_sel = |lo: f32, hi: f32| lo <= 1e-4 && hi >= dur - 1e-4;
             let has_sel = sel_hi > sel_lo + 1e-4 && !full_sel(sel_lo, sel_hi);
             let (lo_x, hi_x) = (x_of(sel_lo), x_of(sel_hi));
@@ -4596,7 +4691,11 @@ impl PixelView {
                                 let ff = next_zero_crossing(&ap.samples, ch, f, true) as i64;
                                 let fb = next_zero_crossing(&ap.samples, ch, f, false) as i64;
                                 let fi = f as i64;
-                                let nf = if (ff - fi).abs() <= (fi - fb).abs() { ff } else { fb };
+                                let nf = if (ff - fi).abs() <= (fi - fb).abs() {
+                                    ff
+                                } else {
+                                    fb
+                                };
                                 (nf.max(0) as f32 / sr).clamp(0.0, (dur - width).max(0.0))
                             } else if (snap_on || alt) && !boundaries.is_empty() {
                                 nearest_mark(&boundaries, lo0).clamp(0.0, (dur - width).max(0.0))
@@ -4660,7 +4759,9 @@ impl PixelView {
             // Cursor feedback: ↔ over / while RESIZING an edge, grab inside a selection. A FRESH
             // selection drag has no fixed edge (both endpoints move) → not treated as an edge.
             let active_edge = match self.wave_drag {
-                Some(WaveDrag::Select { edge, fresh: false, .. }) => Some(edge),
+                Some(WaveDrag::Select {
+                    edge, fresh: false, ..
+                }) => Some(edge),
                 _ => None,
             };
             let fresh_drag = matches!(self.wave_drag, Some(WaveDrag::Select { fresh: true, .. }));
@@ -4710,8 +4811,10 @@ impl PixelView {
                         self.nudge_lock = Some((edge, now));
                         let steps = (notches.abs().round() as i64).clamp(1, 8);
                         let cur_t = if edge == Edge::Left { sel_lo } else { sel_hi };
-                        let cur_f =
-                            (cur_t * sr).round().clamp(0.0, nframes.saturating_sub(1) as f32) as usize;
+                        let cur_f = (cur_t * sr)
+                            .round()
+                            .clamp(0.0, nframes.saturating_sub(1) as f32)
+                            as usize;
                         let outward: i64 = if edge == Edge::Left { -1 } else { 1 };
                         let dir: i64 = if up { outward } else { -outward };
                         let new_f: i64 = if shift && alt {
@@ -4789,7 +4892,8 @@ impl PixelView {
             // When zoomed in enough that few frames are visible, draw the real per-sample peak
             // (crisp detail); otherwise sample the precomputed envelope (fast for the whole file).
             let vis_frames = (vspan * sr) as usize;
-            let use_samples = nframes > 0 && vis_frames > 0 && vis_frames < cols.saturating_mul(6).max(1);
+            let use_samples =
+                nframes > 0 && vis_frames > 0 && vis_frames < cols.saturating_mul(6).max(1);
             for cx in 0..cols {
                 let t0 = vs + (cx as f32 / w) * vspan;
                 let t1 = vs + ((cx + 1) as f32 / w) * vspan;
@@ -4871,7 +4975,11 @@ impl PixelView {
                 // Only draw an edge handle when it falls inside the visible (zoomed) window.
                 for (e, et, tag) in [(Edge::Left, draw_lo, "S"), (Edge::Right, draw_hi, "E")] {
                     if et >= vs - 1e-6 && et <= ve + 1e-6 {
-                        let (col, wdt) = if hot(e) { (GREEN_HOT, 2.5) } else { (GREEN, 1.5) };
+                        let (col, wdt) = if hot(e) {
+                            (GREEN_HOT, 2.5)
+                        } else {
+                            (GREEN, 1.5)
+                        };
                         let ex = x_of(et);
                         p.vline(ex, rect.y_range(), egui::Stroke::new(wdt, col));
                         // 's'/'e' tag just inside the selection at each edge.
@@ -4965,15 +5073,28 @@ impl PixelView {
                         rect.left_top(),
                         egui::pos2(rect.right(), rect.top() + inset_h),
                     );
-                    p.rect_filled(ir, 3.0, egui::Color32::from_rgba_unmultiplied(8, 12, 20, 240));
-                    p.rect_stroke(ir, 3.0, egui::Stroke::new(1.0, GREEN), egui::StrokeKind::Inside);
+                    p.rect_filled(
+                        ir,
+                        3.0,
+                        egui::Color32::from_rgba_unmultiplied(8, 12, 20, 240),
+                    );
+                    p.rect_stroke(
+                        ir,
+                        3.0,
+                        egui::Stroke::new(1.0, GREEN),
+                        egui::StrokeKind::Inside,
+                    );
                     let iw = ir.width().max(1.0);
                     let imid = ir.center().y;
-                    p.hline(ir.x_range(), imid, egui::Stroke::new(1.0, accent.gamma_multiply(0.3)));
+                    p.hline(
+                        ir.x_range(),
+                        imid,
+                        egui::Stroke::new(1.0, accent.gamma_multiply(0.3)),
+                    );
                     for cx in 0..(iw as usize) {
                         let f0 = (ws + (cx as f32 / iw) * span_f) as usize;
-                        let f1 =
-                            ((ws + ((cx + 1) as f32 / iw) * span_f) as usize).clamp(f0 + 1, nframes);
+                        let f1 = ((ws + ((cx + 1) as f32 / iw) * span_f) as usize)
+                            .clamp(f0 + 1, nframes);
                         let mut mx = 0.0f32;
                         for f in f0..f1 {
                             let base = f * ch;
@@ -5028,13 +5149,9 @@ impl PixelView {
                     egui::pos2(rect.right() + amp_w, rect.bottom() - 2.0),
                 );
                 let mut v = self.wave_amp;
-                let mut child = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(amp_rect)
-                        .layout(egui::Layout::centered_and_justified(
-                            egui::Direction::TopDown,
-                        )),
-                );
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(amp_rect).layout(
+                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                ));
                 if child
                     .add(
                         egui::Slider::new(&mut v, 1.0..=8.0)
@@ -5192,7 +5309,11 @@ impl PixelView {
                 let avail = ui.available_width();
                 // A wider minimum when the pane shows the "Pads (N)" list, so the truncated names
                 // stay readable (the pad grid gets the rest).
-                let left_min = if self.pad_list_visible() { 300.0 } else { 140.0 };
+                let left_min = if self.pad_list_visible() {
+                    300.0
+                } else {
+                    140.0
+                };
                 let left_w = self
                     .audio_left_w
                     .clamp(left_min, (avail - 220.0).max(left_min));
@@ -5244,8 +5365,8 @@ impl PixelView {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                     }
                     if dresp.dragged() {
-                        new_left_w =
-                            (left_w + dresp.drag_delta().x).clamp(140.0, (avail - 220.0).max(160.0));
+                        new_left_w = (left_w + dresp.drag_delta().x)
+                            .clamp(140.0, (avail - 220.0).max(160.0));
                     }
                     ui.allocate_ui_with_layout(
                         egui::vec2(right_w, h),
@@ -5471,7 +5592,11 @@ impl PixelView {
                 self.load_kit_map(&p);
             }
         }
-        if self.audio_player.as_ref().is_some_and(|ap| ap.has_active_audio()) {
+        if self
+            .audio_player
+            .as_ref()
+            .is_some_and(|ap| ap.has_active_audio())
+        {
             self.want_repaint = true;
         }
     }
@@ -5706,10 +5831,11 @@ impl PixelView {
                                         egui::Color32::from_rgb(chip[0], chip[1], chip[2]),
                                     );
                                     ui.add_space(5.0); // so the name doesn't touch the chip
-                                    // Elide the name to the remaining row width so the pane stays
-                                    // EXACTLY its allocated width (a jittering pane width cascades into
-                                    // the pad grid, sizing its cells too wide → overlap).
-                                    let max_chars = ((ui.available_width() - 6.0) / 7.0).max(4.0) as usize;
+                                                       // Elide the name to the remaining row width so the pane stays
+                                                       // EXACTLY its allocated width (a jittering pane width cascades into
+                                                       // the pad grid, sizing its cells too wide → overlap).
+                                    let max_chars =
+                                        ((ui.available_width() - 6.0) / 7.0).max(4.0) as usize;
                                     let label = if *has {
                                         elide(&format!("{:>2}. {}", i + 1, name), max_chars)
                                     } else {
@@ -5994,15 +6120,20 @@ impl PixelView {
                     };
                     ui.painter().rect_filled(rect, 5.0, bg);
                     let border = if clone_hover {
-                        egui::Stroke::new(2.5, egui::Color32::from_rgb(120, 230, 140)) // clone (Alt)
+                        egui::Stroke::new(2.5, egui::Color32::from_rgb(120, 230, 140))
+                    // clone (Alt)
                     } else if drop_hover {
-                        egui::Stroke::new(2.5, egui::Color32::from_rgb(90, 180, 255)) // drop target
+                        egui::Stroke::new(2.5, egui::Color32::from_rgb(90, 180, 255))
+                    // drop target
                     } else if assigning {
-                        egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 190, 70)) // MIDI-learn
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 190, 70))
+                    // MIDI-learn
                     } else if soloed {
-                        egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 220, 110)) // solo = green
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 220, 110))
+                    // solo = green
                     } else if muted {
-                        egui::Stroke::new(2.0, egui::Color32::from_rgb(225, 70, 70)) // mute = red
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(225, 70, 70))
+                    // mute = red
                     } else {
                         egui::Stroke::new(1.0, egui::Color32::from_gray(72))
                     };
@@ -6035,8 +6166,10 @@ impl PixelView {
                                     if n > 0 && n % 8 == 0 {
                                         ui.end_row();
                                     }
-                                    let (cr, cresp) = ui
-                                        .allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                                    let (cr, cresp) = ui.allocate_exact_size(
+                                        egui::vec2(18.0, 18.0),
+                                        egui::Sense::click(),
+                                    );
                                     let col = egui::Color32::from_rgb(c[0], c[1], c[2]);
                                     ui.painter().rect_filled(cr, 0.0, col);
                                     let outline = if color == Some(c) {
@@ -6046,7 +6179,12 @@ impl PixelView {
                                     } else {
                                         egui::Stroke::new(1.0, egui::Color32::from_black_alpha(70))
                                     };
-                                    ui.painter().rect_stroke(cr, 0.0, outline, egui::StrokeKind::Inside);
+                                    ui.painter().rect_stroke(
+                                        cr,
+                                        0.0,
+                                        outline,
+                                        egui::StrokeKind::Inside,
+                                    );
                                     if cresp.clicked() {
                                         want_color = Some((i, Some(c)));
                                         ui.close();
@@ -6096,11 +6234,10 @@ impl PixelView {
                                 egui::pos2(rect.right() - 14.0, fader_bottom),
                             );
                             let parent_clip = ui.clip_rect();
-                            let mut fchild = ui.new_child(
-                                egui::UiBuilder::new().max_rect(fader).layout(
+                            let mut fchild =
+                                ui.new_child(egui::UiBuilder::new().max_rect(fader).layout(
                                     egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                                ),
-                            );
+                                ));
                             fchild.set_clip_rect(rect.intersect(parent_clip));
                             // A vertical Slider's LENGTH is `spacing.slider_width` (default ~100px),
                             // NOT the container height — so on a big tile it fell short (empty space
@@ -6187,9 +6324,7 @@ impl PixelView {
                                         .sense(egui::Sense::click())
                                         .truncate(),
                                     );
-                                    if lbl
-                                        .on_hover_text("Double-click to rename")
-                                        .double_clicked()
+                                    if lbl.on_hover_text("Double-click to rename").double_clicked()
                                     {
                                         rename_start = Some(i);
                                     }
@@ -6198,15 +6333,13 @@ impl PixelView {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        ui.label(
-                                            egui::RichText::new(&note_name).size(10.0).color(
-                                                if overridden {
-                                                    egui::Color32::from_rgb(150, 200, 255)
-                                                } else {
-                                                    egui::Color32::from_gray(130)
-                                                },
-                                            ),
-                                        );
+                                        ui.label(egui::RichText::new(&note_name).size(10.0).color(
+                                            if overridden {
+                                                egui::Color32::from_rgb(150, 200, 255)
+                                            } else {
+                                                egui::Color32::from_gray(130)
+                                            },
+                                        ));
                                     },
                                 );
                             });
@@ -6222,7 +6355,9 @@ impl PixelView {
                                 // MIDI-learn: arm this pad, then the next key (onscreen/hardware)
                                 // becomes its trigger note. Armed → the 🎹 button is highlighted.
                                 if ui
-                                    .add(egui::Button::new(icons::PIANO).small().selected(assigning))
+                                    .add(
+                                        egui::Button::new(icons::PIANO).small().selected(assigning),
+                                    )
                                     .on_hover_text(
                                         "Assign a MIDI note: click, then press a key on your \
                                          controller or the onscreen keyboard",
@@ -6404,7 +6539,11 @@ impl PixelView {
         }
         if let Some(i) = want_assign {
             // Toggle MIDI-learn on this pad (click again to cancel).
-            self.pad_assign = if self.pad_assign == Some(i) { None } else { Some(i) };
+            self.pad_assign = if self.pad_assign == Some(i) {
+                None
+            } else {
+                Some(i)
+            };
             if self.pad_assign.is_some() {
                 self.status = format!("Pad {}: press a key to assign its MIDI note…", i + 1);
             }
@@ -6435,7 +6574,12 @@ impl PixelView {
             .as_ref()
             .map(|ap| !ap.pad_voices.is_empty())
             .unwrap_or(false);
-        if voices || self.pads.iter().any(|p| p.flash_t >= 0.0 && now - p.flash_t < 0.2) {
+        if voices
+            || self
+                .pads
+                .iter()
+                .any(|p| p.flash_t >= 0.0 && now - p.flash_t < 0.2)
+        {
             self.want_repaint = true;
         }
     }
@@ -6566,9 +6710,7 @@ impl PixelView {
                     temp_root: temp_root.clone(),
                 });
                 self.open_folder(temp_root);
-                let n = crate::soundfont::info(&sf2)
-                    .map(|i| i.samples)
-                    .unwrap_or(0);
+                let n = crate::soundfont::info(&sf2).map(|i| i.samples).unwrap_or(0);
                 self.status = format!("Opened {} · {n} samples", short_name(&sf2));
             }
             Err(e) => self.status = format!("Couldn't open {}: {e}", short_name(&sf2)),
@@ -8224,8 +8366,8 @@ impl PixelView {
     /// The colors "Reduce to N" quantizes for `path`: the image's own extracted
     /// palette when it has one (≤ `SWATCH_CAP` distinct colors), else — for a photo
     /// or gradient with too many colors to extract a swatch palette — its pixels
-    /// sampled from a thumbnail decode. This is what lets Reduce work on a
-    /// >`SWATCH_CAP`-color image: we synthesize a palette from the pixels and
+    /// sampled from a thumbnail decode. This is what lets Reduce work on an image with
+    /// more than `SWATCH_CAP` colors: we synthesize a palette from the pixels and
     /// median-cut *that*. Cached in `reduce_src` so changing N doesn't re-decode.
     fn reduce_source(&mut self, path: &Path) -> Option<Vec<[u8; 4]>> {
         if let Some(Some(pal)) = self.palettes.get(path) {
@@ -8266,8 +8408,7 @@ impl PixelView {
             .unwrap_or(true);
         if stale {
             let src = self.reduce_source(path)?;
-            self.quantize_cache =
-                Some((path.to_path_buf(), n, crate::thumb::median_cut(&src, n)));
+            self.quantize_cache = Some((path.to_path_buf(), n, crate::thumb::median_cut(&src, n)));
         }
         Some(self.quantize_cache.as_ref().unwrap().2.clone())
     }
@@ -8307,35 +8448,46 @@ impl PixelView {
     /// the effective ordered-dither cell size for *this* buffer (see
     /// [`eff_dither_scale`], which keeps the pattern the same fraction of the image
     /// on a small preview vs the full-res view).
-    fn pipe_aux<'a>(&'a self, palette: Option<&'a [[u8; 4]]>, dscale: usize) -> PipeAux<'a> {
+    fn pipe_aux<'a>(
+        &'a self,
+        palette: Option<&'a [[u8; 4]]>,
+        dscale_x: usize,
+        dscale_y: usize,
+    ) -> PipeAux<'a> {
         PipeAux {
             dither_method: self.dither_method,
             dither_amount: self.dither_amount,
             dither_custom: &self.dither_custom,
             dither_n: self.dither_custom_n,
-            dither_scale: dscale,
+            dither_scale_x: dscale_x,
+            dither_scale_y: dscale_y,
             balance: self.balance_offset(),
             palette,
         }
     }
 
-    /// The ordered-dither cell size to use when the pipeline runs on a `buf_w`-wide
-    /// buffer, given the image's `native_w`. `dither_scale` is authored against the
-    /// full-res image, so on a downscaled buffer (preview / grid thumb) we shrink it
-    /// by `buf_w / native_w` — that makes the dither cover the same *fraction* of the
+    /// The effective dither cell size on one axis when the pipeline runs on a `buf`-px
+    /// buffer whose native size is `native`. The authored `raw` scale is defined
+    /// against the full-res image, so on a downscaled buffer (preview / grid thumb) we
+    /// shrink it by `buf / native` — making the dither cover the same *fraction* of the
     /// image everywhere, so the small preview faithfully predicts the full view.
-    fn eff_dither_scale(&self, buf_w: usize, native_w: usize) -> usize {
-        if native_w == 0 || buf_w >= native_w {
-            return self.dither_scale.max(1);
+    fn eff_dither_scale(&self, raw: usize, buf: usize, native: usize) -> usize {
+        if native == 0 || buf >= native {
+            return raw.max(1);
         }
-        ((self.dither_scale as f32 * buf_w as f32 / native_w as f32).round() as usize).max(1)
+        ((raw as f32 * buf as f32 / native as f32).round() as usize).max(1)
     }
 
-    /// Auto-detect a good dither cell size for `path` by estimating the art's native
-    /// pixel scale (see [`thumb::detect_pixel_scale`]). Decodes native pixels (the
-    /// factor is defined at native res) — the cached full pixels when present, else a
-    /// fresh decode of the real file. None only if it can't be decoded.
-    fn detect_dither_scale(&mut self, path: &Path) -> Option<usize> {
+    /// Auto-detect a good dither cell size for `path`. Two-tier:
+    /// 1. If the art is **upscaled pixel art**, match the dither to its pixel grid
+    ///    ([`thumb::detect_pixel_scale`] — edges land on a period-S grid).
+    /// 2. Otherwise (a detailed / smooth source, like this case) there's no grid to
+    ///    find; a 1px dither there is just invisible noise. What makes it noise is
+    ///    the image being large relative to the cell — a *resolution* property — so
+    ///    we scale the cell with the image: ~one cell per 200px of the shorter side
+    ///    (≈3 for a 600px image, 1 for small art), giving a readable crosshatch that
+    ///    grows with resolution. Decodes native pixels; None only if undecodable.
+    fn detect_dither_scale(&mut self, path: &Path) -> Option<(usize, usize)> {
         let (w, h, rgba) = match &self.full_src {
             Some((p, sz, px)) if p == path => (sz[0], sz[1], px.clone()),
             _ => {
@@ -8344,7 +8496,13 @@ impl PixelView {
                 (img.width as usize, img.height as usize, img.rgba_bytes())
             }
         };
-        Some(crate::thumb::detect_pixel_scale(&rgba, w, h).clamp(1, 16))
+        let (gx, gy) = crate::thumb::detect_pixel_scale(&rgba, w, h);
+        if gx > 1 || gy > 1 {
+            return Some((gx.max(1), gy.max(1))); // real (non-square) upscaled pixel art
+        }
+        // No grid → resolution-based square cell so the pattern reads on hi-res art.
+        let by_res = ((w.min(h) as f32 / 200.0).round() as usize).clamp(1, 16);
+        Some((by_res, by_res))
     }
 
     /// The resample target dims for a `w`×`h` pipeline buffer: the buffer scaled by
@@ -8386,11 +8544,12 @@ impl PixelView {
             String::new()
         };
         format!(
-            "{}|D{}:{:.2}:{dsig}:S{}|B{},{},{}|R{}:{:.4}:{:.4}",
+            "{}|D{}:{:.2}:{dsig}:S{}x{}|B{},{},{}|R{}:{:.4}:{:.4}",
             self.adjust.key(),
             self.dither_method,
             self.dither_amount,
-            self.dither_scale,
+            self.dither_scale_x,
+            self.dither_scale_y,
             off[0],
             off[1],
             off[2],
@@ -8483,10 +8642,15 @@ impl PixelView {
         }
         let (w, h, mut rgba) = self.thumb_rgba.get(path)?.clone();
         let palette = self.tile_palette(path);
-        let native_w = self.img_meta.get(path).map(|m| m.w as usize).unwrap_or(w);
-        let ds = self.eff_dither_scale(w, native_w);
+        let (native_w, native_h) = self
+            .img_meta
+            .get(path)
+            .map(|m| (m.w as usize, m.h as usize))
+            .unwrap_or((w, h));
+        let dsx = self.eff_dither_scale(self.dither_scale_x, w, native_w);
+        let dsy = self.eff_dither_scale(self.dither_scale_y, h, native_h);
         let (tw, th) = self.resize_target(w, h);
-        let aux = self.pipe_aux(palette.as_deref(), ds);
+        let aux = self.pipe_aux(palette.as_deref(), dsx, dsy);
         apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
         let color = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
         // Match the plain-thumb path: a downscaled (area-averaged) tile displays
@@ -8526,7 +8690,8 @@ impl PixelView {
             dither_amount: 0.0,
             dither_custom: &[],
             dither_n: 0,
-            dither_scale: 1,
+            dither_scale_x: 1,
+            dither_scale_y: 1,
             balance: self.balance_offset(),
             palette: palette.as_deref(),
         };
@@ -8579,10 +8744,15 @@ impl PixelView {
             let s = self.preview_src.as_ref().unwrap();
             (s.1, s.2, s.3.clone())
         };
-        let native_w = self.img_meta.get(path).map(|m| m.w as usize).unwrap_or(w);
-        let ds = self.eff_dither_scale(w, native_w);
+        let (native_w, native_h) = self
+            .img_meta
+            .get(path)
+            .map(|m| (m.w as usize, m.h as usize))
+            .unwrap_or((w, h));
+        let dsx = self.eff_dither_scale(self.dither_scale_x, w, native_w);
+        let dsy = self.eff_dither_scale(self.dither_scale_y, h, native_h);
         let (tw, th) = self.resize_target(w, h);
-        let aux = self.pipe_aux(palette, ds);
+        let aux = self.pipe_aux(palette, dsx, dsy);
         apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
         let color = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
         let tex = ctx.load_texture("pv_preview", color, egui::TextureOptions::NEAREST);
@@ -8613,10 +8783,11 @@ impl PixelView {
             }
         };
         let (w, h) = (size[0], size[1]);
-        // Full-res buffer: native_w == w, so eff_dither_scale is the raw scale.
-        let ds = self.eff_dither_scale(w, w);
+        // Full-res buffer: native == buffer, so eff_dither_scale is the raw scale.
+        let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
+        let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
         let (tw, th) = self.resize_target(w, h);
-        let aux = self.pipe_aux(palette, ds);
+        let aux = self.pipe_aux(palette, dsx, dsy);
         apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
         let tt = TiledTexture::from_rgba(ctx, "pv_full_reduced", size, &rgba, view_tex_opts());
         self.full_reduced = Some((path.to_path_buf(), key.to_string(), tt.clone()));
@@ -8769,7 +8940,8 @@ impl PixelView {
             ui.visuals().weak_text_color()
         };
         for dx in [-16.0, -8.0, 0.0, 8.0, 16.0] {
-            ui.painter().circle_filled(bar.center() + egui::vec2(dx, 0.0), 1.4, c);
+            ui.painter()
+                .circle_filled(bar.center() + egui::vec2(dx, 0.0), 1.4, c);
         }
         if active {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
@@ -8794,7 +8966,7 @@ impl PixelView {
         let mut want_download = false;
         let mut want_pack: Option<PathBuf> = None;
         let mut want_open_default = false; // "Open in default app" (PDF)
-        // Audio player actions are handled inside `draw_audio_controls`, not deferred here.
+                                           // Audio player actions are handled inside `draw_audio_controls`, not deferred here.
         let disp = self.to_display(&entry.path);
         // Inspecting a downloadable pack folder (it has a fetched zip URL). Keyed off
         // `remote_urls`, not path depth, so `groups/<g>` / `artists/<a>` listing folders
@@ -9008,7 +9180,11 @@ impl PixelView {
                                 ui.end_row();
                                 if let (Some(lo), Some(hi)) = (z.key_lo, z.key_hi) {
                                     ui.weak("Key range");
-                                    ui.label(format!("{} – {}", midi_note_name(lo), midi_note_name(hi)));
+                                    ui.label(format!(
+                                        "{} – {}",
+                                        midi_note_name(lo),
+                                        midi_note_name(hi)
+                                    ));
                                     ui.end_row();
                                 }
                             } else if let Some(d) = &dls {
@@ -9274,7 +9450,8 @@ impl PixelView {
                 self.dither_amount = 1.0;
                 self.dither_custom_n = 4;
                 self.dither_custom = crate::thumb::bayer_values(4);
-                self.dither_scale = 1;
+                self.dither_scale_x = 1;
+                self.dither_scale_y = 1;
                 self.resize_on = false;
                 self.resize_fx = 1.0;
                 self.resize_fy = 1.0;
@@ -10042,32 +10219,76 @@ impl PixelView {
                         });
                     }
                     // Cell scale — only meaningful for the ordered (Bayer/custom) methods;
-                    // error-diffusion has no fixed cell. Enlarges each cell to N×N px so a
+                    // error-diffusion has no fixed cell. Per-axis (Width×Height) like the
+                    // Resize panel, since art isn't always square; enlarges each cell so a
                     // Bayer pattern reads as a proper crosshatch on high-res art, not noise.
-                    if matches!(self.dither_method, 1 | 2 | 3)
+                    if matches!(self.dither_method, 1..=3)
                         || self.dither_method == crate::thumb::DITHER_CUSTOM
                     {
+                        // Width (cell X); a locked cell mirrors it to height.
+                        let mut sx = self.dither_scale_x;
                         ui.horizontal(|ui| {
-                            ui.label("Scale")
-                                .on_hover_text("Dither cell size in pixels — zoom the pattern to match high-res art");
-                            let resp = ui.add(
-                                egui::Slider::new(&mut self.dither_scale, 1..=16).suffix("px"),
-                            );
-                            middle_reset(ui, &resp, &mut self.dither_scale, 1usize);
-                            wheel_adjust(ui, &resp, &mut self.dither_scale, 1.0, 1usize, 16usize);
-                            // Detect the art's native pixel size + match the dither cell.
+                            ui.label("Cell W")
+                                .on_hover_text("Dither cell WIDTH in px — zoom the pattern horizontally");
+                            let resp =
+                                ui.add(egui::Slider::new(&mut sx, 1..=16).suffix("px"));
+                            middle_reset(ui, &resp, &mut sx, 1usize);
+                            wheel_adjust(ui, &resp, &mut sx, 1.0, 1usize, 16usize);
+                        });
+                        if sx != self.dither_scale_x {
+                            self.dither_scale_x = sx;
+                            if self.dither_scale_lock {
+                                self.dither_scale_y = sx;
+                            }
+                        }
+                        // Height (cell Y).
+                        let mut sy = self.dither_scale_y;
+                        ui.horizontal(|ui| {
+                            ui.label("Cell H")
+                                .on_hover_text("Dither cell HEIGHT in px — zoom the pattern vertically");
+                            let resp =
+                                ui.add(egui::Slider::new(&mut sy, 1..=16).suffix("px"));
+                            middle_reset(ui, &resp, &mut sy, 1usize);
+                            wheel_adjust(ui, &resp, &mut sy, 1.0, 1usize, 16usize);
+                        });
+                        if sy != self.dither_scale_y {
+                            self.dither_scale_y = sy;
+                            if self.dither_scale_lock {
+                                self.dither_scale_x = sy;
+                            }
+                        }
+                        ui.horizontal(|ui| {
+                            if ui
+                                .selectable_label(self.dither_scale_lock, "🔒 Lock")
+                                .on_hover_text("Keep the dither cell square")
+                                .clicked()
+                            {
+                                self.dither_scale_lock = !self.dither_scale_lock;
+                                if self.dither_scale_lock {
+                                    self.dither_scale_y = self.dither_scale_x; // unify on lock
+                                }
+                            }
+                            // Detect the art's native pixel size (per-axis) + match the cell.
                             if ui
                                 .button("Auto")
                                 .on_hover_text(
-                                    "Detect the art's pixel size (upscaled pixel art) and \
-                                     set the dither cell to match. Stays 1 for genuinely \
-                                     hi-res / detailed art.",
+                                    "Pick a dither cell for this art: its pixel grid (per axis) \
+                                     if it's upscaled pixel art, else scaled to the resolution \
+                                     so the pattern reads on hi-res art.",
                                 )
                                 .clicked()
                             {
-                                if let Some(s) = self.detect_dither_scale(&entry.path) {
-                                    self.dither_scale = s;
-                                    self.status = format!("Auto dither scale: {s}px");
+                                if let Some((ax, ay)) = self.detect_dither_scale(&entry.path) {
+                                    // Locked → keep it square (the coarser of the two).
+                                    let (ax, ay) = if self.dither_scale_lock {
+                                        let s = ax.max(ay);
+                                        (s, s)
+                                    } else {
+                                        (ax, ay)
+                                    };
+                                    self.dither_scale_x = ax;
+                                    self.dither_scale_y = ay;
+                                    self.status = format!("Auto dither cell: {ax}×{ay}px");
                                 }
                             }
                         });
@@ -10320,9 +10541,10 @@ impl PixelView {
         };
         let (w, h) = (size[0], size[1]);
         // Save the image AS SHOWN: full-res, so the raw dither scale + resample apply.
-        let ds = self.eff_dither_scale(w, w);
+        let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
+        let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
         let (tw, th) = self.resize_target(w, h);
-        let aux = self.pipe_aux(recolor.as_ref().map(|(_, p)| p.as_slice()), ds);
+        let aux = self.pipe_aux(recolor.as_ref().map(|(_, p)| p.as_slice()), dsx, dsy);
         apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
         let name = format!("{stem}_{}.png", self.recolor_tag());
@@ -10685,8 +10907,7 @@ impl PixelView {
                             } else if self.colo_pieces.contains_key(path) && is_audio_ext(path) {
                                 // A 16colo audio piece has no server-side render PNG, so paint a
                                 // music-note tile rather than spin forever waiting for one.
-                                let ext =
-                                    path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                                 paint_audio_tile(&ui.painter_at(rect), rect, ext);
                             } else {
                                 // 16colo piece → fetch its pre-rendered PNG over HTTP;
@@ -10784,9 +11005,7 @@ impl PixelView {
                         // Fetch audio / module metadata only for the hovered tile (cached after),
                         // so the tooltip shows real audio info, not the placeholder's image dims.
                         let (audio, tracker) = if resp.hovered() {
-                            let a = is_audio_ext(path)
-                                .then(|| self.audio_info(path))
-                                .flatten();
+                            let a = is_audio_ext(path).then(|| self.audio_info(path)).flatten();
                             let t = Self::is_module_ext(path)
                                 .then(|| self.tracker_info(path))
                                 .flatten();
@@ -10794,8 +11013,8 @@ impl PixelView {
                         } else {
                             (None, None)
                         };
-                        let resp = resp
-                            .on_hover_ui(|ui| hover_details(ui, &entry, meta, audio, tracker));
+                        let resp =
+                            resp.on_hover_ui(|ui| hover_details(ui, &entry, meta, audio, tracker));
                         if resp.clicked() {
                             clicked = Some((idx, ui.input(|i| i.modifiers)));
                         }
@@ -11523,8 +11742,11 @@ impl PixelView {
                                 );
                             } else if colo_audio {
                                 // A 16colo audio piece: a music-note cell, not an endless spinner.
-                                let ext =
-                                    entry.path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                                let ext = entry
+                                    .path
+                                    .extension()
+                                    .and_then(|e| e.to_str())
+                                    .unwrap_or("");
                                 paint_audio_tile(&ui.painter_at(rect), rect, ext);
                             } else if !entry.is_dir {
                                 // Spinner while the row's thumbnail loads (the request was
@@ -11645,8 +11867,8 @@ impl PixelView {
                     } else {
                         (None, None)
                     };
-                    let resp = resp
-                        .on_hover_ui(|ui| hover_details(ui, &entry, meta, audio, tracker));
+                    let resp =
+                        resp.on_hover_ui(|ui| hover_details(ui, &entry, meta, audio, tracker));
                     if resp.hovered() {
                         hovered = Some(idx);
                     }
@@ -12010,8 +12232,10 @@ impl PixelView {
                         };
                         if ui
                             .add(
-                                egui::Button::new(anim_lbl(anim.playing))
-                                    .min_size(fixed_btn_size(ui, &[&anim_lbl(true), &anim_lbl(false)])),
+                                egui::Button::new(anim_lbl(anim.playing)).min_size(fixed_btn_size(
+                                    ui,
+                                    &[&anim_lbl(true), &anim_lbl(false)],
+                                )),
                             )
                             .clicked()
                         {
@@ -12105,73 +12329,73 @@ impl PixelView {
             // The combo mutates only this local (so it doesn't need `&mut self` while the
             // player is borrowed below); the change is applied after the borrow ends.
             let mut baud_choice = baud;
-            let (active, just_finished) = {
-                let p = self.player.as_mut().unwrap();
-                let was_playing = p.playing;
-                p.advance(baud, dt);
-                let len = p.len;
-                if !immersive {
-                    ui.horizontal(|ui| {
-                        let baud_lbl = |pl: bool| {
-                            if pl {
-                                format!("{} Pause", icons::PAUSE)
-                            } else {
-                                format!("{} Play", icons::PLAY)
-                            }
-                        };
-                        if ui
-                            .add(
-                                egui::Button::new(baud_lbl(p.playing))
-                                    .min_size(fixed_btn_size(ui, &[&baud_lbl(true), &baud_lbl(false)])),
-                            )
-                            .clicked()
-                        {
-                            if p.pos >= p.len {
-                                p.pos = 0; // at the end → replay from the start
-                                p.acc = 0.0;
-                            }
-                            p.playing = !p.playing;
-                        }
-                        if ui.button(format!("{} Replay", icons::REPLAY)).clicked() {
-                            p.pos = 0;
-                            p.acc = 0.0;
-                            p.playing = true;
-                        }
-                        // Baud picker, right by the transport controls: simulate a modem
-                        // typing the art out. RIP and ANSI keep separate remembered speeds.
-                        egui::ComboBox::from_id_salt("baud_pick")
-                            .selected_text(format!("{} {}", icons::BOLT, baud_choice.label()))
-                            .show_ui(ui, |ui| {
-                                for b in Baud::ALL {
-                                    ui.selectable_value(&mut baud_choice, b, b.label());
+            let (active, just_finished) =
+                {
+                    let p = self.player.as_mut().unwrap();
+                    let was_playing = p.playing;
+                    p.advance(baud, dt);
+                    let len = p.len;
+                    if !immersive {
+                        ui.horizontal(|ui| {
+                            let baud_lbl = |pl: bool| {
+                                if pl {
+                                    format!("{} Pause", icons::PAUSE)
+                                } else {
+                                    format!("{} Play", icons::PLAY)
                                 }
-                            })
-                            .response
-                            .on_hover_text(
-                                "Simulated modem baud rate — replay the art as it would have \
+                            };
+                            if ui
+                                .add(egui::Button::new(baud_lbl(p.playing)).min_size(
+                                    fixed_btn_size(ui, &[&baud_lbl(true), &baud_lbl(false)]),
+                                ))
+                                .clicked()
+                            {
+                                if p.pos >= p.len {
+                                    p.pos = 0; // at the end → replay from the start
+                                    p.acc = 0.0;
+                                }
+                                p.playing = !p.playing;
+                            }
+                            if ui.button(format!("{} Replay", icons::REPLAY)).clicked() {
+                                p.pos = 0;
+                                p.acc = 0.0;
+                                p.playing = true;
+                            }
+                            // Baud picker, right by the transport controls: simulate a modem
+                            // typing the art out. RIP and ANSI keep separate remembered speeds.
+                            egui::ComboBox::from_id_salt("baud_pick")
+                                .selected_text(format!("{} {}", icons::BOLT, baud_choice.label()))
+                                .show_ui(ui, |ui| {
+                                    for b in Baud::ALL {
+                                        ui.selectable_value(&mut baud_choice, b, b.label());
+                                    }
+                                })
+                                .response
+                                .on_hover_text(
+                                    "Simulated modem baud rate — replay the art as it would have \
                                  typed out over a dial-up connection (None = instant). RIP and \
                                  ANSI keep separate speeds.",
-                            );
-                        let mut pos = p.pos;
-                        if ui
-                            .add(egui::Slider::new(&mut pos, 0..=len).text("byte"))
-                            .changed()
-                        {
-                            p.pos = pos;
-                            p.acc = 0.0;
-                            p.playing = false;
-                        }
-                        // The slider already shows the byte position, so don't repeat it:
-                        // just the percent and total size (baud is the picker to the left).
-                        let pct = if len > 0 { p.pos * 100 / len } else { 100 };
-                        ui.label(format!("{pct}%  ·  {}", human_size(len as u64)));
-                    });
-                }
-                // Render one extra frame the moment it finishes, so the auto-scroll lands
-                // exactly at the bottom (without it the last drawn frame is a tick short).
-                let just_finished = was_playing && !p.playing;
-                (p.playing || p.pos < p.len || just_finished, just_finished)
-            };
+                                );
+                            let mut pos = p.pos;
+                            if ui
+                                .add(egui::Slider::new(&mut pos, 0..=len).text("byte"))
+                                .changed()
+                            {
+                                p.pos = pos;
+                                p.acc = 0.0;
+                                p.playing = false;
+                            }
+                            // The slider already shows the byte position, so don't repeat it:
+                            // just the percent and total size (baud is the picker to the left).
+                            let pct = if len > 0 { p.pos * 100 / len } else { 100 };
+                            ui.label(format!("{pct}%  ·  {}", human_size(len as u64)));
+                        });
+                    }
+                    // Render one extra frame the moment it finishes, so the auto-scroll lands
+                    // exactly at the bottom (without it the last drawn frame is a tick short).
+                    let just_finished = was_playing && !p.playing;
+                    (p.playing || p.pos < p.len || just_finished, just_finished)
+                };
             // Apply a baud change now that the player borrow above has ended: remember the
             // per-kind speed and restart the transmission (or jump to the end for None).
             if baud_choice != baud {
@@ -14039,7 +14263,7 @@ impl PixelView {
         let mut audio_mute = false;
         let mut audio_vol: Option<f32> = None;
         let mut audio_show_playing = false; // click the "PLAYING …" pill → jump to the player
-        // Top-level menu button responses, for the hover-to-switch pass after the bar renders.
+                                            // Top-level menu button responses, for the hover-to-switch pass after the bar renders.
         let mut menu_resps: Vec<egui::Response> = Vec::new();
         egui::MenuBar::new().ui(ui, |ui| {
             Self::menu_bar_button(ui, &mut menu_resps, "File", |ui| {
@@ -14254,11 +14478,7 @@ impl PixelView {
                     {
                         audio_vol = Some(vol);
                     }
-                    if ui
-                        .button(icons::STOP)
-                        .on_hover_text("Stop audio")
-                        .clicked()
-                    {
+                    if ui.button(icons::STOP).on_hover_text("Stop audio").clicked() {
                         audio_stop = true;
                     }
                     if ui
@@ -14270,7 +14490,9 @@ impl PixelView {
                             )
                             .fill(egui::Color32::from_rgb(230, 40, 40)),
                         )
-                        .on_hover_text("SHIFT+ESC — stop ALL sound + pad voices, incl. looping pads")
+                        .on_hover_text(
+                            "SHIFT+ESC — stop ALL sound + pad voices, incl. looping pads",
+                        )
                         .clicked()
                     {
                         audio_panic_now = true;
@@ -14302,11 +14524,7 @@ impl PixelView {
                         let (r, resp) =
                             ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                         let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * glow) as u8;
-                        let c = egui::Color32::from_rgb(
-                            lerp(28, 90),
-                            lerp(74, 255),
-                            lerp(40, 130),
-                        );
+                        let c = egui::Color32::from_rgb(lerp(28, 90), lerp(74, 255), lerp(40, 130));
                         ui.painter().circle_filled(r.center(), 5.0, c);
                         if glow > 0.05 {
                             ui.painter().circle_stroke(
@@ -14480,7 +14698,9 @@ impl PixelView {
                 if self.explorer_tab == 0 {
                     // Sub-tabs: Local folders · 16colo.rs · Kits · Samples (last two audio-plugin only).
                     ui.horizontal_wrapped(|ui| {
-                        for (idx, label) in [(0u8, "Local"), (1, "16colo"), (2, "Kits"), (3, "Samples")] {
+                        for (idx, label) in
+                            [(0u8, "Local"), (1, "16colo"), (2, "Kits"), (3, "Samples")]
+                        {
                             if (idx == 2 || idx == 3) && !self.plugin_audio {
                                 continue;
                             }
@@ -14534,9 +14754,12 @@ impl PixelView {
                         {
                             nav = Some(PathBuf::from(crate::sixteen::ROOT));
                         }
-                        if let Some(p) =
-                            self.favorites_buttons(ui, icons::GLOBE, crate::sixteen::is_remote, false)
-                        {
+                        if let Some(p) = self.favorites_buttons(
+                            ui,
+                            icons::GLOBE,
+                            crate::sixteen::is_remote,
+                            false,
+                        ) {
                             nav = Some(p);
                         }
                     } else if self.places_tab == 2 {
@@ -14686,7 +14909,9 @@ impl PixelView {
                             } else if self.sample_focus {
                                 ui.weak("↑/↓ select · Enter/→ open · Backspace/← up · Esc unfocus");
                             } else {
-                                ui.weak("click a sample → load into editor (click focuses this pane)");
+                                ui.weak(
+                                    "click a sample → load into editor (click focuses this pane)",
+                                );
                             }
                             let mut subdirs: Vec<PathBuf> = Vec::new();
                             let mut files: Vec<PathBuf> = Vec::new();
@@ -14718,46 +14943,47 @@ impl PixelView {
                                     ui.spacing_mut().item_spacing.y = 0.0;
                                     let row_h = 20.0;
                                     let mut ri = 0usize; // row index for the zebra stripe
-                                    let mut row = |ui: &mut egui::Ui,
-                                                   label: String,
-                                                   is_sel: bool,
-                                                   sense: egui::Sense|
-                                     -> egui::Response {
-                                        let w = ui.available_width();
-                                        let (rect, resp) =
-                                            ui.allocate_exact_size(egui::vec2(w, row_h), sense);
-                                        let hover = resp.hovered();
-                                        let fill = if is_sel {
-                                            ui.visuals().selection.bg_fill
-                                        } else if hover {
-                                            ui.visuals().widgets.hovered.bg_fill
-                                        } else if ri % 2 == 1 {
-                                            ui.visuals().faint_bg_color
-                                        } else {
-                                            egui::Color32::TRANSPARENT
+                                    let mut row =
+                                        |ui: &mut egui::Ui,
+                                         label: String,
+                                         is_sel: bool,
+                                         sense: egui::Sense|
+                                         -> egui::Response {
+                                            let w = ui.available_width();
+                                            let (rect, resp) =
+                                                ui.allocate_exact_size(egui::vec2(w, row_h), sense);
+                                            let hover = resp.hovered();
+                                            let fill = if is_sel {
+                                                ui.visuals().selection.bg_fill
+                                            } else if hover {
+                                                ui.visuals().widgets.hovered.bg_fill
+                                            } else if ri % 2 == 1 {
+                                                ui.visuals().faint_bg_color
+                                            } else {
+                                                egui::Color32::TRANSPARENT
+                                            };
+                                            if fill != egui::Color32::TRANSPARENT {
+                                                ui.painter().rect_filled(rect, 0.0, fill);
+                                            }
+                                            let fg = if is_sel {
+                                                ui.visuals().strong_text_color()
+                                            } else {
+                                                ui.visuals().text_color()
+                                            };
+                                            let p = ui.painter().with_clip_rect(rect);
+                                            p.text(
+                                                rect.left_center() + egui::vec2(5.0, 0.0),
+                                                egui::Align2::LEFT_CENTER,
+                                                label,
+                                                egui::FontId::proportional(13.0),
+                                                fg,
+                                            );
+                                            if hover {
+                                                ui.ctx().request_repaint();
+                                            }
+                                            ri += 1;
+                                            resp
                                         };
-                                        if fill != egui::Color32::TRANSPARENT {
-                                            ui.painter().rect_filled(rect, 0.0, fill);
-                                        }
-                                        let fg = if is_sel {
-                                            ui.visuals().strong_text_color()
-                                        } else {
-                                            ui.visuals().text_color()
-                                        };
-                                        let p = ui.painter().with_clip_rect(rect);
-                                        p.text(
-                                            rect.left_center() + egui::vec2(5.0, 0.0),
-                                            egui::Align2::LEFT_CENTER,
-                                            label,
-                                            egui::FontId::proportional(13.0),
-                                            fg,
-                                        );
-                                        if hover {
-                                            ui.ctx().request_repaint();
-                                        }
-                                        ri += 1;
-                                        resp
-                                    };
                                     for d in &subdirs {
                                         // Highlight a keyboard-selected folder too (↑/↓ can land on a
                                         // dir before Enter/→ descends), not just files.
@@ -14778,7 +15004,11 @@ impl PixelView {
                                         let is_sel = cur_sel.as_deref() == Some(f.as_path());
                                         let r = row(
                                             ui,
-                                            format!("{} {}", icons::MUSIC, elide(&short_name(f), 30)),
+                                            format!(
+                                                "{} {}",
+                                                icons::MUSIC,
+                                                elide(&short_name(f), 30)
+                                            ),
                                             is_sel,
                                             egui::Sense::click_and_drag(),
                                         )
@@ -14806,10 +15036,7 @@ impl PixelView {
                                 ui.painter().rect_stroke(
                                     sa.inner_rect,
                                     3.0,
-                                    egui::Stroke::new(
-                                        2.0,
-                                        egui::Color32::from_rgb(120, 170, 235),
-                                    ),
+                                    egui::Stroke::new(2.0, egui::Color32::from_rgb(120, 170, 235)),
                                     egui::StrokeKind::Inside,
                                 );
                             }
@@ -15129,8 +15356,8 @@ impl eframe::App for PixelView {
         self.poll_colo_sauce();
         self.poll_midi(ctx.input(|i| i.time) as f32); // hardware MIDI keys → pads / sample
         self.poll_audio_load(ctx.input(|i| i.stable_dt)); // background audio decode → build player
-        // Screensaver: once a (random) pack has finished downloading + mounting, open its
-        // first art file. Both async ops idle ⇒ the listing has settled.
+                                                          // Screensaver: once a (random) pack has finished downloading + mounting, open its
+                                                          // first art file. Both async ops idle ⇒ the listing has settled.
         if self.pending_autoplay && self.random_rx.is_none() && self.remote_rx.is_none() {
             self.pending_autoplay = false;
             if let Some(idx) = self.entries.iter().position(|e| !e.is_dir && !e.is_archive) {
@@ -16162,7 +16389,13 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::DITHER_AMOUNT_KEY, &self.dither_amount);
         eframe::set_value(storage, Self::DITHER_CUSTOM_KEY, &self.dither_custom);
         eframe::set_value(storage, Self::DITHER_CUSTOM_N_KEY, &self.dither_custom_n);
-        eframe::set_value(storage, Self::DITHER_SCALE_KEY, &self.dither_scale);
+        eframe::set_value(storage, Self::DITHER_SCALE_KEY, &self.dither_scale_x);
+        eframe::set_value(storage, Self::DITHER_SCALE_Y_KEY, &self.dither_scale_y);
+        eframe::set_value(
+            storage,
+            Self::DITHER_SCALE_LOCK_KEY,
+            &self.dither_scale_lock,
+        );
         eframe::set_value(storage, Self::RESIZE_ON_KEY, &self.resize_on);
         eframe::set_value(storage, Self::RESIZE_FX_KEY, &self.resize_fx);
         eframe::set_value(storage, Self::RESIZE_FY_KEY, &self.resize_fy);
@@ -16221,7 +16454,11 @@ fn paint_format_badge(painter: &egui::Painter, pos: egui::Pos2, ext: &str, accen
         (accent.b() as f32 * 0.35) as u8,
         220,
     );
-    painter.rect_filled(egui::Rect::from_min_size(pos, galley.size()).expand(2.0), 3.0, bg);
+    painter.rect_filled(
+        egui::Rect::from_min_size(pos, galley.size()).expand(2.0),
+        3.0,
+        bg,
+    );
     painter.galley(pos, galley, accent.gamma_multiply(1.4));
 }
 
@@ -16372,7 +16609,11 @@ fn contrast_text(c: [u8; 3]) -> egui::Color32 {
 /// Blend `base` a fraction `t` (0..1) toward the sRGB accent `accent`. A cheap linear mix in
 /// gamma space — plenty for a subtle tile-background tint (see `tile_category_bg`).
 fn blend_toward(base: egui::Color32, accent: [u8; 3], t: f32) -> egui::Color32 {
-    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round().clamp(0.0, 255.0) as u8;
+    let mix = |a: u8, b: u8| {
+        (a as f32 + (b as f32 - a as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
     egui::Color32::from_rgb(
         mix(base.r(), accent[0]),
         mix(base.g(), accent[1]),
@@ -16458,7 +16699,10 @@ fn fixed_btn_size(ui: &egui::Ui, labels: &[&str]) -> egui::Vec2 {
                 .x
         })
         .fold(0.0f32, f32::max);
-    egui::vec2(w + pad.x * 2.0, ui.spacing().interact_size.y.max(font.size + pad.y * 2.0))
+    egui::vec2(
+        w + pad.x * 2.0,
+        ui.spacing().interact_size.y.max(font.size + pad.y * 2.0),
+    )
 }
 
 /// A full-width horizontal drag handle (a row of dots) for resizing the region above it. Returns
@@ -16830,7 +17074,8 @@ struct PipeAux<'a> {
     dither_amount: f32,
     dither_custom: &'a [u32],
     dither_n: usize,
-    dither_scale: usize, // ordered-dither cell size in pixels (≥1)
+    dither_scale_x: usize, // ordered-dither cell width in pixels (≥1)
+    dither_scale_y: usize, // ordered-dither cell height in pixels (≥1)
     balance: [i16; 3],
     palette: Option<&'a [[u8; 4]]>,
 }
@@ -16857,7 +17102,8 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, a: &Adjust, aux: &PipeAux
                 aux.dither_amount,
                 aux.dither_custom,
                 aux.dither_n,
-                aux.dither_scale,
+                aux.dither_scale_x,
+                aux.dither_scale_y,
                 aux.palette,
             ),
             OpKind::ColorBalance => color_balance(rgba, aux.balance),
@@ -16955,7 +17201,8 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             dither_amount: 0.0,
             dither_custom: &[],
             dither_n: 0,
-            dither_scale: 1,
+            dither_scale_x: 1,
+            dither_scale_y: 1,
             balance: [0, 0, 0],
             palette: None,
         },
@@ -18025,24 +18272,24 @@ struct NamedSample {
 /// saved/loaded as a named `.pvkit` file — see `Pad::record`/`from_record` + the pads WAV dir.
 #[derive(Clone)]
 struct Pad {
-    name: String,                        // display label ("" when empty)
+    name: String,                           // display label ("" when empty)
     buf: Option<std::sync::Arc<SampleBuf>>, // the loaded audio (None = empty slot)
-    note: Option<i32>,                   // assigned absolute MIDI note (60 = native pitch)
-    volume: f32,                         // per-pad gain 0..1
+    note: Option<i32>,                      // assigned absolute MIDI note (60 = native pitch)
+    volume: f32,                            // per-pad gain 0..1
     muted: bool,
     soloed: bool,
     // Per-pad playback shaping, set in the drill-in editor + saved with the pad/kit:
-    pitch: i32,       // semitone offset applied on trigger (0 = native; ±12 = ±octave)
-    loop_on: bool,    // loop the region while held/until stopped (vs. a one-shot hit)
-    loop_start: f32,  // loop region start (seconds within the sample)
-    loop_end: f32,    // loop region end (seconds; ≤ start ⇒ the whole sample)
-    loop_type: u8,    // playback direction: 0 = forward, 1 = reverse, 2 = ping-pong
-    vel_track: bool,  // track incoming MIDI velocity (on) vs. fixed max velocity 127 (off)
+    pitch: i32,      // semitone offset applied on trigger (0 = native; ±12 = ±octave)
+    loop_on: bool,   // loop the region while held/until stopped (vs. a one-shot hit)
+    loop_start: f32, // loop region start (seconds within the sample)
+    loop_end: f32,   // loop region end (seconds; ≤ start ⇒ the whole sample)
+    loop_type: u8,   // playback direction: 0 = forward, 1 = reverse, 2 = ping-pong
+    vel_track: bool, // track incoming MIDI velocity (on) vs. fixed max velocity 127 (off)
     color: Option<[u8; 3]>, // optional tile color tag (right-click → colorize)
     source: Option<String>, // original sample path (for the sample-list hover); "" if unknown
-    note_lock: bool,  // key-lock: keep this pad firing on the same note when it's dragged to a new
-                      // slot (its override is pinned to the absolute note); off ⇒ note follows slot
-    flash_t: f32,     // ctx time of the last trigger (green flash); transient
+    note_lock: bool, // key-lock: keep this pad firing on the same note when it's dragged to a new
+    // slot (its override is pinned to the absolute note); off ⇒ note follows slot
+    flash_t: f32, // ctx time of the last trigger (green flash); transient
 }
 
 /// Human-readable names for `Pad::loop_type` (indexed by the stored value).
@@ -18085,7 +18332,11 @@ enum WaveDrag {
     /// `fresh` distinguishes carving a **new** selection from empty (edge flips as you cross the
     /// anchor; no magnified edge-inset) vs. **resizing** an existing edge (`edge` is that fixed
     /// grabbed edge; the inset overlay is shown for precise placement).
-    Select { anchor: f32, edge: Edge, fresh: bool },
+    Select {
+        anchor: f32,
+        edge: Edge,
+        fresh: bool,
+    },
     /// Shifting the whole selection: its `width` (secs) + the pointer-to-`lo` offset at grab time.
     Move { width: f32, grab_off: f32 },
 }
@@ -18278,7 +18529,13 @@ fn detect_transients(samples: &[f32], ch: usize, sample_rate: u32, sensitivity: 
     }
     // Positive energy flux (rise over the previous window).
     let flux: Vec<f32> = (0..nwin)
-        .map(|i| if i == 0 { 0.0 } else { (energy[i] - energy[i - 1]).max(0.0) })
+        .map(|i| {
+            if i == 0 {
+                0.0
+            } else {
+                (energy[i] - energy[i - 1]).max(0.0)
+            }
+        })
         .collect();
     let peak = flux.iter().copied().fold(0.0f32, f32::max);
     if peak <= 1e-6 {
@@ -18320,7 +18577,10 @@ fn next_zero_crossing(samples: &[f32], ch: usize, from: usize, forward: bool) ->
     }
     let mono = |f: usize| -> f32 {
         let base = f * ch;
-        (0..ch).map(|c| samples.get(base + c).copied().unwrap_or(0.0)).sum::<f32>() / ch as f32
+        (0..ch)
+            .map(|c| samples.get(base + c).copied().unwrap_or(0.0))
+            .sum::<f32>()
+            / ch as f32
     };
     let start = from.min(nframes - 1);
     let mut prev = mono(start);
@@ -18461,10 +18721,10 @@ impl DecodedAudio {
 /// heavy work runs off the UI thread so a "Loading…" spinner can animate). The worker sends the
 /// result over `rx`; `poll_audio_load` builds the player when it arrives.
 struct AudioLoading {
-    path: PathBuf,             // display path (the audio player identity) being loaded
-    force_play: bool,          // start playing on ready (Play/Space vs merely opening)
-    sf_path: Option<PathBuf>,  // GM SoundFont being loaded on the worker (to cache its Arc)
-    t: f32,                    // seconds spent loading (delays the spinner so fast loads don't flash)
+    path: PathBuf,            // display path (the audio player identity) being loaded
+    force_play: bool,         // start playing on ready (Play/Space vs merely opening)
+    sf_path: Option<PathBuf>, // GM SoundFont being loaded on the worker (to cache its Arc)
+    t: f32, // seconds spent loading (delays the spinner so fast loads don't flash)
     rx: std::sync::mpsc::Receiver<Result<AudioLoaded, String>>,
 }
 
@@ -18503,9 +18763,9 @@ struct AudioPlayer {
     volume: f32,       // master volume 0..1 (from the menu-bar control)
     muted: bool,       // master mute (silences without losing the volume value)
     tracker_samples: Vec<NamedSample>, // samples inside a tracker module (empty for PCM files)
-    active_sample: Option<usize>,      // which tracker sample is loaded (None = the whole song)
-    song_backup: Option<SampleBuf>,    // the song buffer, stashed while a sample is auditioned
-    pad_voices: Vec<PadVoice>,         // concurrent one-shot pad hits on the shared mixer (polyphonic)
+    active_sample: Option<usize>, // which tracker sample is loaded (None = the whole song)
+    song_backup: Option<SampleBuf>, // the song buffer, stashed while a sample is auditioned
+    pad_voices: Vec<PadVoice>, // concurrent one-shot pad hits on the shared mixer (polyphonic)
 }
 
 /// One live, concurrent sample-pad voice. Unlike the monophonic `AudioPlayer::player` (which is
@@ -18672,7 +18932,8 @@ impl AudioPlayer {
     ) {
         use rodio::Source;
         let speed = 2.0f32.powf(semitone as f32 / 12.0);
-        let src = rodio::buffer::SamplesBuffer::new(buf.channels, buf.sample_rate, region).speed(speed);
+        let src =
+            rodio::buffer::SamplesBuffer::new(buf.channels, buf.sample_rate, region).speed(speed);
         let player = rodio::Player::connect_new(self._stream.mixer());
         player.set_volume(gain);
         if loop_it {
@@ -18733,7 +18994,10 @@ impl AudioPlayer {
             let half = (sr as usize / 100).saturating_mul(ch); // ~10 ms each side
             let s = center.saturating_sub(half).min(n);
             let e = (center + half).min(n);
-            let peak = v.buf.samples[s..e].iter().fold(0f32, |m, &x| m.max(x.abs())).min(1.0);
+            let peak = v.buf.samples[s..e]
+                .iter()
+                .fold(0f32, |m, &x| m.max(x.abs()))
+                .min(1.0);
             out[v.pad] = out[v.pad].max(peak);
         }
         out
@@ -19480,7 +19744,11 @@ fn piano_keyboard(
                 rect.left_top() + egui::vec2(wi as f32 * ww, 0.0),
                 egui::vec2(ww, h),
             );
-            let resp = ui.interact(kr.shrink(1.0), ui.id().with(("wk", wi)), egui::Sense::click());
+            let resp = ui.interact(
+                kr.shrink(1.0),
+                ui.id().with(("wk", wi)),
+                egui::Sense::click(),
+            );
             let fill = if let Some(c) = lit(base + semi) {
                 c
             } else if resp.is_pointer_button_down_on() {
@@ -19524,7 +19792,11 @@ fn piano_keyboard(
                 egui::pos2(cx - bw / 2.0, rect.top()),
                 egui::vec2(bw, bh),
             );
-            let resp = ui.interact(kr, ui.id().with(("bk", oi * 12 + semi)), egui::Sense::click());
+            let resp = ui.interact(
+                kr,
+                ui.id().with(("bk", oi * 12 + semi)),
+                egui::Sense::click(),
+            );
             let fill = if let Some(c) = lit(base + semi) {
                 c
             } else if resp.is_pointer_button_down_on() {
@@ -20115,7 +20387,10 @@ fn entry_context_menu(
             }
         }
         if ui
-            .add_enabled(!pinned, egui::Button::new(format!("{} Pin to Places", icons::PIN)))
+            .add_enabled(
+                !pinned,
+                egui::Button::new(format!("{} Pin to Places", icons::PIN)),
+            )
             .clicked()
         {
             pick = Some(TilePick::Pin);
@@ -20481,7 +20756,10 @@ fn hover_details(
             ui.label(format!("{fmt} · {}", t.format));
         }
         ui.label(format!("{} channels · {} patterns", t.channels, t.patterns));
-        ui.label(format!("{} instruments · {} samples", t.instruments, t.samples));
+        ui.label(format!(
+            "{} instruments · {} samples",
+            t.instruments, t.samples
+        ));
         if t.duration_ms > 0 {
             ui.label(format!(
                 "Length: {} · {} pos",
@@ -21106,7 +21384,10 @@ mod tests {
         let accent = [200, 100, 40];
         // t=0 → base, t=1 → accent, and a subtle tint stays close to base.
         assert_eq!(blend_toward(base, accent, 0.0), base);
-        assert_eq!(blend_toward(base, accent, 1.0), egui::Color32::from_rgb(200, 100, 40));
+        assert_eq!(
+            blend_toward(base, accent, 1.0),
+            egui::Color32::from_rgb(200, 100, 40)
+        );
         let subtle = blend_toward(base, accent, 0.25);
         assert_eq!(subtle, egui::Color32::from_rgb(50, 25, 10));
         // A light base tints toward the accent from the other side.
@@ -21116,7 +21397,10 @@ mod tests {
 
     #[test]
     fn strip_audio_ext_removes_only_known_exts() {
-        assert_eq!(strip_audio_ext("CM 1 Aalto 1v Seq's.wav"), "CM 1 Aalto 1v Seq's");
+        assert_eq!(
+            strip_audio_ext("CM 1 Aalto 1v Seq's.wav"),
+            "CM 1 Aalto 1v Seq's"
+        );
         assert_eq!(strip_audio_ext("kick.WAV"), "kick"); // case-insensitive
         assert_eq!(strip_audio_ext("loop.flac"), "loop");
         assert_eq!(strip_audio_ext("snare"), "snare"); // no ext → unchanged
@@ -21161,8 +21445,14 @@ mod tests {
         let marks = detect_transients(&s, 1, sr, 0.5);
         // At least the two onsets, near 0.25s and 0.50s.
         assert!(marks.len() >= 2, "expected ≥2 onsets, got {}", marks.len());
-        assert!(marks.iter().any(|&m| (m - 0.25).abs() < 0.03), "no onset near 0.25s: {marks:?}");
-        assert!(marks.iter().any(|&m| (m - 0.50).abs() < 0.03), "no onset near 0.50s: {marks:?}");
+        assert!(
+            marks.iter().any(|&m| (m - 0.25).abs() < 0.03),
+            "no onset near 0.25s: {marks:?}"
+        );
+        assert!(
+            marks.iter().any(|&m| (m - 0.50).abs() < 0.03),
+            "no onset near 0.50s: {marks:?}"
+        );
         // Silence detects nothing.
         assert!(detect_transients(&vec![0.0f32; sr as usize], 1, sr, 0.5).is_empty());
     }
@@ -21195,7 +21485,7 @@ mod tests {
         assert_eq!(r.color, Some([200, 50, 90]));
         assert_eq!(r.source.as_deref(), Some("/samples/kick.wav"));
         assert!(r.note_lock); // key-lock survives the round-trip
-        // A short/garbage row degrades gracefully to sane defaults.
+                              // A short/garbage row degrades gracefully to sane defaults.
         let (d, _) = Pad::from_record(&["1".to_string()]);
         assert_eq!(d.note, None);
         assert_eq!(d.volume, 1.0);
@@ -21214,7 +21504,7 @@ mod tests {
         assert!(pad_is_audible(&none, 0));
         assert!(!pad_is_audible(&none, 1)); // muted
         assert!(!pad_is_audible(&none, 9)); // out of range
-        // Any solo present → only soloed pads sound (even unmuted non-solo goes silent).
+                                            // Any solo present → only soloed pads sound (even unmuted non-solo goes silent).
         let solo = vec![mk(false, true), mk(false, false), mk(true, true)];
         assert!(pad_is_audible(&solo, 0)); // soloed
         assert!(!pad_is_audible(&solo, 1)); // not soloed while a solo is active
@@ -21225,9 +21515,7 @@ mod tests {
     fn pad_wav_roundtrip_via_decode() {
         // Discharges the "reload persisted pads without a WAV reader" risk: wav_bytes_16 →
         // disk → decode_sample_buf (reusing decode_audio) must recover rate/channels/length.
-        let samples: Vec<f32> = (0..800)
-            .map(|i| ((i as f32) * 0.05).sin() * 0.5)
-            .collect();
+        let samples: Vec<f32> = (0..800).map(|i| ((i as f32) * 0.05).sin() * 0.5).collect();
         let wav = wav_bytes_16(&samples, 1, 8000);
         let path = std::env::temp_dir().join("pv_pad_roundtrip_test.wav");
         std::fs::write(&path, &wav).unwrap();
@@ -21272,7 +21560,7 @@ mod tests {
         assert_eq!(parse_wav_loop(&build(0, 100, 200)), Some((100, 200, 0))); // forward
         assert_eq!(parse_wav_loop(&build(1, 10, 50)), Some((10, 50, 2))); // alternating → ping-pong
         assert_eq!(parse_wav_loop(&build(2, 5, 9)), Some((5, 9, 1))); // backward → reverse
-        // Degenerate loop (end <= start) and non-WAV bytes yield None.
+                                                                      // Degenerate loop (end <= start) and non-WAV bytes yield None.
         assert_eq!(parse_wav_loop(&build(0, 200, 200)), None);
         assert_eq!(parse_wav_loop(b"not a wav file at all!!"), None);
     }
@@ -22102,7 +22390,8 @@ mod tests {
             dither_amount: 0.0,
             dither_custom: &[],
             dither_n: 0,
-            dither_scale: 1,
+            dither_scale_x: 1,
+            dither_scale_y: 1,
             balance: [0, 0, 0],
             palette: Some(&pal),
         };
@@ -22132,7 +22421,8 @@ mod tests {
             dither_amount: 0.0,
             dither_custom: &[],
             dither_n: 0,
-            dither_scale: 1,
+            dither_scale_x: 1,
+            dither_scale_y: 1,
             balance: [0, 0, 0],
             palette: None,
         };
@@ -22145,7 +22435,11 @@ mod tests {
         assert_eq!(rgba[0], rgba[4], "left 2-px block is uniform");
         assert_eq!(rgba[8], rgba[12], "right 2-px block is uniform");
         assert!((45..=55).contains(&rgba[0]), "left ≈50, got {}", rgba[0]);
-        assert!((145..=155).contains(&rgba[8]), "right ≈150, got {}", rgba[8]);
+        assert!(
+            (145..=155).contains(&rgba[8]),
+            "right ≈150, got {}",
+            rgba[8]
+        );
         // A no-op resample (target == source) leaves the buffer untouched.
         let mut same = vec![10u8, 20, 30, 255, 40, 50, 60, 255];
         let copy = same.clone();
@@ -22993,7 +23287,10 @@ mod hold_test {
         // fmt: PCM(1), 1 channel, 8000 Hz, 16-bit.
         assert_eq!(u16::from_le_bytes([bytes[20], bytes[21]]), 1);
         assert_eq!(u16::from_le_bytes([bytes[22], bytes[23]]), 1);
-        assert_eq!(u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]), 8000);
+        assert_eq!(
+            u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]),
+            8000
+        );
         assert_eq!(u16::from_le_bytes([bytes[34], bytes[35]]), 16);
         // data chunk = 4 samples * 2 bytes, and the whole file is 44 + data.
         assert_eq!(
