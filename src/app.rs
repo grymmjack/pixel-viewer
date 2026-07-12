@@ -3032,8 +3032,9 @@ impl PixelView {
         let (region, eff_ch) = apply_pan(region, ch, pad.pan);
         let channels = std::num::NonZeroU16::new(eff_ch as u16).unwrap_or(buf.channels);
         let (pitch, loop_it) = (pad.pitch, pad.loop_on);
-        // Velocity: a kit-wide fixed velocity (global) overrides everything; else the pad tracks
-        // the incoming velocity, or ignores it (fixed 127) when its own tracking is off.
+        let (region_start, region_len, loop_type) = (ls, le - ls, pad.loop_type); // for the playhead
+                                                                                  // Velocity: a kit-wide fixed velocity (global) overrides everything; else the pad tracks
+                                                                                  // the incoming velocity, or ignores it (fixed 127) when its own tracking is off.
         let vel = if self.kit_global_vel {
             self.kit_global_vel_amt
         } else if pad.vel_track {
@@ -3047,7 +3048,18 @@ impl PixelView {
             pad.volume
         }) * (vel as f32 / 127.0).clamp(0.0, 1.0);
         if let Some(ap) = &mut self.audio_player {
-            ap.trigger_pad_voice(i, buf, region, channels, pitch, gain, loop_it);
+            ap.trigger_pad_voice(
+                i,
+                buf,
+                region,
+                channels,
+                region_start,
+                region_len,
+                loop_type,
+                pitch,
+                gain,
+                loop_it,
+            );
         }
         self.pads[i].flash_t = now;
         // Light this pad's assigned key on the onscreen keyboard too (red — it routes to a pad), so
@@ -5396,6 +5408,22 @@ impl PixelView {
                     rect.y_range(),
                     egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 224, 130)),
                 );
+            }
+            // Live pad-voice playhead — while drilled into a pad, a bright marker sweeps left→right
+            // tracking that pad's currently-playing voice, so you can watch the envelope shape the
+            // sound. (A pad plays as a separate mixer voice, so the main yellow playhead can't show
+            // it.) Repaint continuously while it sounds so the sweep animates.
+            if let EditFocus::Pad(pi) = self.edit_focus {
+                if let Some(pt) = ap.pad_voice_pos(pi) {
+                    if pt >= vs - 1e-6 && pt <= ve + 1e-6 {
+                        p.vline(
+                            x_of(pt),
+                            rect.y_range(),
+                            egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 240, 170)),
+                        );
+                    }
+                    ui.ctx().request_repaint();
+                }
             }
             // ---- Amp-envelope overlay (edit the ADSR curve directly on the waveform) ----
             if env_editing {
@@ -20514,6 +20542,13 @@ struct PadVoice {
     player: rodio::Player,
     buf: std::sync::Arc<SampleBuf>,
     speed: f32, // pitch ratio (2^(semitone/12)) — the voice advances this much faster than wall time
+    // Region the voice is playing (sample seconds), for the live playhead: `region_start` = where in
+    // the sample the region begins, `region_len` = its forward length, `loop_type` maps a ping-pong /
+    // reverse played position back to a sample time, `loop_it` = whether it wraps.
+    region_start: f32,
+    region_len: f32,
+    loop_type: u8,
+    loop_it: bool,
 }
 
 impl AudioPlayer {
@@ -20666,6 +20701,9 @@ impl AudioPlayer {
         buf: std::sync::Arc<SampleBuf>,
         region: Vec<rodio::Sample>,
         channels: rodio::ChannelCount, // the region's channel count (pan may expand mono → stereo)
+        region_start: f32,             // where in the sample the played region begins (seconds)
+        region_len: f32,               // the region's forward length (seconds)
+        loop_type: u8,
         semitone: i32,
         gain: f32,
         loop_it: bool,
@@ -20687,7 +20725,43 @@ impl AudioPlayer {
             player,
             buf,
             speed,
+            region_start,
+            region_len,
+            loop_type,
+            loop_it,
         });
+    }
+
+    /// The live playback position (in SAMPLE seconds) of pad `i`'s currently-sounding voice, for the
+    /// moving playhead — `None` if it isn't playing. Maps the voice's consumed source time (scaled by
+    /// pitch `speed`, wrapped for a looping voice) back onto the sample timeline, honoring the region
+    /// offset and reverse / ping-pong direction so the marker tracks what you actually hear.
+    fn pad_voice_pos(&self, i: usize) -> Option<f32> {
+        let v = self
+            .pad_voices
+            .iter()
+            .find(|v| v.pad == i && !v.player.empty() && !v.player.is_paused())?;
+        let rlen = v.region_len.max(1e-4);
+        // Total length of the played buffer in source seconds (ping-pong plays fwd then back).
+        let played = if v.loop_type == 2 { rlen * 2.0 } else { rlen };
+        let mut src = v.player.get_pos().as_secs_f32() * v.speed;
+        if v.loop_it {
+            src %= played; // a looping voice's clock runs past the buffer end
+        } else if src > played {
+            return None; // a finished one-shot (reaper hasn't dropped it yet)
+        }
+        let t = match v.loop_type {
+            1 => v.region_start + (rlen - src.min(rlen)), // reverse: played 0 = region end
+            2 => {
+                if src <= rlen {
+                    v.region_start + src // forward half
+                } else {
+                    v.region_start + (rlen - (src - rlen)) // back half
+                }
+            }
+            _ => v.region_start + src.min(rlen), // forward
+        };
+        Some(t.clamp(0.0, v.buf.duration.max(0.0)))
     }
 
     /// Drop finished pad voices (call once per frame; bounds the Vec + frees rodio players).
