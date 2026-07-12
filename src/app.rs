@@ -890,6 +890,7 @@ pub struct PixelView {
     custom_palette: Option<Vec<[u8; 4]>>,    // a generated/edited palette (e.g. Random)
     flash: Option<[u8; 4]>,                  // swatch held down: highlight this color
     editing_color: Option<(usize, [u8; 4])>, // swatch right-click: editing palette[idx]
+    swatch_rect: Option<egui::Rect>,         // screen rect of the palette swatch row (Edit-color anchor)
     adjust: Adjust,                          // tone adjustments applied before the palette map
     explorer_filter: String,                 // folder-tree search box (runtime only)
     colo_search: String,                     // 16colo.rs nav-bar search box (runtime only)
@@ -952,6 +953,15 @@ pub struct PixelView {
     dither_amount: f32,      // 0..1 dither strength
     dither_custom: Vec<u32>, // custom ordered-dither threshold matrix (row-major)
     dither_custom_n: usize,  // custom matrix dimension (n×n; 2/4/8)
+    dither_scale: usize,     // ordered-dither cell size in px (≥1; "zoom" the pattern)
+    // Resize/resample preview: downsample the art to a fraction of native, run the
+    // whole pipeline (dither/palette) at that lower resolution, then nearest-upscale
+    // back to native — so it displays at the SAME screen size but shows the
+    // degradation, and single-pixel dither operates at the reduced resolution.
+    resize_on: bool,   // is the resample active?
+    resize_fx: f32,    // width factor  (0,1] of native
+    resize_fy: f32,    // height factor (0,1] of native
+    resize_lock: bool, // lock aspect (fx == fy)
     balance_color: [u8; 3],  // color-balance op: ±offset color (128 = neutral)
     balance_strength: f32,   // color-balance op: 0..1 amount
     balance_hex: String,     // live buffer for the hex paste field
@@ -1276,6 +1286,11 @@ impl PixelView {
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
     const DITHER_CUSTOM_KEY: &'static str = "dither_custom";
     const DITHER_CUSTOM_N_KEY: &'static str = "dither_custom_n";
+    const DITHER_SCALE_KEY: &'static str = "dither_scale";
+    const RESIZE_ON_KEY: &'static str = "resize_on";
+    const RESIZE_FX_KEY: &'static str = "resize_fx";
+    const RESIZE_FY_KEY: &'static str = "resize_fy";
+    const RESIZE_LOCK_KEY: &'static str = "resize_lock";
     const BALANCE_COLOR_KEY: &'static str = "balance_color";
     const BALANCE_STRENGTH_KEY: &'static str = "balance_strength";
     const PALETTE_DIR_KEY: &'static str = "palette_dir";
@@ -1655,6 +1670,23 @@ impl PixelView {
             .and_then(|s| eframe::get_value::<Vec<u32>>(s, Self::DITHER_CUSTOM_KEY))
             .filter(|v| v.len() == dither_custom_n * dither_custom_n)
             .unwrap_or_else(|| crate::thumb::bayer_values(dither_custom_n));
+        let dither_scale = cc
+            .storage
+            .and_then(|s| eframe::get_value::<usize>(s, Self::DITHER_SCALE_KEY))
+            .unwrap_or(1)
+            .clamp(1, 32);
+        let resize_on = get_bool(Self::RESIZE_ON_KEY).unwrap_or(false);
+        let resize_fx = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::RESIZE_FX_KEY))
+            .unwrap_or(1.0)
+            .clamp(0.005, 1.0);
+        let resize_fy = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::RESIZE_FY_KEY))
+            .unwrap_or(1.0)
+            .clamp(0.005, 1.0);
+        let resize_lock = get_bool(Self::RESIZE_LOCK_KEY).unwrap_or(true);
         let balance_color = cc
             .storage
             .and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::BALANCE_COLOR_KEY))
@@ -1834,6 +1866,7 @@ impl PixelView {
             custom_palette: None,
             flash: None,
             editing_color: None,
+            swatch_rect: None,
             adjust,
             explorer_filter: String::new(),
             colo_search: String::new(),
@@ -1886,6 +1919,11 @@ impl PixelView {
             dither_amount,
             dither_custom,
             dither_custom_n,
+            dither_scale,
+            resize_on,
+            resize_fx,
+            resize_fy,
+            resize_lock,
             balance_color,
             balance_strength,
             balance_hex,
@@ -8265,16 +8303,45 @@ impl PixelView {
     }
 
     /// Bundle the marker-op inputs (dither + balance + the snap palette) for a
-    /// pipeline run. `palette` is the active recolor palette, or None.
-    fn pipe_aux<'a>(&'a self, palette: Option<&'a [[u8; 4]]>) -> PipeAux<'a> {
+    /// pipeline run. `palette` is the active recolor palette, or None. `dscale` is
+    /// the effective ordered-dither cell size for *this* buffer (see
+    /// [`eff_dither_scale`], which keeps the pattern the same fraction of the image
+    /// on a small preview vs the full-res view).
+    fn pipe_aux<'a>(&'a self, palette: Option<&'a [[u8; 4]]>, dscale: usize) -> PipeAux<'a> {
         PipeAux {
             dither_method: self.dither_method,
             dither_amount: self.dither_amount,
             dither_custom: &self.dither_custom,
             dither_n: self.dither_custom_n,
+            dither_scale: dscale,
             balance: self.balance_offset(),
             palette,
         }
+    }
+
+    /// The ordered-dither cell size to use when the pipeline runs on a `buf_w`-wide
+    /// buffer, given the image's `native_w`. `dither_scale` is authored against the
+    /// full-res image, so on a downscaled buffer (preview / grid thumb) we shrink it
+    /// by `buf_w / native_w` — that makes the dither cover the same *fraction* of the
+    /// image everywhere, so the small preview faithfully predicts the full view.
+    fn eff_dither_scale(&self, buf_w: usize, native_w: usize) -> usize {
+        if native_w == 0 || buf_w >= native_w {
+            return self.dither_scale.max(1);
+        }
+        ((self.dither_scale as f32 * buf_w as f32 / native_w as f32).round() as usize).max(1)
+    }
+
+    /// The resample target dims for a `w`×`h` pipeline buffer: the buffer scaled by
+    /// the resize factors (min 1px, never up). Equals `(w, h)` when Resize is off, so
+    /// callers can unconditionally pass the result to [`apply_pipeline_resized`].
+    /// Factor-based (not absolute px) so preview + full-res degrade by the same ratio.
+    fn resize_target(&self, w: usize, h: usize) -> (usize, usize) {
+        if !self.resize_on {
+            return (w, h);
+        }
+        let tw = ((w as f32 * self.resize_fx).round() as usize).clamp(1, w.max(1));
+        let th = ((h as f32 * self.resize_fy).round() as usize).clamp(1, h.max(1));
+        (tw, th)
     }
 
     /// Is *any* pipeline stage active (an adjustment, color balance, or dither)?
@@ -8283,6 +8350,12 @@ impl PixelView {
         !self.adjust.is_identity()
             || self.balance_offset() != [0, 0, 0]
             || (self.dither_method != 0 && self.dither_amount > 0.0)
+            || self.resize_active()
+    }
+
+    /// True when the Resize/resample actually downsamples (on + a factor below 1).
+    fn resize_active(&self) -> bool {
+        self.resize_on && (self.resize_fx < 1.0 || self.resize_fy < 1.0)
     }
 
     /// A cache key for the whole adjustment pipeline (everything *except* the snap
@@ -8297,13 +8370,17 @@ impl PixelView {
             String::new()
         };
         format!(
-            "{}|D{}:{:.2}:{dsig}|B{},{},{}",
+            "{}|D{}:{:.2}:{dsig}:S{}|B{},{},{}|R{}:{:.4}:{:.4}",
             self.adjust.key(),
             self.dither_method,
             self.dither_amount,
+            self.dither_scale,
             off[0],
             off[1],
             off[2],
+            self.resize_on as u8,
+            self.resize_fx,
+            self.resize_fy,
         )
     }
 
@@ -8390,8 +8467,11 @@ impl PixelView {
         }
         let (w, h, mut rgba) = self.thumb_rgba.get(path)?.clone();
         let palette = self.tile_palette(path);
-        let aux = self.pipe_aux(palette.as_deref());
-        apply_pipeline(&mut rgba, w, h, &self.adjust, &aux);
+        let native_w = self.img_meta.get(path).map(|m| m.w as usize).unwrap_or(w);
+        let ds = self.eff_dither_scale(w, native_w);
+        let (tw, th) = self.resize_target(w, h);
+        let aux = self.pipe_aux(palette.as_deref(), ds);
+        apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
         let color = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
         // Match the plain-thumb path: a downscaled (area-averaged) tile displays
         // LINEAR so it isn't re-aliased; a source-res sprite stays crisp NEAREST.
@@ -8423,15 +8503,18 @@ impl PixelView {
         let (w, h, mut rgba) = self.thumb_rgba.get(path)?.clone();
         // Flash highlights where a palette color is used — run adjustments + balance
         // + the plain snap, but skip dither (its noise would scatter the highlight).
+        // Resize still applies so the highlight matches the (possibly degraded) preview.
+        let (tw, th) = self.resize_target(w, h);
         let aux = PipeAux {
             dither_method: 0,
             dither_amount: 0.0,
             dither_custom: &[],
             dither_n: 0,
+            dither_scale: 1,
             balance: self.balance_offset(),
             palette: palette.as_deref(),
         };
-        apply_pipeline(&mut rgba, w, h, &self.adjust, &aux);
+        apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
         for px in rgba.chunks_exact_mut(4) {
             if px[3] == 0 {
                 continue;
@@ -8480,8 +8563,11 @@ impl PixelView {
             let s = self.preview_src.as_ref().unwrap();
             (s.1, s.2, s.3.clone())
         };
-        let aux = self.pipe_aux(palette);
-        apply_pipeline(&mut rgba, w, h, &self.adjust, &aux);
+        let native_w = self.img_meta.get(path).map(|m| m.w as usize).unwrap_or(w);
+        let ds = self.eff_dither_scale(w, native_w);
+        let (tw, th) = self.resize_target(w, h);
+        let aux = self.pipe_aux(palette, ds);
+        apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
         let color = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
         let tex = ctx.load_texture("pv_preview", color, egui::TextureOptions::NEAREST);
         self.preview_tex = Some((path.to_path_buf(), key.to_string(), tex.clone()));
@@ -8511,8 +8597,11 @@ impl PixelView {
             }
         };
         let (w, h) = (size[0], size[1]);
-        let aux = self.pipe_aux(palette);
-        apply_pipeline(&mut rgba, w, h, &self.adjust, &aux);
+        // Full-res buffer: native_w == w, so eff_dither_scale is the raw scale.
+        let ds = self.eff_dither_scale(w, w);
+        let (tw, th) = self.resize_target(w, h);
+        let aux = self.pipe_aux(palette, ds);
+        apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
         let tt = TiledTexture::from_rgba(ctx, "pv_full_reduced", size, &rgba, view_tex_opts());
         self.full_reduced = Some((path.to_path_buf(), key.to_string(), tt.clone()));
         Some(tt)
@@ -9169,6 +9258,10 @@ impl PixelView {
                 self.dither_amount = 1.0;
                 self.dither_custom_n = 4;
                 self.dither_custom = crate::thumb::bayer_values(4);
+                self.dither_scale = 1;
+                self.resize_on = false;
+                self.resize_fx = 1.0;
+                self.resize_fy = 1.0;
                 self.balance_color = [128, 128, 128];
                 self.balance_strength = 0.0;
                 self.balance_hex = "808080".into();
@@ -9251,7 +9344,7 @@ impl PixelView {
                     let mut swatch_flash: Option<[u8; 4]> = None;
                     let mut swatch_delete: Option<usize> = None;
                     let mut swatch_edit: Option<usize> = None;
-                    ui.horizontal_wrapped(|ui| {
+                    let swatch_row = ui.horizontal_wrapped(|ui| {
                         for (i, &c) in d.iter().enumerate() {
                             let (r, resp) = ui
                                 .allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
@@ -9283,6 +9376,9 @@ impl PixelView {
                             });
                         }
                     });
+                    // Remember where the swatch row sits (screen coords) so the
+                    // Edit-color dialog can default to just left of it.
+                    self.swatch_rect = Some(swatch_row.response.rect);
                     // Apply swatch actions. Edits/deletes materialize the active palette
                     // into a live `custom_palette` — the .gpl files on disk are never
                     // touched. Flash is set only while a swatch is held.
@@ -9290,13 +9386,18 @@ impl PixelView {
                     if swatch_flash.is_some() {
                         self.want_repaint = true;
                     }
+                    // Editing/deleting a swatch materializes the shown palette into
+                    // `custom_palette` (which wins in `active_recolor`), so the edit
+                    // shows live. We DON'T clear `quantize_on` here: editing a reduced
+                    // color should keep "Reduce" checked (the user's edit *is* the
+                    // reduced palette, hand-tweaked). Toggling Reduce or changing the
+                    // Colors count are the explicit resets that drop the edit.
                     if let Some(i) = swatch_delete {
                         if d.len() > 1 && i < d.len() {
                             let mut pal = d.clone();
                             pal.remove(i);
                             self.custom_palette = Some(pal);
                             self.selected_palette = None;
-                            self.quantize_on = false;
                         }
                     }
                     if let Some(i) = swatch_edit {
@@ -9304,7 +9405,6 @@ impl PixelView {
                             self.editing_color = Some((i, c));
                             self.custom_palette = Some(d.clone());
                             self.selected_palette = None;
-                            self.quantize_on = false;
                         }
                     }
                     ui.spacing_mut().item_spacing = prev;
@@ -9340,6 +9440,126 @@ impl PixelView {
                 }
                 ui.add_space(6.0);
                 ui.separator();
+
+                // ----- Resize / resample (downsample the art, run the whole pipeline
+                //       at that lower resolution, then nearest-upscale back so it shows
+                //       at the SAME on-screen size — to judge low-res degradation and to
+                //       dither at single-pixel scale). Sits above Adjustments so the
+                //       resample happens first. -----
+                {
+                    let (nw, nh) = self
+                        .img_meta
+                        .get(&entry.path)
+                        .map(|m| (m.w as usize, m.h as usize))
+                        .filter(|&(w, h)| w > 0 && h > 0)
+                        .unwrap_or((0, 0));
+                    let (tw, th) = if nw > 0 {
+                        (
+                            ((nw as f32 * self.resize_fx).round() as usize).max(1),
+                            ((nh as f32 * self.resize_fy).round() as usize).max(1),
+                        )
+                    } else {
+                        (0, 0)
+                    };
+                    let header = if self.resize_active() {
+                        format!("Resize *  · {tw}×{th}")
+                    } else {
+                        "Resize".to_string()
+                    };
+                    egui::CollapsingHeader::new(header)
+                        .id_salt("resize")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            if nw == 0 {
+                                ui.weak("(load the image to resize it)");
+                                return;
+                            }
+                            ui.checkbox(&mut self.resize_on, "Enable").on_hover_text(
+                                "Downsample then upscale back — the low-res look at the \
+                                 same on-screen size. Dither/adjustments below apply at \
+                                 the reduced resolution.",
+                            );
+                            let resize_on = self.resize_on;
+                            ui.add_enabled_ui(resize_on, |ui| {
+                                const PAD: f32 = 10.0;
+                                const VALUE_W: f32 = 64.0;
+                                let font = egui::TextStyle::Body.resolve(ui.style());
+                                let label_col = ui
+                                    .painter()
+                                    .layout_no_wrap(
+                                        "Height".to_string(),
+                                        font,
+                                        egui::Color32::WHITE,
+                                    )
+                                    .size()
+                                    .x;
+                                let slider_w = (ui.available_width()
+                                    - label_col
+                                    - VALUE_W
+                                    - PAD * 2.0)
+                                    .max(48.0);
+                                // Width (px) — editing sets the width factor; a locked
+                                // aspect mirrors it to the height factor.
+                                let mut w = tw;
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = PAD;
+                                    value_slider(
+                                        ui, "Width", label_col, slider_w, VALUE_W, &mut w,
+                                        1usize, nw, nw, 1.0, 0,
+                                    );
+                                });
+                                if w != tw {
+                                    self.resize_fx = (w as f32 / nw as f32).clamp(0.005, 1.0);
+                                    if self.resize_lock {
+                                        self.resize_fy = self.resize_fx;
+                                    }
+                                }
+                                // Height (px).
+                                let mut h = th;
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = PAD;
+                                    value_slider(
+                                        ui, "Height", label_col, slider_w, VALUE_W, &mut h,
+                                        1usize, nh, nh, 1.0, 0,
+                                    );
+                                });
+                                if h != th {
+                                    self.resize_fy = (h as f32 / nh as f32).clamp(0.005, 1.0);
+                                    if self.resize_lock {
+                                        self.resize_fx = self.resize_fy;
+                                    }
+                                }
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .selectable_label(self.resize_lock, "🔒 Lock aspect")
+                                        .clicked()
+                                    {
+                                        self.resize_lock = !self.resize_lock;
+                                        if self.resize_lock {
+                                            self.resize_fy = self.resize_fx; // unify on lock
+                                        }
+                                    }
+                                    if ui
+                                        .button("/2")
+                                        .on_hover_text("Halve the resolution (press again to keep halving)")
+                                        .clicked()
+                                    {
+                                        self.resize_fx = (self.resize_fx * 0.5).max(0.005);
+                                        self.resize_fy = (self.resize_fy * 0.5).max(0.005);
+                                    }
+                                    if ui.button("×2").on_hover_text("Double back up").clicked() {
+                                        self.resize_fx = (self.resize_fx * 2.0).min(1.0);
+                                        self.resize_fy = (self.resize_fy * 2.0).min(1.0);
+                                    }
+                                    if ui.button("Reset").on_hover_text("Back to native resolution").clicked() {
+                                        self.resize_fx = 1.0;
+                                        self.resize_fy = 1.0;
+                                    }
+                                });
+                            });
+                        });
+                }
+                ui.add_space(4.0);
 
                 // ----- Adjustments (applied before the palette map) -----
                 {
@@ -9727,9 +9947,12 @@ impl PixelView {
                             .changed()
                         {
                             self.quantize_on = on;
+                            // Toggling Reduce is the explicit reset: drop any swatch
+                            // hand-edit so checking re-reduces fresh and unchecking
+                            // reverts to Original (custom_palette wins otherwise).
+                            self.custom_palette = None;
                             if on {
                                 self.selected_palette = None;
-                                self.custom_palette = None;
                             }
                         }
                     }
@@ -9745,6 +9968,7 @@ impl PixelView {
                             .x;
                         let slider_w =
                             (ui.available_width() - label_col - VALUE_W - PAD * 2.0).max(48.0);
+                        let n_before = self.quantize_n;
                         ui.add_enabled_ui(active_reduce, |ui| {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = PAD;
@@ -9754,6 +9978,11 @@ impl PixelView {
                                 );
                             });
                         });
+                        // Changing the count re-quantizes to a fresh N-color median cut,
+                        // so a prior swatch hand-edit (kept in custom_palette) is dropped.
+                        if self.quantize_n != n_before {
+                            self.custom_palette = None;
+                        }
                     }
                     // Quick reduction presets.
                     ui.horizontal(|ui| {
@@ -9794,6 +10023,22 @@ impl PixelView {
                             let resp = ui.add(egui::Slider::new(&mut self.dither_amount, 0.0..=1.0));
                             middle_reset(ui, &resp, &mut self.dither_amount, 1.0f32);
                             wheel_adjust(ui, &resp, &mut self.dither_amount, 0.05, 0.0f32, 1.0f32);
+                        });
+                    }
+                    // Cell scale — only meaningful for the ordered (Bayer/custom) methods;
+                    // error-diffusion has no fixed cell. Enlarges each cell to N×N px so a
+                    // Bayer pattern reads as a proper crosshatch on high-res art, not noise.
+                    if matches!(self.dither_method, 1 | 2 | 3)
+                        || self.dither_method == crate::thumb::DITHER_CUSTOM
+                    {
+                        ui.horizontal(|ui| {
+                            ui.label("Scale")
+                                .on_hover_text("Dither cell size in pixels — zoom the pattern to match high-res art");
+                            let resp = ui.add(
+                                egui::Slider::new(&mut self.dither_scale, 1..=16).suffix("px"),
+                            );
+                            middle_reset(ui, &resp, &mut self.dither_scale, 1usize);
+                            wheel_adjust(ui, &resp, &mut self.dither_scale, 1.0, 1usize, 16usize);
                         });
                     }
                     if matches!(self.dither_method, 4 | 5) && recolor.is_none() {
@@ -9961,11 +10206,23 @@ impl PixelView {
         if let Some((idx, mut c)) = self.editing_color {
             let mut open = true;
             let mut done = false;
+            // Movable (drag the title bar): an `.anchor()` re-pinned it dead-center
+            // every frame — parking it over the art AND defeating drag (the anchor
+            // overrode any move each frame). `default_pos` only sets the FIRST-frame
+            // spot; egui then remembers wherever the user drags it. Not modal.
+            // Default spot: just LEFT of the palette swatches (its top-right corner
+            // sits at the swatch row's left edge, via the RIGHT_TOP pivot, so we
+            // don't need to know the dialog's width). Falls back to upper-left.
+            let default_pos = self
+                .swatch_rect
+                .map(|r| r.left_top() + egui::vec2(-12.0, 0.0))
+                .unwrap_or_else(|| ctx.content_rect().left_top() + egui::vec2(40.0, 80.0));
             egui::Window::new("Edit color")
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::RIGHT_TOP)
+                .default_pos(default_pos)
                 .show(&ctx, |ui| {
                     let mut col = egui::Color32::from_rgb(c[0], c[1], c[2]);
                     egui::color_picker::color_picker_color32(
@@ -10031,8 +10288,11 @@ impl PixelView {
             },
         };
         let (w, h) = (size[0], size[1]);
-        let aux = self.pipe_aux(recolor.as_ref().map(|(_, p)| p.as_slice()));
-        apply_pipeline(&mut rgba, w, h, &self.adjust, &aux);
+        // Save the image AS SHOWN: full-res, so the raw dither scale + resample apply.
+        let ds = self.eff_dither_scale(w, w);
+        let (tw, th) = self.resize_target(w, h);
+        let aux = self.pipe_aux(recolor.as_ref().map(|(_, p)| p.as_slice()), ds);
+        apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
         let name = format!("{stem}_{}.png", self.recolor_tag());
         let dest = if as_dialog {
@@ -15871,6 +16131,11 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::DITHER_AMOUNT_KEY, &self.dither_amount);
         eframe::set_value(storage, Self::DITHER_CUSTOM_KEY, &self.dither_custom);
         eframe::set_value(storage, Self::DITHER_CUSTOM_N_KEY, &self.dither_custom_n);
+        eframe::set_value(storage, Self::DITHER_SCALE_KEY, &self.dither_scale);
+        eframe::set_value(storage, Self::RESIZE_ON_KEY, &self.resize_on);
+        eframe::set_value(storage, Self::RESIZE_FX_KEY, &self.resize_fx);
+        eframe::set_value(storage, Self::RESIZE_FY_KEY, &self.resize_fy);
+        eframe::set_value(storage, Self::RESIZE_LOCK_KEY, &self.resize_lock);
         eframe::set_value(storage, Self::BALANCE_COLOR_KEY, &self.balance_color);
         eframe::set_value(storage, Self::BALANCE_STRENGTH_KEY, &self.balance_strength);
         eframe::set_value(storage, Self::PALETTE_DIR_KEY, &self.palette_dir);
@@ -16534,6 +16799,7 @@ struct PipeAux<'a> {
     dither_amount: f32,
     dither_custom: &'a [u32],
     dither_n: usize,
+    dither_scale: usize, // ordered-dither cell size in pixels (≥1)
     balance: [i16; 3],
     palette: Option<&'a [[u8; 4]]>,
 }
@@ -16560,10 +16826,46 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, a: &Adjust, aux: &PipeAux
                 aux.dither_amount,
                 aux.dither_custom,
                 aux.dither_n,
+                aux.dither_scale,
                 aux.palette,
             ),
             OpKind::ColorBalance => color_balance(rgba, aux.balance),
             other => apply_op(rgba, w, h, other, a),
+        }
+    }
+}
+
+/// Run the pipeline, optionally at a REDUCED resolution then nearest-upscaled back —
+/// the Resize/resample preview. When `tw < w` or `th < h`, the buffer is box-averaged
+/// down to `tw`×`th`, the WHOLE pipeline (adjustments, dither, palette) runs at that
+/// lower resolution, and the result is nearest-neighbor upscaled back into `rgba` at
+/// `w`×`h`. So the texture keeps its native size — unchanged zoom / on-screen size —
+/// but shows the low-res degradation, and single-pixel dither operates at the reduced
+/// resolution (the whole point of Resize). No downscale ⇒ a plain in-place pipeline.
+fn apply_pipeline_resized(
+    rgba: &mut [u8],
+    w: usize,
+    h: usize,
+    tw: usize,
+    th: usize,
+    a: &Adjust,
+    aux: &PipeAux,
+) {
+    if (tw >= w && th >= h) || tw == 0 || th == 0 || w == 0 || h == 0 {
+        apply_pipeline(rgba, w, h, a, aux);
+        return;
+    }
+    let mut small = crate::thumb::box_downscale(rgba, w, h, tw, th);
+    apply_pipeline(&mut small, tw, th, a, aux);
+    // Nearest-neighbor upscale small (tw×th) back into rgba (w×h): each dest pixel
+    // samples the source cell it falls in, so reduced pixels become solid blocks.
+    for y in 0..h {
+        let sy = y * th / h;
+        for x in 0..w {
+            let sx = x * tw / w;
+            let s = (sy * tw + sx) * 4;
+            let d = (y * w + x) * 4;
+            rgba[d..d + 4].copy_from_slice(&small[s..s + 4]);
         }
     }
 }
@@ -16622,6 +16924,7 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             dither_amount: 0.0,
             dither_custom: &[],
             dither_n: 0,
+            dither_scale: 1,
             balance: [0, 0, 0],
             palette: None,
         },
@@ -21768,6 +22071,7 @@ mod tests {
             dither_amount: 0.0,
             dither_custom: &[],
             dither_n: 0,
+            dither_scale: 1,
             balance: [0, 0, 0],
             palette: Some(&pal),
         };
@@ -21784,6 +22088,38 @@ mod tests {
             "brightness after remap lifts the red channel"
         );
         assert_ne!(last, first, "moving the palette op changes the result");
+    }
+
+    #[test]
+    fn resize_wrapper_downsamples_then_upscales_to_blocks() {
+        // The Resize preview: box-average down to tw×th, run the pipeline there, then
+        // nearest-upscale back to w×h so it displays at the SAME size in solid blocks.
+        // Identity adjust + no palette ⇒ only the resample runs.
+        let a = Adjust::default();
+        let aux = PipeAux {
+            dither_method: 0,
+            dither_amount: 0.0,
+            dither_custom: &[],
+            dither_n: 0,
+            dither_scale: 1,
+            balance: [0, 0, 0],
+            palette: None,
+        };
+        // 4×1: black, grey, grey, light. Downsample to 2×1 (avg pairs), upscale to 4×1.
+        let mut rgba = vec![
+            0, 0, 0, 255, 100, 100, 100, 255, 100, 100, 100, 255, 200, 200, 200, 255,
+        ];
+        apply_pipeline_resized(&mut rgba, 4, 1, 2, 1, &a, &aux);
+        // Left block = avg(0,100)=50; right block = avg(100,200)=150; each spans 2 px.
+        assert_eq!(rgba[0], rgba[4], "left 2-px block is uniform");
+        assert_eq!(rgba[8], rgba[12], "right 2-px block is uniform");
+        assert!((45..=55).contains(&rgba[0]), "left ≈50, got {}", rgba[0]);
+        assert!((145..=155).contains(&rgba[8]), "right ≈150, got {}", rgba[8]);
+        // A no-op resample (target == source) leaves the buffer untouched.
+        let mut same = vec![10u8, 20, 30, 255, 40, 50, 60, 255];
+        let copy = same.clone();
+        apply_pipeline_resized(&mut same, 2, 1, 2, 1, &a, &aux);
+        assert_eq!(same, copy, "tw==w ⇒ plain pipeline, no resample");
     }
 
     #[test]

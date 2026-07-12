@@ -389,6 +389,10 @@ pub fn bayer_values(n: usize) -> Vec<u32> {
 /// the later Palette step — so they work even with no palette (e.g. dithered
 /// posterize banding). Error-diffusion (Floyd–Steinberg/Atkinson) needs a target,
 /// so it quantizes toward `palette` here, or no-ops if none is active.
+/// `scale` (≥1) enlarges each ordered-dither cell to span `scale`×`scale` pixels —
+/// so on high-resolution art a Bayer pattern reads as a proper crosshatch instead
+/// of single-pixel noise. Ignored by the error-diffusion methods (they have no
+/// fixed cell). Pass 1 for the classic 1-px pattern.
 #[allow(clippy::too_many_arguments)]
 pub fn dither_pass(
     rgba: &mut [u8],
@@ -398,15 +402,17 @@ pub fn dither_pass(
     amount: f32,
     custom: &[u32],
     custom_n: usize,
+    scale: usize,
     palette: Option<&[[u8; 4]]>,
 ) {
     if method == 0 || amount <= 0.0 {
         return;
     }
+    let s = scale.max(1);
     match method {
-        1 => ordered_bias(rgba, w, h, &BAYER2, 2, amount),
-        2 => ordered_bias(rgba, w, h, &BAYER4, 4, amount),
-        3 => ordered_bias(rgba, w, h, &BAYER8, 8, amount),
+        1 => ordered_bias(rgba, w, h, &BAYER2, 2, s, amount),
+        2 => ordered_bias(rgba, w, h, &BAYER4, 4, s, amount),
+        3 => ordered_bias(rgba, w, h, &BAYER8, 8, s, amount),
         4 => {
             if let Some(p) = palette {
                 diffuse(rgba, w, h, p, amount, FLOYD_STEINBERG);
@@ -419,7 +425,7 @@ pub fn dither_pass(
         }
         DITHER_CUSTOM => {
             if custom_n >= 1 && custom.len() >= custom_n * custom_n {
-                ordered_bias(rgba, w, h, custom, custom_n, amount);
+                ordered_bias(rgba, w, h, custom, custom_n, s, amount);
             }
         }
         _ => {}
@@ -429,16 +435,26 @@ pub fn dither_pass(
 /// Ordered (Bayer/custom) dither *bias*: nudge each opaque pixel up/down by its
 /// `matrix` threshold so a later quantize (Palette or Posterize) breaks into a
 /// stable crosshatch. No snapping happens here — that's what makes it movable.
-fn ordered_bias(rgba: &mut [u8], w: usize, h: usize, matrix: &[u32], n: usize, amount: f32) {
+/// `scale` (≥1) makes each matrix cell span `scale`×`scale` pixels.
+fn ordered_bias(
+    rgba: &mut [u8],
+    w: usize,
+    h: usize,
+    matrix: &[u32],
+    n: usize,
+    scale: usize,
+    amount: f32,
+) {
     let strength = amount * 64.0; // bias span in 0..255 space
     let denom = (n * n) as f32;
+    let s = scale.max(1);
     for y in 0..h {
         for x in 0..w {
             let i = (y * w + x) * 4;
             if rgba[i + 3] != 255 {
                 continue;
             }
-            let m = matrix[(y % n) * n + (x % n)] as f32 / denom - 0.5;
+            let m = matrix[((y / s) % n) * n + ((x / s) % n)] as f32 / denom - 0.5;
             let bias = (m * strength) as i32;
             rgba[i] = (rgba[i] as i32 + bias).clamp(0, 255) as u8;
             rgba[i + 1] = (rgba[i + 1] as i32 + bias).clamp(0, 255) as u8;
@@ -821,7 +837,7 @@ mod tests {
         for method in [1u8, 2, 3, 4, 5, DITHER_CUSTOM] {
             // a flat mid-grey field that forces dithering between black and white
             let mut rgba: Vec<u8> = (0..64).flat_map(|_| [128, 128, 128, 255]).collect();
-            dither_pass(&mut rgba, 8, 8, method, 1.0, &custom, 4, Some(&palette));
+            dither_pass(&mut rgba, 8, 8, method, 1.0, &custom, 4, 1, Some(&palette));
             // The Palette op always runs after the Dither op in the pipeline.
             remap_to_palette(&mut rgba, &palette);
             let blacks = rgba.chunks_exact(4).filter(|p| p[0] == 0).count();
@@ -844,7 +860,7 @@ mod tests {
         // Ordered/custom dither with no palette must NOT snap — it only nudges
         // values, leaving them off-palette so a later op can quantize them.
         let mut rgba: Vec<u8> = (0..16).flat_map(|_| [128u8, 128, 128, 255]).collect();
-        dither_pass(&mut rgba, 4, 4, 2, 1.0, &[], 0, None);
+        dither_pass(&mut rgba, 4, 4, 2, 1.0, &[], 0, 1, None);
         // The flat grey is now a checker of nudged values, none forced to 0/255.
         let distinct: std::collections::HashSet<[u8; 3]> =
             rgba.chunks_exact(4).map(|p| [p[0], p[1], p[2]]).collect();
@@ -853,6 +869,27 @@ mod tests {
             rgba.chunks_exact(4).all(|p| p[0] > 0 && p[0] < 255),
             "ordered bias must not snap to palette endpoints"
         );
+    }
+
+    #[test]
+    fn ordered_dither_scale_enlarges_cells() {
+        // `scale` makes each Bayer cell span scale×scale pixels: within a cell the
+        // bias is identical, so a flat field comes out in solid blocks. This is what
+        // "zooms" the dither so 1-px noise becomes a readable crosshatch on hi-res art.
+        let flat = || -> Vec<u8> { (0..16).flat_map(|_| [128u8, 128, 128, 255]).collect() }; // 4×4
+        let at = |b: &[u8], x: usize, y: usize| b[(y * 4 + x) * 4];
+
+        let mut s1 = flat();
+        dither_pass(&mut s1, 4, 4, 2, 1.0, &[], 0, 1, None); // Bayer 4×4, scale 1
+        // Neighbouring pixels use different Bayer entries → they differ.
+        assert_ne!(at(&s1, 0, 0), at(&s1, 1, 0));
+
+        let mut s2 = flat();
+        dither_pass(&mut s2, 4, 4, 2, 1.0, &[], 0, 2, None); // scale 2 → 2×2 cells
+        assert_eq!(at(&s2, 0, 0), at(&s2, 1, 0), "same 2×2 cell → equal");
+        assert_eq!(at(&s2, 0, 0), at(&s2, 0, 1), "same 2×2 cell → equal");
+        assert_eq!(at(&s2, 0, 0), at(&s2, 1, 1), "same 2×2 cell → equal");
+        assert_ne!(at(&s2, 0, 0), at(&s2, 2, 0), "next cell differs");
     }
 
     #[test]
