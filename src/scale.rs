@@ -8,10 +8,11 @@
 //! byte buffers, comparing whole `[u8; 4]` pixels for equality, so it's self-contained
 //! (no image-crate/version coupling) and unit-testable.
 //!
-//! Implemented so far: the classic hard-edge family (Scale2x/EPX, Scale3x, Eagle 2×/3×)
-//! and **xBR 2×/3×/4×** (the edge-directed *blending* family — 2×/3× ported faithfully
-//! from libxbr-standalone's FILT2/FILT3, 4× = 2× chained twice). `Scaler` is the enum
-//! the UI + persistence key off; adding a new algorithm is one variant + one function.
+//! Implemented so far: the classic hard-edge family (Scale2x/EPX, Scale3x, Eagle 2×/3×),
+//! **xBR 2×/3×/4×** (edge-directed blending — 2×/3× ported faithfully from
+//! libxbr-standalone's FILT2/FILT3, 4× = 2× chained), and **HQ2x/3x/4x** (the
+//! lookup-table family, via the `hqx` crate — bridged through `hqx_scale`). `Scaler`
+//! is the enum the UI + persistence key off; a new algorithm is one variant + one fn.
 
 /// Which pixel-art upscaler to apply (or `None` = leave the source untouched).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -25,11 +26,14 @@ pub enum Scaler {
     Xbr2x,
     Xbr3x,
     Xbr4x,
+    Hq2x,
+    Hq3x,
+    Hq4x,
 }
 
 impl Scaler {
     /// Every scaler, in menu order. `ALL[i] as u8 == i`, so the index persists.
-    pub const ALL: [Scaler; 8] = [
+    pub const ALL: [Scaler; 11] = [
         Scaler::None,
         Scaler::Scale2x,
         Scaler::Scale3x,
@@ -38,6 +42,9 @@ impl Scaler {
         Scaler::Xbr2x,
         Scaler::Xbr3x,
         Scaler::Xbr4x,
+        Scaler::Hq2x,
+        Scaler::Hq3x,
+        Scaler::Hq4x,
     ];
 
     pub fn from_u8(b: u8) -> Scaler {
@@ -54,6 +61,9 @@ impl Scaler {
             Scaler::Xbr2x => "xBR 2×",
             Scaler::Xbr3x => "xBR 3×",
             Scaler::Xbr4x => "xBR 4×",
+            Scaler::Hq2x => "HQ2x",
+            Scaler::Hq3x => "HQ3x",
+            Scaler::Hq4x => "HQ4x",
         }
     }
 
@@ -61,9 +71,9 @@ impl Scaler {
     pub fn factor(self) -> usize {
         match self {
             Scaler::None => 1,
-            Scaler::Scale2x | Scaler::Eagle2x | Scaler::Xbr2x => 2,
-            Scaler::Scale3x | Scaler::Eagle3x | Scaler::Xbr3x => 3,
-            Scaler::Xbr4x => 4,
+            Scaler::Scale2x | Scaler::Eagle2x | Scaler::Xbr2x | Scaler::Hq2x => 2,
+            Scaler::Scale3x | Scaler::Eagle3x | Scaler::Xbr3x | Scaler::Hq3x => 3,
+            Scaler::Xbr4x | Scaler::Hq4x => 4,
         }
     }
 
@@ -83,6 +93,9 @@ impl Scaler {
             Scaler::Xbr2x => xbr2x(&src),
             Scaler::Xbr3x => xbr3x(&src),
             Scaler::Xbr4x => xbr4x(&src),
+            Scaler::Hq2x => hqx_scale(&src, 2),
+            Scaler::Hq3x => hqx_scale(&src, 3),
+            Scaler::Hq4x => hqx_scale(&src, 4),
         }
     }
 }
@@ -518,6 +531,30 @@ fn xbr4x(s: &Grid) -> (Vec<u8>, usize, usize) {
         w: w2,
         h: h2,
     })
+}
+
+/// **HQx** (HQ2x/HQ3x/HQ4x) via the `hqx` crate — the high-quality lookup-table family.
+/// Bridges our straight-RGBA bytes to/from the crate's packed `0xAARRGGBB` u32 slices.
+fn hqx_scale(s: &Grid, factor: usize) -> (Vec<u8>, usize, usize) {
+    let (ow, oh) = (s.w * factor, s.h * factor);
+    // RGBA bytes → 0xAARRGGBB u32 (exactly w*h pixels; the buffer may be longer).
+    let src: Vec<u32> = s.rgba[..s.w * s.h * 4]
+        .chunks_exact(4)
+        .map(|p| (p[3] as u32) << 24 | (p[0] as u32) << 16 | (p[1] as u32) << 8 | (p[2] as u32))
+        .collect();
+    let mut dst = vec![0u32; ow * oh];
+    let (w, h) = (s.w as u32, s.h as u32);
+    match factor {
+        2 => hqx::hq2x(&src, &mut dst, w, h),
+        3 => hqx::hq3x(&src, &mut dst, w, h),
+        _ => hqx::hq4x(&src, &mut dst, w, h),
+    }
+    // 0xAARRGGBB u32 → RGBA bytes.
+    let out = dst
+        .iter()
+        .flat_map(|&v| [(v >> 16) as u8, (v >> 8) as u8, v as u8, (v >> 24) as u8])
+        .collect();
+    (out, ow, oh)
 }
 
 #[cfg(test)]

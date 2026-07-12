@@ -2151,6 +2151,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hqx"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62e432f82a709fa7710780113a33ee71da394b237ead3f1a1ee6df7d43193880"
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3534,6 +3540,7 @@ dependencies = [
  "cc",
  "eframe",
  "egui_kittest",
+ "hqx",
  "icy_parser_core",
  "image 0.25.10",
  "lopdf",

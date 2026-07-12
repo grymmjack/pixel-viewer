@@ -41,6 +41,9 @@ serde_json = "1"
 # derive Serialize/Deserialize for persisted structs (e.g. FxPreset). serde +
 # serde_derive are already in the tree via eframe/serde_json; this just exposes it.
 serde = { version = "1", features = ["derive"] }
+# HQx pixel-art upscalers (HQ2x/3x/4x). Operates on raw &[u32] ARGB — no image-crate
+# coupling — so it plugs straight into the scale module's RGBA buffers.
+hqx = "0.1"
 # Native open-folder / open-file dialogs on Linux, macOS, Windows.
 rfd = "0.15"
 trash = "5.2.6"
