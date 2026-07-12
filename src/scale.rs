@@ -9,9 +9,9 @@
 //! (no image-crate/version coupling) and unit-testable.
 //!
 //! Implemented so far: the classic hard-edge family (Scale2x/EPX, Scale3x, Eagle 2×/3×)
-//! and **xBR 2×** (the edge-directed *blending* family — ported faithfully from
-//! libxbr-standalone's FILT2). `Scaler` is the enum the UI + persistence key off;
-//! adding a new algorithm is one variant + one function.
+//! and **xBR 2×/3×/4×** (the edge-directed *blending* family — 2×/3× ported faithfully
+//! from libxbr-standalone's FILT2/FILT3, 4× = 2× chained twice). `Scaler` is the enum
+//! the UI + persistence key off; adding a new algorithm is one variant + one function.
 
 /// Which pixel-art upscaler to apply (or `None` = leave the source untouched).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -23,17 +23,21 @@ pub enum Scaler {
     Eagle2x,
     Eagle3x,
     Xbr2x,
+    Xbr3x,
+    Xbr4x,
 }
 
 impl Scaler {
     /// Every scaler, in menu order. `ALL[i] as u8 == i`, so the index persists.
-    pub const ALL: [Scaler; 6] = [
+    pub const ALL: [Scaler; 8] = [
         Scaler::None,
         Scaler::Scale2x,
         Scaler::Scale3x,
         Scaler::Eagle2x,
         Scaler::Eagle3x,
         Scaler::Xbr2x,
+        Scaler::Xbr3x,
+        Scaler::Xbr4x,
     ];
 
     pub fn from_u8(b: u8) -> Scaler {
@@ -48,6 +52,8 @@ impl Scaler {
             Scaler::Eagle2x => "Eagle 2×",
             Scaler::Eagle3x => "Eagle 3×",
             Scaler::Xbr2x => "xBR 2×",
+            Scaler::Xbr3x => "xBR 3×",
+            Scaler::Xbr4x => "xBR 4×",
         }
     }
 
@@ -56,7 +62,8 @@ impl Scaler {
         match self {
             Scaler::None => 1,
             Scaler::Scale2x | Scaler::Eagle2x | Scaler::Xbr2x => 2,
-            Scaler::Scale3x | Scaler::Eagle3x => 3,
+            Scaler::Scale3x | Scaler::Eagle3x | Scaler::Xbr3x => 3,
+            Scaler::Xbr4x => 4,
         }
     }
 
@@ -74,6 +81,8 @@ impl Scaler {
             Scaler::Eagle2x => eagle2x(&src),
             Scaler::Eagle3x => eagle3x(&src),
             Scaler::Xbr2x => xbr2x(&src),
+            Scaler::Xbr3x => xbr3x(&src),
+            Scaler::Xbr4x => xbr4x(&src),
         }
     }
 }
@@ -387,6 +396,21 @@ fn xbr_filt2(nb: &Nb, out: &mut [[u8; 4]; 4], n: [usize; 4]) {
     }
 }
 
+/// Read the 21-pixel xBR neighbourhood centred on `(x, y)` (edge-clamped).
+#[rustfmt::skip]
+fn read_nb(s: &Grid, x: isize, y: isize) -> Nb {
+    Nb {
+        pa: s.at(x-1, y-1), pb: s.at(x, y-1), pc: s.at(x+1, y-1),
+        pd: s.at(x-1, y),   pe: s.at(x, y),   pf: s.at(x+1, y),
+        pg: s.at(x-1, y+1), ph: s.at(x, y+1), pi: s.at(x+1, y+1),
+        a1: s.at(x-1, y-2), b1: s.at(x, y-2), c1: s.at(x+1, y-2),
+        a0: s.at(x-2, y-1), c4: s.at(x+2, y-1),
+        d0: s.at(x-2, y),   f4: s.at(x+2, y),
+        g0: s.at(x-2, y+1), i4: s.at(x+2, y+1),
+        g5: s.at(x-1, y+2), h5: s.at(x, y+2), i5: s.at(x+1, y+2),
+    }
+}
+
 fn xbr2x(s: &Grid) -> (Vec<u8>, usize, usize) {
     let (ow, oh) = (s.w * 2, s.h * 2);
     let mut out = vec![0u8; ow * oh * 4];
@@ -395,48 +419,105 @@ fn xbr2x(s: &Grid) -> (Vec<u8>, usize, usize) {
     const MAPS: [[usize; 4]; 4] = [[0, 1, 2, 3], [2, 0, 3, 1], [3, 2, 1, 0], [1, 3, 0, 2]];
     for y in 0..s.h as isize {
         for x in 0..s.w as isize {
-            let nb = Nb {
-                pa: s.at(x - 1, y - 1),
-                pb: s.at(x, y - 1),
-                pc: s.at(x + 1, y - 1),
-                pd: s.at(x - 1, y),
-                pe: s.at(x, y),
-                pf: s.at(x + 1, y),
-                pg: s.at(x - 1, y + 1),
-                ph: s.at(x, y + 1),
-                pi: s.at(x + 1, y + 1),
-                a1: s.at(x - 1, y - 2),
-                b1: s.at(x, y - 2),
-                c1: s.at(x + 1, y - 2),
-                a0: s.at(x - 2, y - 1),
-                c4: s.at(x + 2, y - 1),
-                d0: s.at(x - 2, y),
-                f4: s.at(x + 2, y),
-                g0: s.at(x - 2, y + 1),
-                i4: s.at(x + 2, y + 1),
-                g5: s.at(x - 1, y + 2),
-                h5: s.at(x, y + 2),
-                i5: s.at(x + 1, y + 2),
-            };
-            let e = s.at(x, y);
-            let mut cell = [e; 4]; // TL, TR, BL, BR
-            let mut cur = nb;
+            let mut cell = [s.at(x, y); 4]; // TL, TR, BL, BR
+            let mut cur = read_nb(s, x, y);
             for m in MAPS {
                 xbr_filt2(&cur, &mut cell, m);
                 cur = cur.rot_cw();
             }
-            // cell order TL,TR,BL,BR → 2×2 block.
-            put_cell(
-                &mut out,
-                ow,
-                x as usize,
-                y as usize,
-                2,
-                &[cell[0], cell[1], cell[2], cell[3]],
-            );
+            put_cell(&mut out, ow, x as usize, y as usize, 2, &cell);
         }
     }
     (out, ow, oh)
+}
+
+/// One xBR-3× filter pass, blending into the 3×3 output block `out` (row-major 0..8,
+/// 8 = bottom-right = the "main" corner) via the rotated index map `n`. Verbatim FILT3.
+#[allow(clippy::nonminimal_bool)]
+fn xbr_filt3(nb: &Nb, out: &mut [[u8; 4]; 9], n: [usize; 9]) {
+    let (pe, pf, ph) = (nb.pe, nb.pf, nb.ph);
+    if pe == ph || pe == pf {
+        return;
+    }
+    let (pb, pc, pd, pg, pi) = (nb.pb, nb.pc, nb.pd, nb.pg, nb.pi);
+    let (f4, h5, i4, i5) = (nb.f4, nb.h5, nb.i4, nb.i5);
+    let e = df(pe, pc) + df(pe, pg) + df(pi, h5) + df(pi, f4) + (df(ph, pf) << 2);
+    let i = df(ph, pd) + df(ph, i5) + df(pf, i4) + df(pf, pb) + (df(pe, pi) << 2);
+    if e > i {
+        return;
+    }
+    let px = if df(pe, pf) <= df(pe, ph) { pf } else { ph };
+    let strong = e < i
+        && ((!eq(pf, pb) && !eq(pf, pc))
+            || (!eq(ph, pd) && !eq(ph, pg))
+            || (eq(pe, pi) && ((!eq(pf, f4) && !eq(pf, i4)) || (!eq(ph, h5) && !eq(ph, i5))))
+            || eq(pe, pg)
+            || eq(pe, pc));
+    let (n2, n5, n6, n7, n8) = (n[2], n[5], n[6], n[7], n[8]);
+    if strong {
+        let ke = df(pf, pg);
+        let ki = df(ph, pc);
+        let left = ke * 2 <= ki && pe != pg && pd != pg;
+        let up = ke >= ki * 2 && pe != pc && pb != pc;
+        if left && up {
+            out[n7] = blend(out[n7], px, 192);
+            out[n6] = blend(out[n6], px, 64);
+            out[n5] = out[n7];
+            out[n2] = out[n6];
+            out[n8] = px;
+        } else if left {
+            out[n7] = blend(out[n7], px, 192);
+            out[n5] = blend(out[n5], px, 64);
+            out[n6] = blend(out[n6], px, 64);
+            out[n8] = px;
+        } else if up {
+            out[n5] = blend(out[n5], px, 192);
+            out[n7] = blend(out[n7], px, 64);
+            out[n2] = blend(out[n2], px, 64);
+            out[n8] = px;
+        } else {
+            out[n8] = blend(out[n8], px, 224);
+            out[n5] = blend(out[n5], px, 32);
+            out[n7] = blend(out[n7], px, 32);
+        }
+    } else {
+        out[n8] = blend(out[n8], px, 128);
+    }
+}
+
+fn xbr3x(s: &Grid) -> (Vec<u8>, usize, usize) {
+    let (ow, oh) = (s.w * 3, s.h * 3);
+    let mut out = vec![0u8; ow * oh * 4];
+    // 3×3 output-index maps per 90° rotation (row-major 0..8); main corner 8 → 2 → 0 → 6.
+    const MAPS: [[usize; 9]; 4] = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8],
+        [6, 3, 0, 7, 4, 1, 8, 5, 2],
+        [8, 7, 6, 5, 4, 3, 2, 1, 0],
+        [2, 5, 8, 1, 4, 7, 0, 3, 6],
+    ];
+    for y in 0..s.h as isize {
+        for x in 0..s.w as isize {
+            let mut cell = [s.at(x, y); 9];
+            let mut cur = read_nb(s, x, y);
+            for m in MAPS {
+                xbr_filt3(&cur, &mut cell, m);
+                cur = cur.rot_cw();
+            }
+            put_cell(&mut out, ow, x as usize, y as usize, 3, &cell);
+        }
+    }
+    (out, ow, oh)
+}
+
+/// xBR 4× — chain xBR 2× twice (a genuinely smooth 4×; libxbr's native FILT4 isn't
+/// transcribed here). Each pass re-detects edges on the already-doubled image.
+fn xbr4x(s: &Grid) -> (Vec<u8>, usize, usize) {
+    let (two, w2, h2) = xbr2x(s);
+    xbr2x(&Grid {
+        rgba: &two,
+        w: w2,
+        h: h2,
+    })
 }
 
 #[cfg(test)]
@@ -453,18 +534,24 @@ mod tests {
 
     #[test]
     fn factor_and_output_size() {
-        let src = buf(&[0, 255, 255, 0], 2); // 2×2
-        for (sc, f) in [
-            (Scaler::Scale2x, 2),
-            (Scaler::Scale3x, 3),
-            (Scaler::Eagle2x, 2),
-            (Scaler::Eagle3x, 3),
-        ] {
-            let (out, ow, oh) = sc.apply(&src, 2, 2);
-            assert_eq!((ow, oh), (2 * f, 2 * f));
-            assert_eq!(out.len(), ow * oh * 4);
+        // Every non-None scaler enlarges a 4×4 by its factor and keeps a flat field flat.
+        let flat = buf(&[128; 16], 4);
+        for sc in Scaler::ALL {
+            if sc == Scaler::None {
+                continue;
+            }
+            let f = sc.factor();
+            let (out, ow, oh) = sc.apply(&flat, 4, 4);
+            assert_eq!((ow, oh), (4 * f, 4 * f), "{:?} size", sc);
+            assert_eq!(out.len(), ow * oh * 4, "{:?} buffer len", sc);
+            assert!(
+                out.chunks_exact(4).all(|p| p[0] == 128),
+                "{:?} keeps a flat field flat",
+                sc
+            );
         }
         // None is a passthrough.
+        let src = buf(&[0, 255, 255, 0], 2);
         let (out, ow, oh) = Scaler::None.apply(&src, 2, 2);
         assert_eq!((ow, oh, out), (2, 2, src));
     }
