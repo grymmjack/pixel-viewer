@@ -8,9 +8,10 @@
 //! byte buffers, comparing whole `[u8; 4]` pixels for equality, so it's self-contained
 //! (no image-crate/version coupling) and unit-testable.
 //!
-//! Implemented so far: the classic hard-edge family (Scale2x/EPX, Scale3x, Eagle 2×/3×).
-//! `Scaler` is the reorderable-free enum the UI + persistence key off; adding a new
-//! algorithm is one variant + one function.
+//! Implemented so far: the classic hard-edge family (Scale2x/EPX, Scale3x, Eagle 2×/3×)
+//! and **xBR 2×** (the edge-directed *blending* family — ported faithfully from
+//! libxbr-standalone's FILT2). `Scaler` is the enum the UI + persistence key off;
+//! adding a new algorithm is one variant + one function.
 
 /// Which pixel-art upscaler to apply (or `None` = leave the source untouched).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -21,16 +22,18 @@ pub enum Scaler {
     Scale3x,
     Eagle2x,
     Eagle3x,
+    Xbr2x,
 }
 
 impl Scaler {
     /// Every scaler, in menu order. `ALL[i] as u8 == i`, so the index persists.
-    pub const ALL: [Scaler; 5] = [
+    pub const ALL: [Scaler; 6] = [
         Scaler::None,
         Scaler::Scale2x,
         Scaler::Scale3x,
         Scaler::Eagle2x,
         Scaler::Eagle3x,
+        Scaler::Xbr2x,
     ];
 
     pub fn from_u8(b: u8) -> Scaler {
@@ -44,6 +47,7 @@ impl Scaler {
             Scaler::Scale3x => "Scale3x",
             Scaler::Eagle2x => "Eagle 2×",
             Scaler::Eagle3x => "Eagle 3×",
+            Scaler::Xbr2x => "xBR 2×",
         }
     }
 
@@ -51,7 +55,7 @@ impl Scaler {
     pub fn factor(self) -> usize {
         match self {
             Scaler::None => 1,
-            Scaler::Scale2x | Scaler::Eagle2x => 2,
+            Scaler::Scale2x | Scaler::Eagle2x | Scaler::Xbr2x => 2,
             Scaler::Scale3x | Scaler::Eagle3x => 3,
         }
     }
@@ -69,6 +73,7 @@ impl Scaler {
             Scaler::Scale3x => scale3x(&src),
             Scaler::Eagle2x => eagle2x(&src),
             Scaler::Eagle3x => eagle3x(&src),
+            Scaler::Xbr2x => xbr2x(&src),
         }
     }
 }
@@ -250,8 +255,185 @@ fn eagle3x(s: &Grid) -> (Vec<u8>, usize, usize) {
             let tr = if b == c && c == f { c } else { e };
             let bl = if d == g && g == hh { g } else { e };
             let br = if f == hh && hh == i { i } else { e };
-            let cell = [tl, b, tr, d, e, f, bl, hh, br];
+            // Only the four corners get the Eagle treatment; the cross (edges + centre)
+            // stays the source pixel — filling the edges with neighbours fringed colour.
+            let cell = [tl, e, tr, e, e, e, bl, e, br];
             put_cell(&mut out, ow, x as usize, y as usize, 3, &cell);
+        }
+    }
+    (out, ow, oh)
+}
+
+// ---------------------------------------------------------------------------------
+// xBR (Hyllian) — an edge-directed *blending* scaler (the smooth family). Ported
+// faithfully from libxbr-standalone's FILT2 macro (Treeki/Hyllian). Unlike the hard
+// scalers above it produces intermediate colours, so it needs YUV-distance edge
+// detection + weighted blends. The 4 output sub-pixels are handled by rotating the
+// neighbourhood 90° four times and applying the SAME filter — the rotation is derived
+// from the 5×5 grid geometry (below), so there's no hand-transcribed permutation.
+// ---------------------------------------------------------------------------------
+
+/// BT.601 Y/U/V (0..255-ish) for a pixel — the space xBR measures colour distance in.
+#[inline]
+fn yuv(p: [u8; 4]) -> (i32, i32, i32) {
+    let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
+    let y = (299 * r + 587 * g + 114 * b) / 1000;
+    let u = (-169 * r - 331 * g + 500 * b) / 1000 + 128;
+    let v = (500 * r - 419 * g - 81 * b) / 1000 + 128;
+    (y, u, v)
+}
+
+/// xBR pixel difference: |Δα| + |ΔY| + |ΔU| + |ΔV| (the libxbr `pixel_diff`).
+#[inline]
+fn df(a: [u8; 4], b: [u8; 4]) -> u32 {
+    let (ay, au, av) = yuv(a);
+    let (by, bu, bv) = yuv(b);
+    ((a[3] as i32 - b[3] as i32).abs() + (ay - by).abs() + (au - bu).abs() + (av - bv).abs()) as u32
+}
+
+/// "Equal enough" — the libxbr threshold (`df < 155`).
+#[inline]
+fn eq(a: [u8; 4], b: [u8; 4]) -> bool {
+    df(a, b) < 155
+}
+
+/// Blend `a` toward `b` by `n`/256 per channel (the `ALPHA_BLEND_n_W` weights: 128 =
+/// 50%, 192 = ¾, 224 = ⅞, 64 = ¼).
+#[inline]
+fn blend(a: [u8; 4], b: [u8; 4], n: i32) -> [u8; 4] {
+    std::array::from_fn(|k| {
+        let (av, bv) = (a[k] as i32, b[k] as i32);
+        (av + (bv - av) * n / 256).clamp(0, 255) as u8
+    })
+}
+
+/// The xBR neighbourhood — the inner 3×3 (pa..pi, pe = centre) plus the 12 outer
+/// pixels, on the 5×5-minus-corners grid:
+/// ```text
+///        a1 b1 c1
+///     a0 pa pb pc c4
+///     d0 pd pe pf f4
+///     g0 pg ph pi i4
+///        g5 h5 i5
+/// ```
+#[derive(Clone, Copy)]
+#[rustfmt::skip]
+struct Nb {
+    pa: [u8;4], pb: [u8;4], pc: [u8;4],
+    pd: [u8;4], pe: [u8;4], pf: [u8;4],
+    pg: [u8;4], ph: [u8;4], pi: [u8;4],
+    a0: [u8;4], a1: [u8;4], b1: [u8;4], c1: [u8;4], c4: [u8;4],
+    d0: [u8;4], f4: [u8;4], g0: [u8;4], g5: [u8;4], h5: [u8;4], i4: [u8;4], i5: [u8;4],
+}
+
+impl Nb {
+    /// Rotate the whole neighbourhood 90° clockwise (new(r,c) = old(4−c, r)). Applying
+    /// the filter to each of the 4 rotations covers the 4 output quadrants.
+    #[rustfmt::skip]
+    fn rot_cw(&self) -> Nb {
+        Nb {
+            pa: self.pg, pb: self.pd, pc: self.pa,
+            pd: self.ph, pe: self.pe, pf: self.pb,
+            pg: self.pi, ph: self.pf, pi: self.pc,
+            a1: self.g0, b1: self.d0, c1: self.a0, a0: self.g5, c4: self.a1,
+            d0: self.h5, f4: self.b1, g0: self.i5, i4: self.c1, g5: self.i4, h5: self.f4, i5: self.c4,
+        }
+    }
+}
+
+/// One xBR-2× filter pass for the current orientation, blending into the 2×2 output
+/// block `out` (indices 0=TL 1=TR 2=BL 3=BR) via `n` = the rotated (n0,n1,n2,n3). Only
+/// the "main" corner `n3` (+ n1/n2 on a strong edge) are touched. Verbatim FILT2.
+#[allow(clippy::nonminimal_bool)]
+fn xbr_filt2(nb: &Nb, out: &mut [[u8; 4]; 4], n: [usize; 4]) {
+    let (pe, pf, ph) = (nb.pe, nb.pf, nb.ph);
+    if pe == ph || pe == pf {
+        return;
+    }
+    let (pb, pc, pd, pg, pi) = (nb.pb, nb.pc, nb.pd, nb.pg, nb.pi);
+    let (f4, h5, i4, i5) = (nb.f4, nb.h5, nb.i4, nb.i5);
+    let e = df(pe, pc) + df(pe, pg) + df(pi, h5) + df(pi, f4) + (df(ph, pf) << 2);
+    let i = df(ph, pd) + df(ph, i5) + df(pf, i4) + df(pf, pb) + (df(pe, pi) << 2);
+    if e > i {
+        return;
+    }
+    let px = if df(pe, pf) <= df(pe, ph) { pf } else { ph };
+    let (n1, n2, n3) = (n[1], n[2], n[3]);
+    let strong = e < i
+        && ((!eq(pf, pb) && !eq(ph, pd))
+            || (eq(pe, pi) && !eq(pf, i4) && !eq(ph, i5))
+            || eq(pe, pg)
+            || eq(pe, pc));
+    if strong {
+        let ke = df(pf, pg);
+        let ki = df(ph, pc);
+        let left = ke * 2 <= ki && pe != pg && pd != pg;
+        let up = ke >= ki * 2 && pe != pc && pb != pc;
+        if left && up {
+            out[n3] = blend(out[n3], px, 224);
+            out[n2] = blend(out[n2], px, 64);
+            out[n1] = out[n2];
+        } else if left {
+            out[n3] = blend(out[n3], px, 192);
+            out[n2] = blend(out[n2], px, 64);
+        } else if up {
+            out[n3] = blend(out[n3], px, 192);
+            out[n1] = blend(out[n1], px, 64);
+        } else {
+            out[n3] = blend(out[n3], px, 128);
+        }
+    } else {
+        out[n3] = blend(out[n3], px, 128);
+    }
+}
+
+fn xbr2x(s: &Grid) -> (Vec<u8>, usize, usize) {
+    let (ow, oh) = (s.w * 2, s.h * 2);
+    let mut out = vec![0u8; ow * oh * 4];
+    // Output-index maps per 90° rotation (0=TL 1=TR 2=BL 3=BR); the "main" corner n3
+    // rotates BR→TR→TL→BL, matching the libxbr call order.
+    const MAPS: [[usize; 4]; 4] = [[0, 1, 2, 3], [2, 0, 3, 1], [3, 2, 1, 0], [1, 3, 0, 2]];
+    for y in 0..s.h as isize {
+        for x in 0..s.w as isize {
+            let nb = Nb {
+                pa: s.at(x - 1, y - 1),
+                pb: s.at(x, y - 1),
+                pc: s.at(x + 1, y - 1),
+                pd: s.at(x - 1, y),
+                pe: s.at(x, y),
+                pf: s.at(x + 1, y),
+                pg: s.at(x - 1, y + 1),
+                ph: s.at(x, y + 1),
+                pi: s.at(x + 1, y + 1),
+                a1: s.at(x - 1, y - 2),
+                b1: s.at(x, y - 2),
+                c1: s.at(x + 1, y - 2),
+                a0: s.at(x - 2, y - 1),
+                c4: s.at(x + 2, y - 1),
+                d0: s.at(x - 2, y),
+                f4: s.at(x + 2, y),
+                g0: s.at(x - 2, y + 1),
+                i4: s.at(x + 2, y + 1),
+                g5: s.at(x - 1, y + 2),
+                h5: s.at(x, y + 2),
+                i5: s.at(x + 1, y + 2),
+            };
+            let e = s.at(x, y);
+            let mut cell = [e; 4]; // TL, TR, BL, BR
+            let mut cur = nb;
+            for m in MAPS {
+                xbr_filt2(&cur, &mut cell, m);
+                cur = cur.rot_cw();
+            }
+            // cell order TL,TR,BL,BR → 2×2 block.
+            put_cell(
+                &mut out,
+                ow,
+                x as usize,
+                y as usize,
+                2,
+                &[cell[0], cell[1], cell[2], cell[3]],
+            );
         }
     }
     (out, ow, oh)
@@ -299,6 +481,49 @@ mod tests {
         // Centre pixel (1,1) expands to out (2,2)..(3,3): its top-left corner rounds to
         // white because up(=255)==left(=255) and up!=down / left!=right.
         assert_eq!(px(&out, ow, 2, 2), 255, "top-left corner rounded to white");
+    }
+
+    #[test]
+    fn eagle3x_cross_stays_center() {
+        // Distinct centre + neighbours → the 3×3 block's cross (edges + centre) must all
+        // be the centre; only corners may differ. Regression for the cross leaking
+        // neighbour colours (the edge-fringe bug).
+        let src = buf(&[1, 2, 3, 4, 5, 6, 7, 8, 9], 3); // all distinct grays
+        let (out, ow, _) = Scaler::Eagle3x.apply(&src, 3, 3);
+        let at = |x: usize, y: usize| out[(y * ow + x) * 4];
+        // Source centre (1,1)=5 → output block rows 3..6, cols 3..6.
+        assert_eq!(at(4, 3), 5, "top-middle = centre");
+        assert_eq!(at(3, 4), 5, "middle-left = centre");
+        assert_eq!(at(4, 4), 5, "centre = centre");
+        assert_eq!(at(5, 4), 5, "middle-right = centre");
+        assert_eq!(at(4, 5), 5, "bottom-middle = centre");
+    }
+
+    #[test]
+    fn xbr2x_size_flat_and_blends() {
+        // Correct 2× size, and a flat field must stay perfectly flat (the filter early-
+        // outs when the centre equals its neighbours — no phantom edges).
+        let (out, ow, oh) = Scaler::Xbr2x.apply(&buf(&[128; 9], 3), 3, 3);
+        assert_eq!((ow, oh), (6, 6));
+        assert!(out.chunks_exact(4).all(|p| p[0] == 128), "flat stays flat");
+        // A hard diagonal edge should yield at least one *blended* (intermediate) pixel,
+        // which is what makes xBR smooth rather than blocky.
+        //   W W W . .
+        //   W W . . .
+        //   W . . . .   (5×5 upper-left white triangle, centre is on the edge)
+        let mut v = vec![0u8; 25];
+        for y in 0..5 {
+            for x in 0..5 {
+                if x + y < 3 {
+                    v[y * 5 + x] = 255;
+                }
+            }
+        }
+        let (out, _, _) = Scaler::Xbr2x.apply(&buf(&v, 5), 5, 5);
+        assert!(
+            out.chunks_exact(4).any(|p| p[0] > 0 && p[0] < 255),
+            "xBR produced a blended edge pixel"
+        );
     }
 
     #[test]

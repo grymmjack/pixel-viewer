@@ -10975,7 +10975,9 @@ impl PixelView {
         }
         let (size, rgba) = match &self.full_src {
             Some((p, sz, px)) if p == path => (*sz, px.clone()),
-            _ => match self.registry.decode_path(path) {
+            // Decode the *real* file — a downloaded 16colo piece / archive entry lives at
+            // a cache path keyed by the virtual `path` (same split as load_full).
+            _ => match self.registry.decode_path(&self.resolve_local(path)) {
                 Ok(img) => ([img.width as usize, img.height as usize], img.rgba_bytes()),
                 Err(e) => {
                     self.status = format!("decode failed: {e}");
