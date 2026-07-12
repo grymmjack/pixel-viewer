@@ -67,7 +67,10 @@ src/
                      `stats`/`clear`. Used by sixteen.rs (get_json/download) + colo_thumb.
   thumb.rs           worker pool: thumbnails + image metadata (dims, color count)
   colo_thumb.rs      RemoteThumbs: HTTP worker pool fetching 16colo.rs `tn` PNGs
-                     (mirrors ThumbBuilder; results uploaded to thumb_tex by path)
+                     (mirrors ThumbBuilder; results uploaded to thumb_tex + thumb_rgba
+                     by path, so 16colo tiles recolor). Holds an Arc<Registry>: a PDF
+                     piece (no server render) fetches its RAW file + renders page 1
+                     locally (pdftoppm) instead of the missing `tn` PNG.
                      Busy feedback: `net_busy()` (any *_rx in flight + colo_sauce_pending)
                      drives a status-bar `egui::Spinner`; grid/table tiles paint a
                      `paint_spinner` arc while a thumbnail loads; the empty grid/table
@@ -164,7 +167,7 @@ cargo build --release
 cargo check              # fast type-check during edits
 cargo clippy             # lint
 cargo fmt                # format
-cargo test               # 198 tests (188 unit + 10 headless egui_kittest GUI tests; +11 ignored network/real-trash)
+cargo test               # 213 tests (203 unit + 10 headless egui_kittest GUI tests; +11 ignored network/real-trash)
 cargo test gui_tests     # just the egui_kittest UI tests; cargo test <name> for one
 ```
 
@@ -407,24 +410,36 @@ pack-view `raw_url` `enc()`s the built filename) so `#`→`%23` etc. survive
 The Recolor pane (`ui_recolor`) applies per-image **adjustments** then a **palette
 rematch**, and the *order* of all of it is user-controlled.
 
-- **`Adjust`** holds 12 value ops (brightness, contrast, gamma, shadows, highlights,
+- **`Adjust`** holds 12 value fields (brightness, contrast, gamma, shadows, highlights,
   posterize, hue, saturation, **vibrance**, pixelate, sharpen, **invert**) plus `order:
-  [OpKind; 15]` — a permutation of `OpKind::ALL`. Three of those 15 are **marker ops**
-  (no slider value), each marking *where* a step happens and configured in its own
-  section: `OpKind::Palette` (the recolor/remap), `OpKind::Dither` (the dither
-  pattern), and `OpKind::ColorBalance` (per-channel R/G/B offset). New ops are
-  **appended** to `OpKind::ALL` so persisted order indices stay valid. `OpKind::is_marker`
-  is the slider-vs-marker test the row UI keys off.
+  [OpKind; 19]` — a permutation of `OpKind::ALL`. **8 of those 19 are marker ops** (no
+  slider value), each marking *where* a step happens and configured in its own section:
+  `Pixelate` (mosaic W×H), `Palette` (recolor/remap), `ColorBalance` (per-channel R/G/B
+  offset), `Dither` (the dither pattern), and the CRT post-FX `Scanlines` / `Glow` /
+  `Vignette` / `Phosphor`. New ops are **appended** to `OpKind::ALL` so persisted order
+  indices stay valid. `OpKind::is_marker` is the slider-vs-marker test the row UI keys
+  off. (Pixelate's *value* still lives in `Adjust.pixelate` (width); its height/lock are
+  separate `PixelView` fields — see below.)
 - **`apply_pipeline(rgba, w, h, &adjust, &PipeAux)`** is the one true pipeline: it
   walks `adjust.order` and runs each value op (point ops via 256-LUT, color ops via
-  HSL, pixelate/sharpen spatial); at each *marker* op it does that step inline —
-  `Palette` snaps via `thumb::remap_to_palette(aux.palette)`, `Dither` runs
-  `thumb::dither_pass`, `ColorBalance` runs `color_balance(aux.balance)`. `PipeAux`
-  carries the marker inputs (dither method/amount/custom matrix, the balance offset,
-  the snap palette). All 5 recolor paths build it via `self.pipe_aux(palette)`: viewer
-  preview (`make_preview`), full-res (`make_full_reduced`), grid tiles
+  HSL, sharpen spatial); at each *marker* op it does that step inline — `Pixelate` via
+  `pixelate_blocks(rgba, w, h, bw, bh)` (`bw = adjust.pixelate`, `bh = aux.pixelate_h`
+  or square), `Palette` snaps via `thumb::remap_to_palette(aux.palette)`, `Dither` runs
+  `thumb::dither_pass`, `ColorBalance` runs `color_balance(aux.balance)`, and the post-FX
+  run `apply_scanlines`/`apply_glow`/`apply_vignette`/`apply_phosphor(&aux.fx)`. `PipeAux`
+  carries the marker inputs (dither method/amount/custom matrix + **per-axis cell**
+  `dither_scale_x/y`, `pixelate_h`, the balance offset, the `PostFx` value `fx`, the snap
+  palette). All 5 recolor paths build it via `self.pipe_aux(palette, dscale_x, dscale_y)`:
+  viewer preview (`make_preview`), full-res (`make_full_reduced`), grid tiles
   (`grid_recolored_tex`), swatch-flash (`make_flash_tex`, dither forced off), and
   `save_recolored`. `adjust_pixels` is a **test-only** wrapper (neutral aux).
+- **`apply_pipeline_resized(rgba, w, h, tw, th, &adjust, &aux)`** wraps the pipeline for
+  the **Resize/resample** feature: when `tw<w`/`th<h` it box-downscales to `tw×th`, runs
+  the WHOLE pipeline there, then **nearest-upscales back** to `w×h` — so the output keeps
+  native size (unchanged zoom/screen size) but shows the low-res degradation and dither
+  runs at the reduced resolution. Factor-based (`resize_on`/`resize_fx`/`resize_fy`/
+  `resize_lock`, all `PixelView` fields); `resize_target(w,h)` computes `(tw,th)`. Every
+  recolor path calls this instead of `apply_pipeline` directly.
 - **Dither is decoupled from the snap.** Ordered/Bayer + the editable **Custom** matrix
   (`dither_custom`/`dither_custom_n`, seeded by `thumb::bayer_values`) are a *pure bias*
   applied at the `Dither` slot via `thumb::ordered_bias` — the later `Palette` op does
@@ -432,6 +447,24 @@ rematch**, and the *order* of all of it is user-controlled.
   no palette). Error-diffusion (Floyd–Steinberg/Atkinson) *can't* be moved off the
   snap, so it quantizes toward `aux.palette` at the Dither slot and no-ops if none.
   `thumb::dither_pass` dispatches both; `DITHER_NAMES`/`DITHER_CUSTOM` index the methods.
+  The ordered methods take a **per-axis cell size** `scale_x`/`scale_y` (each Bayer cell
+  spans `scale_x`×`scale_y` px) so the crosshatch reads on hi-res art; stored as
+  `dither_scale_x`/`dither_scale_y` (+`dither_scale_lock`) `PixelView` fields, UI = Cell
+  W/H sliders + Lock. **Auto** (`detect_dither_scale` → `thumb::detect_pixel_scale`)
+  detects the art's integer upscale factor per axis (edge positions cluster onto a
+  period-S grid) and matches the cell to it, else scales to the resolution. `eff_dither_scale`
+  shrinks the authored scale by `buf/native` on a small preview so it predicts the full view.
+- **Pixelate is a marker op** with per-axis Width×Height: width = `Adjust.pixelate`,
+  height = `pixelate_h` (a `PixelView` field, threaded via `PipeAux`), `pixelate_lock`
+  keeps it square. `apply_pipeline` reads both (height <2 ⇒ square fallback). A width-off/
+  height-on vertical mosaic still renders because `pipeline_active` also checks `pixelate_h`.
+- **CRT post-FX (`PostFx` value, threaded as `aux.fx`)** — four marker ops baked into the
+  buffer (so they save + apply everywhere): `Scanlines` (amount/spacing/direction
+  H `==`/V `||`/diag `\\` `//`/color), `Glow` (luminance-weighted bloom via a twice-run
+  `box_blur_rgb`), `Vignette` (smoothstep edge darkening), `Phosphor` (RGB aperture-grille
+  mask). `PostFx` persists as one record (`POSTFX_KEY`, `to_record`/`from_record`);
+  `PostFx::active()`/`key()` gate the pipeline + cache. Config in the "Post FX" section;
+  reorder each via its marker row in the Adjustments list.
 - **Color balance** = `out = in + (color − 128)·2·strength` per channel (the picked
   R/G/B/hex color read as a ±offset around neutral grey), clamped. `balance_offset()`
   resolves it to `[i16; 3]` and feeds `pipe_aux`; `parse_hex` powers the hex paste field.
@@ -439,14 +472,17 @@ rematch**, and the *order* of all of it is user-controlled.
   vivid ones are protected, neutrals (s=0) stay neutral. **Invert** blends toward the
   negative (0 = original, 1 = full, in between = partial/solarize).
 - **`pipeline_active()` / `pipeline_key()`** are the canonical "is anything on?" and
-  cache-key helpers — they fold in dither (method/amount + custom matrix when selected)
-  and the balance offset on top of `adjust.key()`, so changing *any* stage invalidates
-  the preview/full/grid caches. Use them, not bare `adjust.is_identity()`/`adjust.key()`.
-- **Persistence:** values in `ADJUST_KEY` (`[f32; 12]`; legacy `[f32; 11]` still loads
-  via `from_array11`), order in `ADJUST_ORDER_KEY` (`[u8; 15]`; legacy `[u8; 12]` still
-  loads). `Adjust::key()` includes the order so reordering invalidates the caches.
-  `with_order(&[u8])` tolerates corrupt/short/legacy orders (appends missing ops).
-  Dither/balance persist separately (`DITHER_CUSTOM*`, `BALANCE_*` keys).
+  cache-key helpers — they fold in dither (method/amount + custom matrix + per-axis cell),
+  the balance offset, **resize**, **`postfx.key()`**, and **`pixelate_h`** on top of
+  `adjust.key()`, so changing *any* stage invalidates the preview/full/grid caches. Use
+  them, not bare `adjust.is_identity()`/`adjust.key()`.
+- **Persistence:** values in `ADJUST_KEY` (`[f32; 12]`; legacy `[f32; 11]` via
+  `from_array11`), order in `ADJUST_ORDER_KEY` (`[u8; 19]`; legacy `[u8; 15]`/`[u8; 12]`
+  still load — `with_order` appends the missing ops so an old config gains the new ones at
+  the end of its stack). `Adjust::key()` includes the order so reordering invalidates the
+  caches. `with_order(&[u8])` tolerates corrupt/short/legacy orders. Dither/balance/scale/
+  pixelate/resize/post-FX persist separately (`DITHER_CUSTOM*`, `DITHER_SCALE*`,
+  `BALANCE_*`, `PIXELATE_*`, `RESIZE_*`, `POSTFX_KEY` keys).
 - **UI rows** are reorderable two ways: a painted **drag-handle grip** (`drag_handle`,
   drag → `adjust_drag`, drop reorders) and **⬆/⬇** buttons. Layout per row:
   `grip [label] [==slider==] [value]  ⟲ ⬆ ⬇`, with the `⟲ ⬆ ⬇` cluster
@@ -461,9 +497,27 @@ rematch**, and the *order* of all of it is user-controlled.
   *under* the widgets). The Color-balance section reuses `value_slider` for wide
   R/G/B/Strength rows (each with its own `⟲`); Reduce + the Dither dropdown sit under
   the palette quick-chooser (above the long "All palettes" list) so they stay visible.
-- **Reduce** (`quantize_on`/`quantize_n`) lives **only** in the Recolor pane (the old
-  duplicate in the viewer status bar was removed). Its checkbox enables only when the
-  image has an extractable palette (`pal_state` is `Some(Some(_))`).
+- **Reduce** (`quantize_on`/`quantize_n`) works on **any** image, not just ≤`SWATCH_CAP`
+  art. `reduce_source(path)` returns the colors to median-cut: the extracted palette when
+  present (`palettes[path] == Some(Some(_))`), else — for a >`SWATCH_CAP` photo/gradient —
+  the distinct opaque colors sampled from a thumbnail decode (`thumb::distinct_opaque_colors`,
+  which has no `SWATCH_CAP`), cached in `reduce_src`. Editing/deleting a swatch keeps
+  Reduce **checked** (`custom_palette` wins in `active_recolor`); toggling Reduce or
+  changing the Colors count are the explicit resets that drop the hand-edit.
+- **PixelFX presets (`FxPreset`, `pixelfx: Vec<FxPreset>`, `PIXELFX_KEY`)** — a snapshot
+  of the WHOLE recolor stack (adjustments + order, post-FX, dither, balance, resize,
+  reduce, active palette), saved/recalled from the **Places → PixelFX** sub-tab (`places_tab
+  == 4`, inserted between Local and 16colo without renumbering — display order ≠ index).
+  `capture_fx_preset`/`apply_fx_preset`; portable fields (`order` as `Vec<u8>`, `postfx`
+  as a record) + `#[serde(default)]` so a preset survives new ops/params. Each preset has
+  a background `color` + text `fg` tag (auto-contrasts when `fg` is None); `ansi32_swatch_grid`
+  backs both pickers. **serde derive is used** here (added to `Cargo.toml`; serde+serde_derive
+  were already in the tree via eframe/serde_json).
+- **Applies to 16colo.rs browsing too.** The remote-thumb upload (`colo_thumbs.drain`) now
+  stores the rendered PNG's CPU pixels in `thumb_rgba` (previously only `thumb_tex`), so
+  `grid_recolored_tex` can recolor 16colo tiles (LINEAR — they're rendered previews);
+  `make_preview` falls back to that thumbnail when the raw art isn't downloaded, so a
+  hovered piece recolors in the details pane.
 - **Swatches + Export/Save** sit directly under the preview image (prioritized for
   small screens); the recolor preview + Details thumbnail scale to pane width.
 
@@ -1010,12 +1064,15 @@ truly-global escape hatch (the plain back-to-grid Escape excludes Shift). The wh
 field save the kit as a `.pvkit` (a zip — `manifest.txt` storing the kit name + **MIDI controller +
 base/octave + global velocity + every pad's record** + `pad_NN.wav`s; `save_kit`/`load_kit` via the
 `zip` crate). Saved
-kits live in `<data>/kits/`. **Places dock sub-tabs are `Local · 16colo · Kits · Samples`** (last two
-audio-plugin-only): the **Kits** tab lists saved `.pvkit`s (click → `load_kit` into the current pads,
-no navigation) and **opens the standalone pad editor** (below); **Samples** holds user-added sample
-folders (`sample_places`: name/dir/color, `SAMPLE_PLACES_KEY`) — `＋ Add location…` (rfd), click to
-browse, right-click to rename (inline) / colorize (ANSI32 swatches) / remove. All gated on
-`self.plugin_audio`.
+kits live in `<data>/kits/`. **Places dock sub-tabs are `Local · PixelFX · 16colo · Kits · Samples`**
+(PixelFX is `places_tab == 4`, ordered between Local and 16colo by the button array, *not* by index,
+so 16colo/Kits/Samples keep their indices; Kits/Samples audio-plugin-only): the **PixelFX** tab is the
+recolor-preset library (see the Recolor section — save current stack, apply, rename, bg/fg colorize,
+remove; deferred `fx_*` locals applied after the closure); the **Kits** tab lists saved `.pvkit`s
+(click → `load_kit` into the current pads, no navigation) and **opens the standalone pad editor**
+(below); **Samples** holds user-added sample folders (`sample_places`: name/dir/color,
+`SAMPLE_PLACES_KEY`) — `＋ Add location…` (rfd), click to browse, right-click to rename (inline) /
+colorize (ANSI32 swatches) / remove. Kits/Samples gated on `self.plugin_audio`.
 
 **Samples file browser + keyboard hot-swap.** The Samples-tab file list renders **full-width rows
 with the table view's look** (zebra `faint_bg_color` on odd rows, hover, and a `selection.bg_fill`
@@ -1318,7 +1375,7 @@ than assuming a logic bug. Already hit and migrated for 0.34.3:
 
 ## Testing
 
-`cargo test` runs 198 tests, all headless (188 unit + 10 GUI; plus 11 `#[ignore]`
+`cargo test` runs 213 tests, all headless (203 unit + 10 GUI; plus 11 `#[ignore]`
 network / real-trash tests that hit the live 16colo.rs API or the system trash):
 - **Unit tests** (`#[cfg(test)] mod tests` per module): PCX decode + sniff,
   `Registry` dispatch (incl. a real PNG via the `image` crate), `make_thumb` /

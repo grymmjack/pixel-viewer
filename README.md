@@ -65,9 +65,12 @@ and the rest of the demoscene / textmode art world — right down to baud-rate
 - **Virtualized thumbnail grid** — *or a sortable table view* — that scrolls smoothly
   through folders of thousands of images, with independent Ctrl+wheel tile sizing and
   configurable captions.
-- **Recolor pane** — a reorderable 15-stage adjustment + palette-rematch + dither
-  pipeline (brightness/contrast/gamma/hue/vibrance/posterize/invert/… → palette snap
-  → dithering), with live preview and export.
+- **Recolor pane** — a fully reorderable pipeline: adjustments
+  (brightness/contrast/gamma/hue/vibrance/posterize/invert/…), per-axis **pixelate**,
+  palette rematch, **reduce-to-N** (on any image), **dithering** (with a zoomable,
+  per-axis cell + Auto-detect), **resize/resample**, and bakeable **CRT post-FX**
+  (scanlines / glow / vignette / phosphor). Save the whole stack as a named
+  **PixelFX preset** and re-apply it in one click — and it all works on 16colo.rs art too.
 - **A library of 55 bundled palettes** (CGA, EGA, VGA, Game Boy, NES, C64, PICO-8,
   DawnBringer, Endesga, …) plus `.GPL` import/export.
 - **Beyond images** — view **source code** (~90 languages, syntax-highlighted), **PDFs**
@@ -251,9 +254,10 @@ order, CRT toggles, baud rates — is **remembered between runs**.
   top bar uncluttered it shows **only color-tagged favorites** by default (toggle in
   **View → Favorites bar: colored only**); the rest stay in the Places dock, and a `+N`
   marker notes how many are hidden.
-- **Places dock** with **Local** / **16colo.rs** sub-tabs — local holds Home, your
-  on-disk favorites and saved smart filters; 16colo.rs holds the 🌐 browse entry and your
-  remote pins (e.g. a pinned artist that re-runs its search on click).
+- **Places dock** with **Local** / **PixelFX** / **16colo.rs** sub-tabs (plus **Kits** /
+  **Samples** with the audio plugin) — local holds Home, your on-disk favorites and saved
+  smart filters; **PixelFX** holds your saved recolor-stack presets; 16colo.rs holds the
+  🌐 browse entry and your remote pins (e.g. a pinned artist that re-runs its search on click).
 - **Left activity rail** (VSCode-style) of icon toggles for the docks.
 - **Explorer dock** — an expandable, lazy-loading folder tree with a filter box
   (collapsed nodes do no disk I/O).
@@ -328,19 +332,44 @@ pixelview goes out of its way to keep pixel art *exact*:
 ### Recolor / colorizer pane
 
 A non-destructive image pipeline (View → Recolor pane) whose **stage order is fully
-user-controlled** — drag the grip handle or use ⬆/⬇ to reorder:
+user-controlled** — drag the grip handle or use ⬆/⬇ to reorder *every* stage below,
+including the effects:
 
-- **12 adjustment ops:** brightness, contrast, gamma, shadows, highlights,
-  posterize, hue, saturation, **vibrance** (protects already-vivid colors), pixelate,
-  sharpen, and **invert** (blend toward negative for partial solarize).
+- **Adjustment ops:** brightness, contrast, gamma, shadows, highlights, posterize,
+  hue, saturation, **vibrance** (protects already-vivid colors), sharpen, and
+  **invert** (blend toward negative for partial solarize).
+- **Pixelate** — a mosaic block with independent **Width × Height** and a **Lock**
+  (square by default), so blocks can be stretched, not just square.
 - **Palette remap** — snap the image to any bundled or loaded palette.
+- **Reduce** — quantize to N colors. Works on **any** image: if it has too many colors
+  to extract a palette, one is synthesized from its pixels and reduced from there.
 - **Dithering** — ordered/Bayer, an editable **custom matrix**, or error-diffusion
   (Floyd–Steinberg / Atkinson). Because dither is a separate stage, you can place it
-  *before* posterize for dithered banding with no palette snap.
+  *before* posterize for dithered banding with no palette snap. The ordered patterns
+  have an independent **Cell W × H** scale (+ Lock) so the crosshatch can be zoomed to
+  read on hi-res art, and an **Auto** button that detects the art's pixel scale (or
+  scales to the resolution) and matches the cell to it.
 - **Color balance** — per-channel R/G/B offset from a picked color or hex value.
-- **Reduce** — quantize the palette to N colors.
-- Live preview, with the result applied to grid tiles too; **Export** the palette as
-  `.GPL` or **Save** the recolored image.
+- **Resize / resample** — downsample the art to a fraction of native, run the whole
+  pipeline at that lower resolution, then upscale back so it displays at the *same*
+  on-screen size — to judge low-res degradation and dither at single-pixel scale.
+  Width/Height sliders with a Lock, **Quick** 100/75/50/25 %, and `/2 · ×2 · ×¼ · ÷¼`
+  steps.
+- **CRT post-FX** (bake into the image, positionable anywhere in the stack):
+  **Scanlines** (amount, spacing, horizontal `==` / vertical `||` / 45° diagonal
+  `\\` `//` direction, and a tint color), **Glow** (phosphor bloom), **Vignette**
+  (edge darkening), and **Phosphor** (an RGB aperture-grille mask).
+- Live preview, with the result applied to grid tiles too (**Apply to grid**);
+  **Export** the palette as `.GPL` or **Save** the recolored image.
+
+**PixelFX presets** — save the *entire* recolor stack (adjustments + order, post-FX,
+dither, color balance, resize, reduce, and the active palette) as a named preset in
+the **Places → PixelFX** tab. Click to apply, right-click to rename, remove, or set a
+background + text color (text auto-contrasts for readability). Build a library of
+looks and slam any of them onto an image in one click.
+
+The whole pipeline — adjustments, PixelFX presets, reduce, dither, post-FX — also
+works while **browsing 16colo.rs** (both the details preview and *Apply to grid*).
 
 ### Palettes
 
@@ -495,6 +524,11 @@ you can keep the viewer lean.
 - **Persistent on-disk cache** — JSON, thumbnails, downloaded files and pack zips are
   cached (SQLite-indexed, LRU-evicted, 2 GiB cap) so re-browsing doesn't re-fetch.
   *Preferences* shows the cache size and a **Clear cache** button.
+- **PDF pieces** (e.g. ANSI-calendar releases) have no server-side render, so their
+  first page is rendered locally (poppler) for the grid/table thumbnail.
+- **The full Recolor pipeline works here too** — adjustments, PixelFX presets, reduce,
+  dither and post-FX apply to a browsed piece's preview and (with *Apply to grid*) its
+  tiles.
 
 ### Scene art, ANSImation & retro effects
 

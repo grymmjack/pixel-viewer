@@ -9770,11 +9770,15 @@ impl PixelView {
                 //       dither at single-pixel scale). Sits above Adjustments so the
                 //       resample happens first. -----
                 {
+                    // Native dims for the px labels: img_meta (local art), else the
+                    // decoded-thumb dims — which is all a 16colo piece has (no img_meta),
+                    // so the resize is enabled there too (it's factor-based regardless).
                     let (nw, nh) = self
                         .img_meta
                         .get(&entry.path)
                         .map(|m| (m.w as usize, m.h as usize))
                         .filter(|&(w, h)| w > 0 && h > 0)
+                        .or_else(|| self.thumb_rgba.get(&entry.path).map(|(w, h, _)| (*w, *h)))
                         .unwrap_or((0, 0));
                     let (tw, th) = if nw > 0 {
                         (
