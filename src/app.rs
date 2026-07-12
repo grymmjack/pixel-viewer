@@ -3327,6 +3327,122 @@ impl PixelView {
         };
     }
 
+    /// Export the kit as an **SFZ instrument** — a `.sfz` text file next to a
+    /// `<name>_samples/` folder of 16-bit WAVs. SFZ is the open interchange format most
+    /// samplers/DAWs load (sforzando, Bitwig, Kontakt via converters, TX16Wx, …). Each
+    /// non-empty pad becomes a `<region>` mapped to its MIDI note, carrying the pad's
+    /// volume (→ dB), pitch (→ `transpose`), and loop (`loop_mode`/`loop_start`/`loop_end`,
+    /// reverse via `direction`). A one-shot pad plays fully regardless of note-off.
+    fn export_sfz(&mut self) {
+        let name = {
+            let n = self.kit_name.trim();
+            if n.is_empty() {
+                "kit".to_string()
+            } else {
+                n.to_string()
+            }
+        };
+        // Gather (note, filename, wav bytes, pad) for every loaded pad first.
+        let pads: Vec<(i32, String, Vec<u8>, Pad, f32, u32)> = (0..self.pads.len())
+            .filter_map(|i| {
+                let p = &self.pads[i];
+                let b = p.buf.as_ref()?;
+                let base = if p.name.trim().is_empty() {
+                    format!("pad_{:02}", i + 1)
+                } else {
+                    sanitize_filename(strip_audio_ext(&p.name))
+                };
+                Some((
+                    self.pad_note(i),
+                    format!("{base}.wav"),
+                    wav_bytes_16(&b.samples, b.channels.get(), b.sample_rate.get()),
+                    p.clone(),
+                    b.duration,
+                    b.sample_rate.get(),
+                ))
+            })
+            .collect();
+        if pads.is_empty() {
+            self.status = "No pads to export".into();
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(format!("{}.sfz", sanitize_filename(&name)))
+            .add_filter("SFZ instrument", &["sfz"])
+            .save_file()
+        else {
+            return;
+        };
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("kit")
+            .to_string();
+        let Some(dir) = path.parent().map(|p| p.to_path_buf()) else {
+            self.status = "Bad export path".into();
+            return;
+        };
+        let sample_dir = dir.join(format!("{stem}_samples"));
+        if let Err(e) = std::fs::create_dir_all(&sample_dir) {
+            self.status = format!("SFZ export failed: {e}");
+            return;
+        }
+        let mut sfz = format!(
+            "// {name} — exported from pixelview\n// {} pads\n\n",
+            pads.len()
+        );
+        // Dedupe filenames (two pads could share a base name) so each WAV is distinct.
+        let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (note, fname, wav, pad, dur, rate) in &pads {
+            let mut fname = fname.clone();
+            let mut n = 2;
+            while !used.insert(fname.clone()) {
+                fname = fname.replace(".wav", &format!("_{n}.wav"));
+                n += 1;
+            }
+            if let Err(e) = std::fs::write(sample_dir.join(&fname), wav) {
+                self.status = format!("SFZ export failed: {e}");
+                return;
+            }
+            sfz.push_str("<region>\n");
+            sfz.push_str(&format!("sample={stem}_samples/{fname}\n"));
+            sfz.push_str(&format!("key={note}\n")); // lokey=hikey=pitch_keycenter=note
+            if pad.pitch != 0 {
+                sfz.push_str(&format!("transpose={}\n", pad.pitch));
+            }
+            let db = if pad.volume <= 0.0001 {
+                -144.0
+            } else {
+                20.0 * pad.volume.log10()
+            };
+            sfz.push_str(&format!("volume={db:.2}\n"));
+            if pad.loop_on {
+                let (ls, le) = pad.loop_region(*dur);
+                let (sf, ef) = (
+                    (ls * *rate as f32).round() as u64,
+                    (le * *rate as f32).round() as u64,
+                );
+                sfz.push_str(&format!(
+                    "loop_mode=loop_continuous\nloop_start={sf}\nloop_end={ef}\n"
+                ));
+                if pad.loop_type == 1 {
+                    sfz.push_str("direction=reverse\n");
+                } else if pad.loop_type == 2 {
+                    sfz.push_str(
+                        "// ping-pong loop approximated as forward (SFZ has no bidi loop)\n",
+                    );
+                }
+            } else {
+                sfz.push_str("loop_mode=one_shot\n"); // a drum hit plays fully, ignores note-off
+            }
+            sfz.push('\n');
+        }
+        self.status = match std::fs::write(&path, sfz) {
+            Ok(()) => format!("Exported SFZ: {} ({} pads)", short_name(&path), pads.len()),
+            Err(e) => format!("SFZ export failed: {e}"),
+        };
+    }
+
     /// `<data_dir>/kits` — where named `.pvkit` files live (browsable in the Places dock).
     fn kits_dir(&self) -> PathBuf {
         self.data_dir.join("kits")
@@ -6005,6 +6121,7 @@ impl PixelView {
         let mut rename_commit: Option<(usize, String)> = None;
         let mut rename_cancel = false;
         let mut want_zip = false;
+        let mut want_sfz = false;
         let mut want_save_kit = false;
         let mut want_load_kit = false;
         let mut want_drop: Option<(usize, PadDrop)> = None; // a sample dropped onto pad i
@@ -6076,6 +6193,15 @@ impl PixelView {
                     .clicked()
                 {
                     want_zip = true;
+                }
+                if ui
+                    .button(format!("{} SFZ", icons::DOWNLOAD))
+                    .on_hover_text(
+                        "Export the kit as an SFZ instrument (.sfz + WAVs) to load in a DAW/sampler",
+                    )
+                    .clicked()
+                {
+                    want_sfz = true;
                 }
             });
         });
@@ -6594,6 +6720,9 @@ impl PixelView {
         }
         if want_zip {
             self.export_pads_zip();
+        }
+        if want_sfz {
+            self.export_sfz();
         }
         if want_save_kit {
             let name = self.kit_name.clone();
