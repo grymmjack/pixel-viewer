@@ -895,7 +895,12 @@ pub struct PixelView {
     explorer_filter: String,         // folder-tree search box (runtime only)
     colo_search: String,             // 16colo.rs nav-bar search box (runtime only)
     explorer_tab: u8,                // 0 = Places, 1 = Folders
-    places_tab: u8, // Places sub-tab: 0 = Local, 1 = 16colo.rs, 2 = Kits, 3 = Samples
+    places_tab: u8, // Places sub-tab: 0 = Local, 1 = 16colo.rs, 2 = Kits, 3 = Samples, 4 = PixelFX
+    // PixelFX presets: saved snapshots of the whole recolor stack, recalled from the
+    // Places → PixelFX sub-tab. Save/apply/rename/colorize/remove.
+    pixelfx: Vec<FxPreset>,
+    pixelfx_name: String,                    // "save current" name buffer
+    pixelfx_rename: Option<(usize, String)>, // inline-rename buffer (transient)
     // User-managed "Samples" locations (name, dir, optional color tag) — quick jumps to sample
     // folders to drag/assign into pads. Add/rename/colorize/remove from the Samples sub-tab.
     sample_places: Vec<(String, PathBuf, Option<[u8; 3]>)>,
@@ -956,6 +961,8 @@ pub struct PixelView {
     dither_scale_x: usize,   // ordered-dither cell WIDTH in px (≥1; "zoom" the pattern)
     dither_scale_y: usize,   // ordered-dither cell HEIGHT in px (≥1)
     dither_scale_lock: bool, // lock the dither cell square (scale_x == scale_y)
+    pixelate_h: f32,         // Pixelate block HEIGHT in px (width = adjust.pixelate); <2 = square
+    pixelate_lock: bool,     // lock the pixelate block square (height == width)
     // Resize/resample preview: downsample the art to a fraction of native, run the
     // whole pipeline (dither/palette) at that lower resolution, then nearest-upscale
     // back to native — so it displays at the SAME screen size but shows the
@@ -1232,6 +1239,7 @@ impl PixelView {
     const TITLE_PATH_KEY: &'static str = "title_show_path";
     const WINDOW_GEOM_KEY: &'static str = "window_geom"; // [x, y, w, h]: restore last window place
     const SAMPLE_PLACES_KEY: &'static str = "sample_places"; // user Samples locations
+    const PIXELFX_KEY: &'static str = "pixelfx"; // saved recolor-stack presets
     const ZOOM_EDIT_KEY: &'static str = "zoom_edit_pct"; // waveform edge-inset magnification
     const WAVE_AMP_KEY: &'static str = "wave_amp"; // waveform vertical magnification
     const TRANSIENTS_KEY: &'static str = "transients_on";
@@ -1292,6 +1300,8 @@ impl PixelView {
     const DITHER_SCALE_KEY: &'static str = "dither_scale"; // legacy single value → X
     const DITHER_SCALE_Y_KEY: &'static str = "dither_scale_y";
     const DITHER_SCALE_LOCK_KEY: &'static str = "dither_scale_lock";
+    const PIXELATE_H_KEY: &'static str = "pixelate_h";
+    const PIXELATE_LOCK_KEY: &'static str = "pixelate_lock";
     const POSTFX_KEY: &'static str = "postfx"; // CRT post-filters (record)
     const RESIZE_ON_KEY: &'static str = "resize_on";
     const RESIZE_FX_KEY: &'static str = "resize_fx";
@@ -1698,6 +1708,12 @@ impl PixelView {
             .unwrap_or(dither_scale_x)
             .clamp(1, 16);
         let dither_scale_lock = get_bool(Self::DITHER_SCALE_LOCK_KEY).unwrap_or(true);
+        let pixelate_h = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::PIXELATE_H_KEY))
+            .unwrap_or(0.0)
+            .clamp(0.0, 32.0);
+        let pixelate_lock = get_bool(Self::PIXELATE_LOCK_KEY).unwrap_or(true);
         let resize_on = get_bool(Self::RESIZE_ON_KEY).unwrap_or(false);
         let resize_fx = cc
             .storage
@@ -1904,6 +1920,12 @@ impl PixelView {
                     )
                 })
                 .unwrap_or_default(),
+            pixelfx: cc
+                .storage
+                .and_then(|s| eframe::get_value::<Vec<FxPreset>>(s, Self::PIXELFX_KEY))
+                .unwrap_or_default(),
+            pixelfx_name: String::new(),
+            pixelfx_rename: None,
             sample_rename: None,
             sample_browse: None,
             sample_sel: None,
@@ -1945,6 +1967,8 @@ impl PixelView {
             dither_scale_x,
             dither_scale_y,
             dither_scale_lock,
+            pixelate_h,
+            pixelate_lock,
             resize_on,
             resize_fx,
             resize_fy,
@@ -8473,6 +8497,7 @@ impl PixelView {
             dither_n: self.dither_custom_n,
             dither_scale_x: dscale_x,
             dither_scale_y: dscale_y,
+            pixelate_h: self.pixelate_h,
             fx: self.postfx,
             balance: self.balance_offset(),
             palette,
@@ -8531,6 +8556,83 @@ impl PixelView {
         (tw, th)
     }
 
+    /// Snapshot the entire recolor stack (adjustments + order, post-FX, dither, color
+    /// balance, resize, reduce, active palette) into a named PixelFX preset.
+    fn capture_fx_preset(&self, name: String) -> FxPreset {
+        FxPreset {
+            name,
+            color: None,
+            adjust_vals: self.adjust.to_array(),
+            order: self.adjust.order_to_u8().to_vec(),
+            postfx: self.postfx.to_record(),
+            dither_method: self.dither_method,
+            dither_amount: self.dither_amount,
+            dither_custom: self.dither_custom.clone(),
+            dither_custom_n: self.dither_custom_n,
+            dither_scale_x: self.dither_scale_x,
+            dither_scale_y: self.dither_scale_y,
+            dither_scale_lock: self.dither_scale_lock,
+            pixelate_h: self.pixelate_h,
+            pixelate_lock: self.pixelate_lock,
+            balance_color: self.balance_color,
+            balance_strength: self.balance_strength,
+            resize_on: self.resize_on,
+            resize_fx: self.resize_fx,
+            resize_fy: self.resize_fy,
+            resize_lock: self.resize_lock,
+            quantize_on: self.quantize_on,
+            quantize_n: self.quantize_n,
+            selected_palette: self.selected_palette.clone(),
+            custom_palette: self.custom_palette.clone(),
+        }
+    }
+
+    /// Restore a PixelFX preset onto the live recolor state. Portable fields go back
+    /// through `with_order` / `from_record` so an old preset survives new ops/params;
+    /// values are clamped to their valid ranges. Clears the derived caches so the
+    /// preview/full/grid rebuild from the recalled look.
+    fn apply_fx_preset(&mut self, p: &FxPreset) {
+        self.adjust = Adjust::from_array(p.adjust_vals).with_order(&p.order);
+        self.postfx = PostFx::from_record(&p.postfx);
+        self.dither_method = p.dither_method;
+        self.dither_amount = p.dither_amount.clamp(0.0, 1.0);
+        self.dither_custom_n = if matches!(p.dither_custom_n, 2 | 4 | 8) {
+            p.dither_custom_n
+        } else {
+            4
+        };
+        self.dither_custom = if p.dither_custom.len() == self.dither_custom_n * self.dither_custom_n
+        {
+            p.dither_custom.clone()
+        } else {
+            crate::thumb::bayer_values(self.dither_custom_n)
+        };
+        self.dither_scale_x = p.dither_scale_x.clamp(1, 16);
+        self.dither_scale_y = p.dither_scale_y.clamp(1, 16);
+        self.dither_scale_lock = p.dither_scale_lock;
+        self.pixelate_h = p.pixelate_h.clamp(0.0, 32.0);
+        self.pixelate_lock = p.pixelate_lock;
+        self.balance_color = p.balance_color;
+        self.balance_strength = p.balance_strength.clamp(0.0, 1.0);
+        self.balance_hex = format!(
+            "{:02X}{:02X}{:02X}",
+            p.balance_color[0], p.balance_color[1], p.balance_color[2]
+        );
+        self.resize_on = p.resize_on;
+        self.resize_fx = p.resize_fx.clamp(0.005, 1.0);
+        self.resize_fy = p.resize_fy.clamp(0.005, 1.0);
+        self.resize_lock = p.resize_lock;
+        self.quantize_on = p.quantize_on;
+        self.quantize_n = p.quantize_n.clamp(2, 256);
+        self.selected_palette = p.selected_palette.clone();
+        self.custom_palette = p.custom_palette.clone();
+        // Invalidate derived caches so the recalled look rebuilds.
+        self.flash = None;
+        self.editing_color = None;
+        self.quantize_cache = None;
+        self.reduce_src = None;
+    }
+
     /// Is *any* pipeline stage active (an adjustment, color balance, or dither)?
     /// Drives the "render a processed preview" gate and the "Adjustments *" marker.
     fn pipeline_active(&self) -> bool {
@@ -8539,6 +8641,7 @@ impl PixelView {
             || (self.dither_method != 0 && self.dither_amount > 0.0)
             || self.resize_active()
             || self.postfx.active()
+            || self.pixelate_h >= 2.0 // vertical-only pixelate (width can be off)
     }
 
     /// True when the Resize/resample actually downsamples (on + a factor below 1).
@@ -8570,7 +8673,7 @@ impl PixelView {
             self.resize_on as u8,
             self.resize_fx,
             self.resize_fy,
-        ) + &format!("|FX{}", self.postfx.key())
+        ) + &format!("|FX{}|PXH{:.0}", self.postfx.key(), self.pixelate_h)
     }
 
     /// The palette to remap the inspected image to right now, plus a cache key
@@ -8706,6 +8809,7 @@ impl PixelView {
             dither_n: 0,
             dither_scale_x: 1,
             dither_scale_y: 1,
+            pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: self.balance_offset(),
             palette: palette.as_deref(),
@@ -9467,6 +9571,7 @@ impl PixelView {
                 self.dither_custom = crate::thumb::bayer_values(4);
                 self.dither_scale_x = 1;
                 self.dither_scale_y = 1;
+                self.pixelate_h = 0.0;
                 self.postfx = PostFx::default();
                 self.resize_on = false;
                 self.resize_fx = 1.0;
@@ -9738,7 +9843,23 @@ impl PixelView {
                                         self.resize_fx = self.resize_fy;
                                     }
                                 }
+                                // Quick % of native (both axes) — snap to 100/75/50/25.
                                 ui.horizontal(|ui| {
+                                    ui.weak("Quick");
+                                    for pct in [100u32, 75, 50, 25] {
+                                        if ui
+                                            .button(format!("{pct}%"))
+                                            .on_hover_text("Set both axes to this % of native")
+                                            .clicked()
+                                        {
+                                            let f = pct as f32 / 100.0;
+                                            self.resize_fx = f;
+                                            self.resize_fy = f;
+                                        }
+                                    }
+                                });
+                                // Lock + relative shrink/grow steps (wrapped: 6 buttons).
+                                ui.horizontal_wrapped(|ui| {
                                     if ui
                                         .selectable_label(self.resize_lock, "🔒 Lock aspect")
                                         .clicked()
@@ -9759,6 +9880,22 @@ impl PixelView {
                                     if ui.button("×2").on_hover_text("Double back up").clicked() {
                                         self.resize_fx = (self.resize_fx * 2.0).min(1.0);
                                         self.resize_fy = (self.resize_fy * 2.0).min(1.0);
+                                    }
+                                    if ui
+                                        .button("×¼")
+                                        .on_hover_text("Quarter the resolution (× ¼)")
+                                        .clicked()
+                                    {
+                                        self.resize_fx = (self.resize_fx * 0.25).max(0.005);
+                                        self.resize_fy = (self.resize_fy * 0.25).max(0.005);
+                                    }
+                                    if ui
+                                        .button("÷¼")
+                                        .on_hover_text("4× back up (÷ ¼)")
+                                        .clicked()
+                                    {
+                                        self.resize_fx = (self.resize_fx * 4.0).min(1.0);
+                                        self.resize_fy = (self.resize_fy * 4.0).min(1.0);
                                     }
                                     if ui.button("Reset").on_hover_text("Back to native resolution").clicked() {
                                         self.resize_fx = 1.0;
@@ -9848,6 +9985,22 @@ impl PixelView {
                                         // controls live in a section lower in the pane.
                                         let active = ui.visuals().selection.bg_fill;
                                         let (txt, hover) = match op {
+                                            OpKind::Pixelate => {
+                                                let bw = self.adjust.pixelate.round() as u32;
+                                                let bh = if self.pixelate_h >= 2.0 {
+                                                    self.pixelate_h.round() as u32
+                                                } else {
+                                                    bw
+                                                };
+                                                (
+                                                    if bw.max(bh) >= 2 {
+                                                        egui::RichText::new(format!("Pixelate · {bw}×{bh}")).strong().color(active)
+                                                    } else {
+                                                        egui::RichText::new("Pixelate (off)").weak()
+                                                    },
+                                                    "Mosaic block size — set width/height in the Pixelate section; drag to reorder",
+                                                )
+                                            }
                                             OpKind::Palette => (
                                                 if recolor.is_some() {
                                                     egui::RichText::new("Palette rematch").strong().color(active)
@@ -10026,8 +10179,75 @@ impl PixelView {
                             }
                             if ui.button("Reset all").clicked() {
                                 a = Adjust::default();
+                                self.pixelate_h = 0.0;
                             }
                             self.adjust = a;
+                        });
+                }
+
+                // ----- Pixelate block size (its "Pixelate" marker row in Adjustments
+                //       positions where the mosaic applies). Per-axis Width×Height + a
+                //       Lock, like the dither cell — art isn't always square. -----
+                {
+                    let bw = self.adjust.pixelate;
+                    let bh = if self.pixelate_h >= 2.0 {
+                        self.pixelate_h
+                    } else {
+                        bw
+                    };
+                    let header = if bw.max(bh) >= 2.0 {
+                        format!("Pixelate *  · {}×{}", bw.round() as u32, bh.round() as u32)
+                    } else {
+                        "Pixelate".to_string()
+                    };
+                    egui::CollapsingHeader::new(header)
+                        .id_salt("pixelate")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            let mut w = self.adjust.pixelate;
+                            ui.horizontal(|ui| {
+                                ui.label("Width")
+                                    .on_hover_text("Mosaic block WIDTH in px (0/1 = off)");
+                                let r = ui.add(egui::Slider::new(&mut w, 0.0..=32.0).step_by(1.0));
+                                middle_reset(ui, &r, &mut w, 0.0f32);
+                                wheel_adjust(ui, &r, &mut w, 1.0, 0.0f32, 32.0f32);
+                            });
+                            if w != self.adjust.pixelate {
+                                self.adjust.pixelate = w;
+                                if self.pixelate_lock {
+                                    self.pixelate_h = w;
+                                }
+                            }
+                            let mut hh = self.pixelate_h;
+                            ui.horizontal(|ui| {
+                                ui.label("Height")
+                                    .on_hover_text("Mosaic block HEIGHT in px (0/1 = square)");
+                                let r = ui.add(egui::Slider::new(&mut hh, 0.0..=32.0).step_by(1.0));
+                                middle_reset(ui, &r, &mut hh, 0.0f32);
+                                wheel_adjust(ui, &r, &mut hh, 1.0, 0.0f32, 32.0f32);
+                            });
+                            if hh != self.pixelate_h {
+                                self.pixelate_h = hh;
+                                if self.pixelate_lock {
+                                    self.adjust.pixelate = hh;
+                                }
+                            }
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .selectable_label(self.pixelate_lock, "🔒 Lock")
+                                    .on_hover_text("Keep the block square")
+                                    .clicked()
+                                {
+                                    self.pixelate_lock = !self.pixelate_lock;
+                                    if self.pixelate_lock {
+                                        self.pixelate_h = self.adjust.pixelate;
+                                    }
+                                }
+                                if ui.button("Reset").clicked() {
+                                    self.adjust.pixelate = 0.0;
+                                    self.pixelate_h = 0.0;
+                                }
+                            });
                         });
                 }
 
@@ -12223,18 +12443,38 @@ impl PixelView {
         self.colo_save_rx = Some(rx);
     }
 
+    /// True while a text field owns the keyboard, so viewer hotkeys must stand down —
+    /// otherwise typing a PixelFX preset name (or any dock field) leaks letters like
+    /// T→tile / F→fit / arrows→scroll. `egui_wants_keyboard_input` covers every focused
+    /// field (set by the docks rendered earlier this frame); the explicit flags cover
+    /// the cases where focus isn't registered yet. Methods that read keys directly (this
+    /// and `draw_image_view`) must consult it — the global handler's `typing` guard is
+    /// local to `ui()` and doesn't reach here.
+    fn keyboard_captured(&self, ctx: &egui::Context) -> bool {
+        self.path_edit.is_some()
+            || self.renaming.is_some()
+            || self.fav_rename.is_some()
+            || self.rebinding.is_some()
+            || ctx.egui_wants_keyboard_input()
+    }
+
     fn ui_single(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let prev_key = self.key_for(Action::PrevImage);
         let next_key = self.key_for(Action::NextImage);
-        let (prev, next, fit, tile, edit) = ui.input(|i| {
-            (
-                i.key_pressed(prev_key),
-                i.key_pressed(next_key),
-                i.key_pressed(egui::Key::F),
-                i.key_pressed(egui::Key::T),
-                i.key_pressed(egui::Key::Enter),
-            )
-        });
+        let typing = self.keyboard_captured(ctx);
+        let (prev, next, fit, tile, edit) = if typing {
+            (false, false, false, false, false)
+        } else {
+            ui.input(|i| {
+                (
+                    i.key_pressed(prev_key),
+                    i.key_pressed(next_key),
+                    i.key_pressed(egui::Key::F),
+                    i.key_pressed(egui::Key::T),
+                    i.key_pressed(egui::Key::Enter),
+                )
+            })
+        };
         // Any user input during baud playback finishes the animation *now* and hands
         // control back — the auto-scroll stops following the cursor so the user can
         // scroll/pan freely. Triggered by a scroll, a zoom gesture, or any key press;
@@ -13032,8 +13272,9 @@ impl PixelView {
             }
         }
         // Up/Down arrows scroll a long file (Left/Right are prev/next). Auto-repeat while
-        // held; one keypress nudges ~⅛ of the viewport. Only when there's overflow to pan.
-        if overflow_y {
+        // held; one keypress nudges ~⅛ of the viewport. Only when there's overflow to pan
+        // AND no text field owns the keyboard (else arrows typed into a field would scroll).
+        if overflow_y && !self.keyboard_captured(ui.ctx()) {
             let (up, down, home, end, pgup, pgdn) = ui.input(|i| {
                 use egui::Key::*;
                 (
@@ -14826,6 +15067,13 @@ impl PixelView {
         let mut color_sample: Option<(usize, Option<[u8; 3]>)> = None;
         let mut rename_start: Option<usize> = None;
         let mut rename_commit: Option<(usize, String)> = None;
+        // PixelFX sub-tab actions (deferred — the closure can't borrow self twice).
+        let mut fx_save = false; // save current stack as a new preset
+        let mut fx_apply: Option<usize> = None; // apply preset i
+        let mut fx_remove: Option<usize> = None;
+        let mut fx_color: Option<(usize, Option<[u8; 3]>)> = None;
+        let mut fx_rename_start: Option<usize> = None;
+        let mut fx_rename_commit: Option<(usize, String)> = None;
         // Tabs: Places | Folders (one at a time, to save vertical room).
         ui.horizontal(|ui| {
             if ui
@@ -14846,11 +15094,16 @@ impl PixelView {
             .auto_shrink([false; 2])
             .show(ui, |ui| {
                 if self.explorer_tab == 0 {
-                    // Sub-tabs: Local folders · 16colo.rs · Kits · Samples (last two audio-plugin only).
+                    // Sub-tabs: Local · PixelFX · 16colo.rs · Kits · Samples (Kits/Samples
+                    // audio-plugin only). PixelFX (idx 4) sits between Local and 16colo.
                     ui.horizontal_wrapped(|ui| {
-                        for (idx, label) in
-                            [(0u8, "Local"), (1, "16colo"), (2, "Kits"), (3, "Samples")]
-                        {
+                        for (idx, label) in [
+                            (0u8, "Local"),
+                            (4, "PixelFX"),
+                            (1, "16colo"),
+                            (2, "Kits"),
+                            (3, "Samples"),
+                        ] {
                             if (idx == 2 || idx == 3) && !self.plugin_audio {
                                 continue;
                             }
@@ -14942,6 +15195,126 @@ impl PixelView {
                             {
                                 load_kit = Some(kf.clone());
                             }
+                        }
+                    } else if self.places_tab == 4 {
+                        // PixelFX: saved snapshots of the whole recolor stack. Name +
+                        // Save the current look; click a preset to apply it; right-click
+                        // to rename / colorize / remove (same treatment as favorites).
+                        ui.horizontal(|ui| {
+                            let te = ui.add(
+                                egui::TextEdit::singleline(&mut self.pixelfx_name)
+                                    .hint_text("preset name")
+                                    .desired_width(120.0),
+                            );
+                            let enter =
+                                te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            if ui
+                                .button(format!("{} Save", icons::DOWNLOAD))
+                                .on_hover_text(
+                                    "Save the current adjustments + effects stack as a preset",
+                                )
+                                .clicked()
+                                || enter
+                            {
+                                fx_save = true;
+                            }
+                        });
+                        ui.separator();
+                        if self.pixelfx.is_empty() {
+                            ui.weak("(no presets — build a look, name it, Save)");
+                        }
+                        let items: Vec<(String, Option<[u8; 3]>)> = self
+                            .pixelfx
+                            .iter()
+                            .map(|p| (p.name.clone(), p.color))
+                            .collect();
+                        for (i, (name, color)) in items.iter().enumerate() {
+                            // Inline rename replaces the button while this row is renamed.
+                            if matches!(&self.pixelfx_rename, Some((ri, _)) if *ri == i) {
+                                let mut buf = match &self.pixelfx_rename {
+                                    Some((_, b)) => b.clone(),
+                                    None => String::new(),
+                                };
+                                let r = ui.add(
+                                    egui::TextEdit::singleline(&mut buf)
+                                        .desired_width(f32::INFINITY),
+                                );
+                                self.pixelfx_rename = Some((i, buf.clone()));
+                                if r.lost_focus()
+                                    && ui.input(|inp| inp.key_pressed(egui::Key::Enter))
+                                {
+                                    fx_rename_commit = Some((i, buf));
+                                }
+                                continue;
+                            }
+                            let r = ui
+                                .add(egui::Button::new(elide(name, 22)).fill(
+                                    if let Some(c) = color {
+                                        egui::Color32::from_rgb(c[0], c[1], c[2])
+                                    } else {
+                                        ui.visuals().widgets.inactive.bg_fill
+                                    },
+                                ))
+                                .on_hover_text(
+                                    "Apply this preset · right-click to rename / colorize / remove",
+                                );
+                            if r.clicked() {
+                                fx_apply = Some(i);
+                            }
+                            r.context_menu(|ui| {
+                                if ui.button("Rename").clicked() {
+                                    fx_rename_start = Some(i);
+                                    ui.close();
+                                }
+                                if ui.button("× Remove").clicked() {
+                                    fx_remove = Some(i);
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui.button("× Clear color").clicked() {
+                                    fx_color = Some((i, None));
+                                    ui.close();
+                                }
+                                egui::Grid::new(("pixelfx_color_grid", i))
+                                    .spacing([1.0, 1.0])
+                                    .min_col_width(0.0)
+                                    .show(ui, |ui| {
+                                        for (n, &c) in ansi32_palette().iter().enumerate() {
+                                            if n > 0 && n % 8 == 0 {
+                                                ui.end_row();
+                                            }
+                                            let (rect, resp) = ui.allocate_exact_size(
+                                                egui::vec2(18.0, 18.0),
+                                                egui::Sense::click(),
+                                            );
+                                            ui.painter().rect_filled(
+                                                rect,
+                                                0.0,
+                                                egui::Color32::from_rgb(c[0], c[1], c[2]),
+                                            );
+                                            let outline = if *color == Some(c) {
+                                                egui::Stroke::new(2.0, egui::Color32::WHITE)
+                                            } else if resp.hovered() {
+                                                egui::Stroke::new(1.0, egui::Color32::WHITE)
+                                            } else {
+                                                egui::Stroke::new(
+                                                    1.0,
+                                                    egui::Color32::from_black_alpha(70),
+                                                )
+                                            };
+                                            ui.painter().rect_stroke(
+                                                rect,
+                                                0.0,
+                                                outline,
+                                                egui::StrokeKind::Inside,
+                                            );
+                                            if resp.clicked() {
+                                                fx_color = Some((i, Some(c)));
+                                                ui.close();
+                                            }
+                                        }
+                                    });
+                            });
                         }
                     } else {
                         // Samples: user-managed sample folders — quick jumps to browse + drag/assign
@@ -15276,6 +15649,62 @@ impl PixelView {
                 }
             }
             self.sample_rename = None;
+        }
+        // PixelFX preset actions (deferred out of the Places closure).
+        if fx_save {
+            let name = {
+                let n = self.pixelfx_name.trim();
+                if n.is_empty() {
+                    format!("Preset {}", self.pixelfx.len() + 1)
+                } else {
+                    n.to_string()
+                }
+            };
+            let preset = self.capture_fx_preset(name.clone());
+            // Overwrite a same-named preset (keeping its color tag), else append.
+            if let Some(slot) = self.pixelfx.iter_mut().find(|p| p.name == name) {
+                let color = slot.color;
+                *slot = preset;
+                slot.color = color;
+            } else {
+                self.pixelfx.push(preset);
+            }
+            self.pixelfx_name.clear();
+            self.status = format!("Saved PixelFX preset “{name}”");
+        }
+        if let Some(i) = fx_apply {
+            if let Some(p) = self.pixelfx.get(i).cloned() {
+                self.apply_fx_preset(&p);
+                self.status = format!("Applied “{}”", p.name);
+            }
+        }
+        if let Some(i) = fx_remove {
+            if i < self.pixelfx.len() {
+                let p = self.pixelfx.remove(i);
+                self.pixelfx_rename = None;
+                self.status = format!("Removed “{}”", p.name);
+            }
+        }
+        if let Some((i, c)) = fx_color {
+            if let Some(p) = self.pixelfx.get_mut(i) {
+                p.color = c;
+            }
+        }
+        if let Some(i) = fx_rename_start {
+            let cur = self
+                .pixelfx
+                .get(i)
+                .map(|p| p.name.clone())
+                .unwrap_or_default();
+            self.pixelfx_rename = Some((i, cur));
+        }
+        if let Some((i, name)) = fx_rename_commit {
+            if let Some(p) = self.pixelfx.get_mut(i) {
+                if !name.trim().is_empty() {
+                    p.name = name.trim().to_string();
+                }
+            }
+            self.pixelfx_rename = None;
         }
         // Load a kit (item 14): adopt it into the pads without navigating into the file, and show
         // the pads (item 15). Clicking the Kits tab also opens the pad editor.
@@ -16380,6 +16809,7 @@ impl eframe::App for PixelView {
             eframe::set_value(storage, Self::WINDOW_GEOM_KEY, &g);
         }
         eframe::set_value(storage, Self::SAMPLE_PLACES_KEY, &self.sample_places);
+        eframe::set_value(storage, Self::PIXELFX_KEY, &self.pixelfx);
         eframe::set_value(storage, Self::ZOOM_EDIT_KEY, &self.zoom_edit_pct);
         eframe::set_value(storage, Self::WAVE_AMP_KEY, &self.wave_amp);
         eframe::set_value(storage, Self::TRANSIENTS_KEY, &self.transients_on);
@@ -16546,6 +16976,8 @@ impl eframe::App for PixelView {
             Self::DITHER_SCALE_LOCK_KEY,
             &self.dither_scale_lock,
         );
+        eframe::set_value(storage, Self::PIXELATE_H_KEY, &self.pixelate_h);
+        eframe::set_value(storage, Self::PIXELATE_LOCK_KEY, &self.pixelate_lock);
         eframe::set_value(storage, Self::RESIZE_ON_KEY, &self.resize_on);
         eframe::set_value(storage, Self::RESIZE_FX_KEY, &self.resize_fx);
         eframe::set_value(storage, Self::RESIZE_FY_KEY, &self.resize_fy);
@@ -16996,7 +17428,8 @@ impl OpKind {
     fn is_marker(self) -> bool {
         matches!(
             self,
-            OpKind::Palette
+            OpKind::Pixelate
+                | OpKind::Palette
                 | OpKind::ColorBalance
                 | OpKind::Dither
                 | OpKind::Scanlines
@@ -17020,7 +17453,7 @@ impl OpKind {
             OpKind::Hue => ("Hue", -1.0, 1.0, 0.0, 0.0),
             OpKind::Saturation => ("Saturation", -1.0, 1.0, 0.0, 0.0),
             OpKind::Vibrance => ("Vibrance", -1.0, 1.0, 0.0, 0.0),
-            OpKind::Pixelate => ("Pixelate", 0.0, 32.0, 0.0, 1.0),
+            OpKind::Pixelate => ("Pixelate", 0.0, 0.0, 0.0, 0.0),
             OpKind::Sharpen => ("Sharpen", 0.0, 1.0, 0.0, 0.0),
             OpKind::Invert => ("Invert", 0.0, 1.0, 0.0, 0.0),
             OpKind::Palette => ("Palette", 0.0, 0.0, 0.0, 0.0),
@@ -17185,7 +17618,8 @@ impl Adjust {
     /// Only valid for value ops — never called for `OpKind::Palette` (no slider).
     fn field_mut(&mut self, op: OpKind) -> &mut f32 {
         match op {
-            OpKind::Palette
+            OpKind::Pixelate
+            | OpKind::Palette
             | OpKind::ColorBalance
             | OpKind::Dither
             | OpKind::Scanlines
@@ -17204,7 +17638,6 @@ impl Adjust {
             OpKind::Hue => &mut self.hue,
             OpKind::Saturation => &mut self.saturation,
             OpKind::Vibrance => &mut self.vibrance,
-            OpKind::Pixelate => &mut self.pixelate,
             OpKind::Sharpen => &mut self.sharpen,
         }
     }
@@ -17259,6 +17692,7 @@ struct PipeAux<'a> {
     dither_n: usize,
     dither_scale_x: usize, // ordered-dither cell width in pixels (≥1)
     dither_scale_y: usize, // ordered-dither cell height in pixels (≥1)
+    pixelate_h: f32,       // Pixelate block height (width = adjust.pixelate); <2 = square
     fx: PostFx,            // CRT post-filter params (scanlines/glow/vignette/phosphor)
     balance: [i16; 3],
     palette: Option<&'a [[u8; 4]]>,
@@ -17273,6 +17707,20 @@ struct PipeAux<'a> {
 fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, a: &Adjust, aux: &PipeAux) {
     for op in a.order {
         match op {
+            OpKind::Pixelate => {
+                // Mosaic: average each bw×bh block (alpha untouched, so the sprite's
+                // silhouette stays crisp). Width = a.pixelate, height = aux.pixelate_h,
+                // falling back to a square (width) when the height isn't set (≥2).
+                let bw = a.pixelate.round() as usize;
+                let bh = if aux.pixelate_h >= 2.0 {
+                    aux.pixelate_h.round() as usize
+                } else {
+                    bw
+                };
+                if bw.max(bh) >= 2 && w > 0 && h > 0 {
+                    pixelate_blocks(rgba, w, h, bw.max(1), bh.max(1));
+                }
+            }
             OpKind::Palette => {
                 if let Some(p) = aux.palette {
                     crate::thumb::remap_to_palette(rgba, p);
@@ -17359,7 +17807,7 @@ impl PostFx {
     }
     /// Flatten to an f32 record for persistence (append-only; `from_record` fills
     /// missing trailing fields with defaults, so the layout can grow compatibly).
-    fn to_record(&self) -> Vec<f32> {
+    fn to_record(self) -> Vec<f32> {
         vec![
             self.scan_amt,
             self.scan_period as f32,
@@ -17390,6 +17838,73 @@ impl PostFx {
             vig_feather: g(9, d.vig_feather),
             phos_amt: g(10, d.phos_amt),
             phos_size: g(11, d.phos_size as f32).max(1.0) as u32,
+        }
+    }
+}
+
+/// A saved "PixelFX" preset — a snapshot of the WHOLE recolor stack (adjustments +
+/// order, post-FX, dither, color balance, resize, reduce, and the active palette), so
+/// a look can be named, colorized, and recalled from the Places → PixelFX tab. The
+/// order + effect params are stored in their portable forms (`order` = op indices,
+/// `postfx` = record) so the struct survives adding new ops/params (`with_order` /
+/// `from_record` fill the gaps). `#[serde(default)]` fills any field a newer layout
+/// added, so an older saved preset still loads.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct FxPreset {
+    name: String,
+    color: Option<[u8; 3]>, // Places button tint (ANSI32 swatch), like favorites
+    adjust_vals: [f32; 12], // Adjust::to_array()
+    order: Vec<u8>,         // Adjust::order_to_u8() — portable across op additions
+    postfx: Vec<f32>,       // PostFx::to_record()
+    dither_method: u8,
+    dither_amount: f32,
+    dither_custom: Vec<u32>,
+    dither_custom_n: usize,
+    dither_scale_x: usize,
+    dither_scale_y: usize,
+    dither_scale_lock: bool,
+    pixelate_h: f32,
+    pixelate_lock: bool,
+    balance_color: [u8; 3],
+    balance_strength: f32,
+    resize_on: bool,
+    resize_fx: f32,
+    resize_fy: f32,
+    resize_lock: bool,
+    quantize_on: bool,
+    quantize_n: usize,
+    selected_palette: Option<PathBuf>,
+    custom_palette: Option<Vec<[u8; 4]>>,
+}
+
+impl Default for FxPreset {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            color: None,
+            adjust_vals: Adjust::default().to_array(),
+            order: Adjust::default().order_to_u8().to_vec(),
+            postfx: PostFx::default().to_record(),
+            dither_method: 0,
+            dither_amount: 1.0,
+            dither_custom: crate::thumb::bayer_values(4),
+            dither_custom_n: 4,
+            dither_scale_x: 1,
+            dither_scale_y: 1,
+            dither_scale_lock: true,
+            pixelate_h: 0.0,
+            pixelate_lock: true,
+            balance_color: [128, 128, 128],
+            balance_strength: 0.0,
+            resize_on: false,
+            resize_fx: 1.0,
+            resize_fy: 1.0,
+            resize_lock: true,
+            quantize_on: false,
+            quantize_n: 16,
+            selected_palette: None,
+            custom_palette: None,
         }
     }
 }
@@ -17651,6 +18166,7 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             dither_n: 0,
             dither_scale_x: 1,
             dither_scale_y: 1,
+            pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],
             palette: None,
@@ -17661,14 +18177,6 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
 /// Apply a single adjustment op (its value read from `a`). Inactive ops do nothing.
 fn apply_op(rgba: &mut [u8], w: usize, h: usize, op: OpKind, a: &Adjust) {
     match op {
-        OpKind::Pixelate => {
-            // Mosaic: replace each bs×bs block with its mean (alpha untouched, so
-            // the sprite's silhouette stays crisp).
-            let bs = a.pixelate.round() as usize;
-            if bs >= 2 && w > 0 && h > 0 {
-                pixelate_blocks(rgba, w, h, bs);
-            }
-        }
         OpKind::Brightness => {
             if a.brightness != 0.0 {
                 let b = a.brightness * 255.0;
@@ -17772,7 +18280,8 @@ fn apply_op(rgba: &mut [u8], w: usize, h: usize, op: OpKind, a: &Adjust) {
             }
         }
         // Marker ops — handled directly by apply_pipeline, never here.
-        OpKind::Palette
+        OpKind::Pixelate
+        | OpKind::Palette
         | OpKind::ColorBalance
         | OpKind::Dither
         | OpKind::Scanlines
@@ -17816,12 +18325,13 @@ fn apply_hsl(rgba: &mut [u8], f: impl Fn(f32, f32, f32) -> (f32, f32, f32)) {
 
 /// Mosaic: average the RGB of each `bs`×`bs` block over its opaque pixels and
 /// write that mean back to them. Alpha is preserved, so edges stay hard.
-fn pixelate_blocks(rgba: &mut [u8], w: usize, h: usize, bs: usize) {
+fn pixelate_blocks(rgba: &mut [u8], w: usize, h: usize, bw: usize, bh: usize) {
+    let (bw, bh) = (bw.max(1), bh.max(1));
     let mut by = 0;
     while by < h {
         let mut bx = 0;
         while bx < w {
-            let (y1, x1) = ((by + bs).min(h), (bx + bs).min(w));
+            let (y1, x1) = ((by + bh).min(h), (bx + bw).min(w));
             let (mut sr, mut sg, mut sb, mut n) = (0u32, 0u32, 0u32, 0u32);
             for y in by..y1 {
                 for x in bx..x1 {
@@ -17851,9 +18361,9 @@ fn pixelate_blocks(rgba: &mut [u8], w: usize, h: usize, bs: usize) {
                     }
                 }
             }
-            bx += bs;
+            bx += bw;
         }
-        by += bs;
+        by += bh;
     }
 }
 
@@ -22855,6 +23365,7 @@ mod tests {
             dither_n: 0,
             dither_scale_x: 1,
             dither_scale_y: 1,
+            pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],
             palette: Some(&pal),
@@ -22875,6 +23386,32 @@ mod tests {
             "brightness after remap lifts the red channel"
         );
         assert_ne!(last, first, "moving the palette op changes the result");
+    }
+
+    #[test]
+    fn fx_preset_serde_roundtrips_and_defaults_missing() {
+        let p = FxPreset {
+            name: "test".into(),
+            color: Some([10, 20, 30]),
+            quantize_on: true,
+            quantize_n: 8,
+            resize_on: true,
+            resize_fx: 0.5,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: FxPreset = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "test");
+        assert_eq!(back.color, Some([10, 20, 30]));
+        assert_eq!(back.quantize_n, 8);
+        assert!(back.resize_on);
+        assert_eq!(back.resize_fx, 0.5);
+        // #[serde(default)] fills fields a partial/older record omitted (dither_amount
+        // defaults to 1.0, not f32's 0) — so old presets keep loading as the layout grows.
+        let partial: FxPreset = serde_json::from_str(r#"{"name":"old"}"#).unwrap();
+        assert_eq!(partial.name, "old");
+        assert_eq!(partial.dither_amount, 1.0);
+        assert_eq!(partial.quantize_n, 16);
     }
 
     #[test]
@@ -22938,6 +23475,36 @@ mod tests {
     }
 
     #[test]
+    fn pixelate_blocks_are_per_axis() {
+        // A vertical gradient: rows 0-1 black, rows 2-3 white.
+        let band = || -> Vec<u8> {
+            let mut b = vec![0u8; 4 * 4 * 4];
+            for y in 0..4 {
+                for x in 0..4 {
+                    let v = if y < 2 { 0 } else { 200 };
+                    let i = (y * 4 + x) * 4;
+                    b[i] = v;
+                    b[i + 1] = v;
+                    b[i + 2] = v;
+                    b[i + 3] = 255;
+                }
+            }
+            b
+        };
+        let at = |b: &[u8], x: usize, y: usize| b[(y * 4 + x) * 4];
+        // A 4-wide × 2-tall block aligns with the bands → they're preserved.
+        let mut wide = band();
+        pixelate_blocks(&mut wide, 4, 4, 4, 2);
+        assert_eq!(at(&wide, 0, 0), 0);
+        assert_eq!(at(&wide, 3, 2), 200);
+        // A 4×4 (square) block averages both bands together → 100 everywhere.
+        let mut square = band();
+        pixelate_blocks(&mut square, 4, 4, 4, 4);
+        assert_eq!(at(&square, 0, 0), 100);
+        assert_eq!(at(&square, 3, 3), 100);
+    }
+
+    #[test]
     fn phosphor_masks_rgb_stripes() {
         // White, 1px stripes, full amount → each column keeps one channel.
         let mut b = vec![255u8; 3 * 4];
@@ -22969,6 +23536,7 @@ mod tests {
             dither_n: 0,
             dither_scale_x: 1,
             dither_scale_y: 1,
+            pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],
             palette: None,

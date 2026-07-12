@@ -38,6 +38,9 @@ icy_parser_core = { git = "https://github.com/mkrueger/icy_tools", rev = "68d4b4
 # Browse 16colo.rs as a virtual disk: HTTPS for the JSON API + pack-zip downloads.
 ureq = "2"
 serde_json = "1"
+# derive Serialize/Deserialize for persisted structs (e.g. FxPreset). serde +
+# serde_derive are already in the tree via eframe/serde_json; this just exposes it.
+serde = { version = "1", features = ["derive"] }
 # Native open-folder / open-file dialogs on Linux, macOS, Windows.
 rfd = "0.15"
 trash = "5.2.6"

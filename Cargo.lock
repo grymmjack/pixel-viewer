@@ -3544,6 +3544,7 @@ dependencies = [
  "rodio",
  "rusqlite",
  "rustysynth",
+ "serde",
  "serde_json",
  "symphonia 0.6.0",
  "trash",
