@@ -808,12 +808,14 @@ pub struct PixelView {
     wave_view: Option<(f32, f32)>, // zoomed view window (start,end secs); None = whole file (transient)
     env_edit: bool, // amp-envelope edit mode: overlay the ADSR curve + draggable handles on the
     // waveform while drilled into a pad (transient; reset on Back / navigation)
+    env_grid: bool, // draw a BPM beat-division grid in the envelope editor (persisted)
+    env_snap: bool, // snap dragged envelope nodes to that grid (persisted)
     sel_undo: Vec<(f32, f32)>, // selection history: previous (start,end)s for undo (transient)
     sel_redo: Vec<(f32, f32)>, // undone selections, for redo (transient)
     sel_undo_pending: Option<(f32, f32)>, // pre-change selection, pushed to sel_undo on commit
     play_from_mark: Option<f32>, // where the last middle-click started playback (neon ▶ marker)
     zoom_edit_pct: u32, // "Zoom Edit %": magnification of the edge inset (0 = off); persisted
-    wave_amp: f32,      // waveform vertical magnification (1 = normal); persisted
+    wave_amp: f32,  // waveform vertical magnification (1 = normal); persisted
     // Transient / BPM / musical-grid state (item 10). Marks are detected times (secs), cached for
     // the current buffer and recomputed when the sensitivity or buffer changes.
     transients_on: bool,  // detect + draw transient guideline markers (persisted)
@@ -1251,6 +1253,8 @@ impl PixelView {
     const BPM_KEY: &'static str = "bpm";
     const MUSICAL_KEY: &'static str = "musical_on";
     const MUSICAL_DIV_KEY: &'static str = "musical_div";
+    const ENV_GRID_KEY: &'static str = "env_grid";
+    const ENV_SNAP_KEY: &'static str = "env_snap";
     const MIDI_FOLLOW_KEY: &'static str = "midi_follow";
     const KIT_MAP_LOCK_KEY: &'static str = "kit_map_lock";
     const RECOLOR_KEY: &'static str = "show_recolor";
@@ -1838,6 +1842,8 @@ impl PixelView {
             nudge_lock: None,
             wave_view: None,
             env_edit: false,
+            env_grid: get_bool(Self::ENV_GRID_KEY).unwrap_or(false),
+            env_snap: get_bool(Self::ENV_SNAP_KEY).unwrap_or(false),
             zoom_edit_pct: cc
                 .storage
                 .and_then(|s| eframe::get_value::<u32>(s, Self::ZOOM_EDIT_KEY))
@@ -3069,6 +3075,18 @@ impl PixelView {
         self.note_flash.retain(|_, t| now - *t < 1.0); // bound the map
         self.note_flash.insert(note, now);
         self.want_repaint = true; // animate the key-light fade
+    }
+
+    /// The envelope grid's beat-division step in seconds, from the shared BPM + `musical_div`
+    /// (whole/half/quarter/…). `None` when the BPM is unusable. Reused to both draw the grid and
+    /// snap dragged nodes, so they always agree.
+    fn env_grid_step(&self) -> Option<f32> {
+        if self.bpm <= 1.0 {
+            return None;
+        }
+        let beats = [4.0f32, 2.0, 1.0, 0.5, 0.25, 0.125][self.musical_div.min(5) as usize];
+        let step = (60.0 / self.bpm) * beats;
+        (step > 1e-4).then_some(step)
     }
 
     /// When the amp envelope is switched on with an all-neutral ADSR, seed a gentle, visibly
@@ -4874,6 +4892,38 @@ impl PixelView {
                                     .suffix(" s")
                                     .max_decimals(3),
                             );
+                            // BPM grid + node snapping for the on-waveform editor (while it's open).
+                            // BPM + division are shared with the waveform's Musical grid.
+                            if self.env_edit {
+                                ui.separator();
+                                ui.checkbox(&mut self.env_grid, "Grid").on_hover_text(
+                                    "Draw a BPM beat-division grid in the envelope editor",
+                                );
+                                ui.checkbox(&mut self.env_snap, "Snap").on_hover_text(
+                                    "Snap dragged envelope nodes to the grid (attack/decay/release \
+                                     land on a beat)",
+                                );
+                                ui.weak("BPM");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.bpm)
+                                        .range(20.0..=300.0)
+                                        .speed(0.5)
+                                        .max_decimals(1),
+                                );
+                                const DIVS: [&str; 6] =
+                                    ["whole", "half", "quarter", "eighth", "sixteenth", "32nd"];
+                                egui::ComboBox::from_id_salt("env_grid_div")
+                                    .selected_text(DIVS[self.musical_div.min(5) as usize])
+                                    .show_ui(ui, |ui| {
+                                        for (di, name) in DIVS.iter().enumerate() {
+                                            ui.selectable_value(
+                                                &mut self.musical_div,
+                                                di as u8,
+                                                *name,
+                                            );
+                                        }
+                                    });
+                            }
                         }
                     });
                 }
@@ -5428,6 +5478,25 @@ impl PixelView {
             // ---- Amp-envelope overlay (edit the ADSR curve directly on the waveform) ----
             if env_editing {
                 if let EditFocus::Pad(pi) = self.edit_focus {
+                    // BPM beat-division grid (draws under the curve) + node snapping share one step.
+                    let grid_step = self.env_grid_step();
+                    if self.env_grid {
+                        if let Some(step) = grid_step {
+                            let gcol = egui::Color32::from_rgba_unmultiplied(120, 160, 255, 60);
+                            let mut g = (vs / step).floor() * step;
+                            while g <= ve {
+                                if g >= vs {
+                                    p.vline(x_of(g), rect.y_range(), egui::Stroke::new(1.0, gcol));
+                                }
+                                g += step;
+                            }
+                        }
+                    }
+                    // Snap a node's absolute time to the nearest grid line (when Snap is on).
+                    let snap = |t: f32| match grid_step.filter(|_| self.env_snap) {
+                        Some(step) => (t / step).round() * step,
+                        None => t,
+                    };
                     // Read the pad's ADSR (immutable — the player is borrowed); edits are deferred
                     // into `want_env` and applied after this block.
                     let mut a = self.pads[pi].amp_attack;
@@ -5479,15 +5548,17 @@ impl PixelView {
                             None
                         }
                     };
+                    // Nodes snap their ABSOLUTE time to the grid: attack ends at `a`, decay ends at
+                    // `a+d`, release starts at `dur-rel` — so a snapped node lands on a beat.
                     if let Some(pp) = do_handle("attack", pa) {
-                        a = t_at(pp.x).clamp(0.0, dur);
+                        a = snap(t_at(pp.x)).clamp(0.0, dur);
                     }
                     if let Some(pp) = do_handle("decay", pd) {
-                        d = (t_at(pp.x) - a).clamp(0.0, dur);
+                        d = (snap(t_at(pp.x)) - a).clamp(0.0, dur);
                         s = level_at(pp.y);
                     }
                     if let Some(pp) = do_handle("release", pr) {
-                        rel = (dur - t_at(pp.x)).clamp(0.0, dur);
+                        rel = (dur - snap(t_at(pp.x))).clamp(0.0, dur);
                     }
                     // Compact label so it's clear you're in envelope-edit mode.
                     p.text(
@@ -17370,6 +17441,8 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::BPM_KEY, &self.bpm);
         eframe::set_value(storage, Self::MUSICAL_KEY, &self.musical_on);
         eframe::set_value(storage, Self::MUSICAL_DIV_KEY, &self.musical_div);
+        eframe::set_value(storage, Self::ENV_GRID_KEY, &self.env_grid);
+        eframe::set_value(storage, Self::ENV_SNAP_KEY, &self.env_snap);
         eframe::set_value(storage, Self::MIDI_FOLLOW_KEY, &self.midi_follow);
         eframe::set_value(storage, Self::KIT_MAP_LOCK_KEY, &self.kit_map_lock);
         eframe::set_value(storage, Self::ZOOM_KEY, &self.ui_zoom);
