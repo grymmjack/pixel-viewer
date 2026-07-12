@@ -1027,12 +1027,24 @@ already carried a non-default ADSR) and **export to native SFZ** (`pan`, `group`
 and `ampeg_*` **only when the envelope is enabled** — off ⇒ the region plays raw with no `ampeg_*`).
 **Visual ADSR editor:** the drill-in row's **`[x] (AMP ENVELOPE)`** — a checkbox to enable + a button
 that toggles `env_edit`, an **on-waveform overlay** (`env_editing = big && env_edit && drilled into a
-pad`) drawing the ADSR contour + three draggable handles (attack X · decay+sustain X·Y · release X)
-right on the waveform. The overlay's handles are `ui.interact` widgets allocated *after* the waveform
-`resp` (so a grab claims the pointer) and the selection drag-start is gated off while `env_editing`;
-handle edits defer through `want_env` (the player is borrowed immutably while drawing). Enabling a flat
-envelope seeds a gentle starter shape (`seed_pad_env_if_flat`) so the handles aren't stacked. `env_edit`
-is transient (reset on `focus_back` / navigation). Pads **auto-map chromatically from a base note** (`pad_base_note`,
+pad`) drawing the ADSR contour + draggable handles right on the waveform. **Node handles** (circles):
+attack X · decay+sustain X·Y · release X. **Curvature handles** (diamonds at each segment midpoint):
+drag vertically to **bow the segment** (`Pad::amp_{attack,decay,release}_curve` −1..1, baked via
+`curve_shape` = `t^(2^3c)`; falling segments invert the drag sign so up always bows up). The overlay's
+handles are `ui.interact` widgets allocated *after* the waveform `resp` (so a grab claims the pointer;
+`Ui::interact` is `&self` so both handle closures can borrow `ui` at once) and the selection
+drag-start is gated off while `env_editing`; edits defer through `want_env: (usize, [f32; 7])`
+(a/d/s/rel + 3 curves — the player is borrowed immutably while drawing). Enabling a flat envelope
+seeds a gentle starter shape (`seed_pad_env_if_flat`) so the handles aren't stacked. `env_edit` is
+transient (reset on `focus_back` / navigation). A **live pad-voice playhead** (`pad_voice_pos`) sweeps
+across while the pad sounds. **BPM grid + snap** (`env_grid`/`env_snap`, persisted; share `self.bpm`
++ `musical_div` with the waveform's Musical grid via `env_grid_step`): draw beat-division lines in the
+overlay and optionally snap each node's absolute time to the nearest beat. **Curve export is hybrid**
+— a linear envelope stays **v1 `ampeg_*`** (universal); a curved one is written as an **SFZ v2 flex EG**
+(`eg01_amplitude=100` + `eg01_timeN`/`levelN`/`shapeN`, `sustain=3`) where `egN_shapeX` carries the
+curvature (`c·8`; ARIA/sforzando/Bitwig read it — exact curve rendering is player-dependent). Flex EGs
+can target far more than amplitude (`egN_pitch`/`cutoff`/`pan`/`eqNgain`…), so this editor is reusable
+for a future pitch/filter env. Pads **auto-map chromatically from a base note** (`pad_base_note`,
 default 48 = C3, a header dropdown); `pad_note(i)` = the individual override (MIDI-learn / a pinned
 key-lock) or `base + i`. Per pad: ⟲ load (captures the current editor
 selection → `load_pad`, WAV write-through to `<data>/pads/pad_NN.wav`), **e** drill-in editor

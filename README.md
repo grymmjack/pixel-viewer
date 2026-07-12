@@ -487,7 +487,13 @@ The audio player goes further than playback:
   thing as an **SFZ instrument** — a `.sfz` next to a `<name>_samples/` folder of 16-bit WAVs that
   loads in any SFZ-capable sampler or DAW (Bitwig, sforzando, TX16Wx, Kontakt via convert, …). Each
   pad becomes a mapped region carrying its note, volume, pan, pitch, loop (forward/reverse), choke
-  group (`group`/`off_by`), amplitude envelope (`ampeg_*`) and velocity tracking — all native SFZ.
+  group (`group`/`off_by`), amplitude envelope and velocity tracking — all native SFZ.
+- **Shape the amp envelope right on the waveform.** Click **`e`** on a pad, enable **AMP ENVELOPE**,
+  and edit the ADSR **visually** — drag the round **node** handles (attack / decay+sustain / release)
+  and the diamond **curvature** handles (bow each segment concave/convex). A **live playhead** sweeps
+  across as the pad plays so you can see the envelope shaping the sound, and an optional **BPM beat
+  grid** lets you snap the nodes to tempo. A linear envelope exports as universal SFZ `ampeg_*`; a
+  curved one exports as an SFZ v2 **flex EG** (`egN_shape*`) that ARIA-based samplers read.
 - **Browse a sample bank as a folder.** A **SoundFont (`.sf2`)**, **SFZ (`.sfz`)**, **DLS
   (`.dls`)**, **FastTracker II instrument (`.xi`)**, or **Renoise song/instrument
   (`.xrns`/`.xrni`)** shows as an enterable "folder"; its Details pane reports what's inside
