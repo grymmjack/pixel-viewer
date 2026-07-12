@@ -956,6 +956,10 @@ pub struct PixelView {
     balance_strength: f32,   // color-balance op: 0..1 amount
     balance_hex: String,     // live buffer for the hex paste field
     quantize_cache: Option<(PathBuf, usize, Vec<[u8; 4]>)>, // memoized reduction
+    // Colors to feed the Reduce median-cut when the image has too many colors to
+    // extract a swatch palette (`palettes[path]` is `Some(None)`): its pixels
+    // sampled once from a thumbnail decode, cached so changing N doesn't re-decode.
+    reduce_src: Option<(PathBuf, Vec<[u8; 4]>)>,
     // GPL palette library (palette-swap preview).
     palette_dir: PathBuf,                            // where the .gpl files live
     palette_files: Vec<PathBuf>,                     // scanned *.gpl in palette_dir
@@ -1886,6 +1890,7 @@ impl PixelView {
             balance_strength,
             balance_hex,
             quantize_cache: None,
+            reduce_src: None,
             palette_dir,
             palette_files,
             palette_favorites,
@@ -8178,8 +8183,43 @@ impl PixelView {
     }
 
     /// Right dock: live details for the hovered (grid) or current (single) entry.
-    /// Median-cut `full` to `quantize_n` colors, memoized by (path, N).
-    fn reduce_palette(&mut self, path: &Path, full: &[[u8; 4]]) -> Vec<[u8; 4]> {
+    /// The colors "Reduce to N" quantizes for `path`: the image's own extracted
+    /// palette when it has one (≤ `SWATCH_CAP` distinct colors), else — for a photo
+    /// or gradient with too many colors to extract a swatch palette — its pixels
+    /// sampled from a thumbnail decode. This is what lets Reduce work on a
+    /// >`SWATCH_CAP`-color image: we synthesize a palette from the pixels and
+    /// median-cut *that*. Cached in `reduce_src` so changing N doesn't re-decode.
+    fn reduce_source(&mut self, path: &Path) -> Option<Vec<[u8; 4]>> {
+        if let Some(Some(pal)) = self.palettes.get(path) {
+            return Some(pal.clone()); // the authoritative extracted palette
+        }
+        if let Some((p, cols)) = &self.reduce_src {
+            if p == path {
+                return Some(cols.clone());
+            }
+        }
+        // No extractable palette. Sample the image's colors: reuse the cached thumb
+        // pixels if the grid already decoded them, else decode a thumbnail of the
+        // real file (16colo/archive art lives at a cache path, not the virtual one).
+        let cached = self.thumb_rgba.get(path).map(|(_, _, rgba)| rgba.clone());
+        let rgba = match cached {
+            Some(rgba) => rgba,
+            None => {
+                let real = self.resolve_local(path);
+                crate::thumb::decode_thumb(&self.registry.clone(), &real, THUMB_PX)?.2
+            }
+        };
+        let cols = crate::thumb::distinct_opaque_colors(&rgba);
+        if cols.is_empty() {
+            return None;
+        }
+        self.reduce_src = Some((path.to_path_buf(), cols.clone()));
+        Some(cols)
+    }
+
+    /// Median-cut the image's colors (see [`reduce_source`]) to `quantize_n`,
+    /// memoized by (path, N). None only when the image can't be decoded at all.
+    fn reduce_palette(&mut self, path: &Path) -> Option<Vec<[u8; 4]>> {
         let n = self.quantize_n.clamp(2, 256);
         let stale = self
             .quantize_cache
@@ -8187,9 +8227,11 @@ impl PixelView {
             .map(|(p, cn, _)| p != path || *cn != n)
             .unwrap_or(true);
         if stale {
-            self.quantize_cache = Some((path.to_path_buf(), n, crate::thumb::median_cut(full, n)));
+            let src = self.reduce_source(path)?;
+            self.quantize_cache =
+                Some((path.to_path_buf(), n, crate::thumb::median_cut(&src, n)));
         }
-        self.quantize_cache.as_ref().unwrap().2.clone()
+        Some(self.quantize_cache.as_ref().unwrap().2.clone())
     }
 
     /// Parse + cache a `.gpl` palette file. None if unreadable or empty.
@@ -8279,8 +8321,7 @@ impl PixelView {
             return Some((format!("pal:{}", pp.display()), pal));
         }
         if self.quantize_on {
-            let full = self.palettes.get(path)?.clone()?;
-            let reduced = self.reduce_palette(path, &full);
+            let reduced = self.reduce_palette(path)?;
             return Some((format!("reduce:{}", self.quantize_n), reduced));
         }
         None
@@ -8319,8 +8360,16 @@ impl PixelView {
             return self.load_gpl(&pp);
         }
         if self.quantize_on {
-            let full = self.palettes.get(path)?.clone()?;
-            return Some(crate::thumb::median_cut(&full, self.quantize_n));
+            // This tile's own colors reduced to N: prefer its extracted palette,
+            // else sample the thumb's pixels so a >SWATCH_CAP photo tile reduces too.
+            let src = match self.palettes.get(path) {
+                Some(Some(pal)) => pal.clone(),
+                _ => crate::thumb::distinct_opaque_colors(&self.thumb_rgba.get(path)?.2),
+            };
+            if src.is_empty() {
+                return None;
+            }
+            return Some(crate::thumb::median_cut(&src, self.quantize_n));
         }
         None
     }
@@ -9262,7 +9311,7 @@ impl PixelView {
                 } else if matches!(pal_state, Some(None)) {
                     ui.add_space(4.0);
                     ui.weak(format!(
-                        "(image itself has > {} colors — pick a palette below)",
+                        "(image itself has > {} colors — Reduce or pick a palette below)",
                         crate::thumb::SWATCH_CAP
                     ));
                 }
@@ -9641,6 +9690,10 @@ impl PixelView {
                     ui.add_space(8.0);
                     ui.separator();
                     let has_own_palette = matches!(pal_state, Some(Some(_)));
+                    // Reduce works on ANY image: with an extractable palette it
+                    // median-cuts that; otherwise it synthesizes a palette from the
+                    // pixels (see `reduce_source`) and cuts *that*. So it's no longer
+                    // gated on `has_own_palette` — a >SWATCH_CAP photo can reduce too.
                     // Deferred so the favorites/list loops can borrow self.palette_*
                     // while we decide what to select. Some(None) = clear (Original).
                     let mut pick: Option<Option<PathBuf>> = None;
@@ -9662,17 +9715,14 @@ impl PixelView {
                     {
                         let mut on = active_reduce;
                         if ui
-                            .add_enabled(
-                                has_own_palette,
-                                egui::Checkbox::new(
-                                    &mut on,
-                                    format!("Reduce to {} colors", self.quantize_n),
-                                ),
+                            .checkbox(
+                                &mut on,
+                                format!("Reduce to {} colors", self.quantize_n),
                             )
                             .on_hover_text(if has_own_palette {
                                 "Median-cut this image's own palette down to N colors"
                             } else {
-                                "This image has too many colors to extract a palette"
+                                "Build a palette from the image's pixels, then reduce to N colors"
                             })
                             .changed()
                         {
@@ -9706,18 +9756,16 @@ impl PixelView {
                         });
                     }
                     // Quick reduction presets.
-                    ui.add_enabled_ui(has_own_palette, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.weak("Quick");
-                            for nq in [4usize, 8, 16, 32] {
-                                if ui.button(nq.to_string()).clicked() {
-                                    self.quantize_n = nq;
-                                    self.quantize_on = true;
-                                    self.selected_palette = None;
-                                    self.custom_palette = None;
-                                }
+                    ui.horizontal(|ui| {
+                        ui.weak("Quick");
+                        for nq in [4usize, 8, 16, 32] {
+                            if ui.button(nq.to_string()).clicked() {
+                                self.quantize_n = nq;
+                                self.quantize_on = true;
+                                self.selected_palette = None;
+                                self.custom_palette = None;
                             }
-                        });
+                        }
                     });
                     self.quantize_n = self.quantize_n.clamp(2, 256);
 

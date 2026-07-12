@@ -161,6 +161,25 @@ fn extract_palette(img: &PixImage) -> Option<Vec<[u8; 4]>> {
     Some(v)
 }
 
+/// Collect the distinct fully-opaque colors from a raw RGBA byte buffer (4 bytes
+/// per pixel). Unlike [`extract_palette`] there's **no** `SWATCH_CAP` — this feeds
+/// [`median_cut`], which reduces however many colors it's given, so it's how
+/// "Reduce to N" builds a palette for a >`SWATCH_CAP` (photo/gradient) image that
+/// has no useful swatch palette of its own. Transparent + partial-alpha pixels are
+/// skipped (as in `extract_palette`); the result is sorted for determinism.
+pub fn distinct_opaque_colors(rgba: &[u8]) -> Vec<[u8; 4]> {
+    let mut seen: HashSet<[u8; 4]> = HashSet::with_capacity(4096);
+    for px in rgba.chunks_exact(4) {
+        if px[3] != 255 {
+            continue; // only fully-opaque pixels (skip transparent + AA edges)
+        }
+        seen.insert([px[0], px[1], px[2], 255]);
+    }
+    let mut v: Vec<[u8; 4]> = seen.into_iter().collect();
+    v.sort();
+    v
+}
+
 /// Parse a GIMP `.gpl` palette into opaque RGBA colors. Skips the header lines
 /// (`GIMP Palette`, `Name:`, `Columns:`), `#` comments and blanks; each color
 /// line is `R G B [name]` with space- or tab-separated 0..255 channels.
@@ -700,6 +719,34 @@ mod tests {
             .collect();
         let img = PixImage::from_rgba(n, 1, pixels);
         assert_eq!(extract_palette(&img), None);
+    }
+
+    #[test]
+    fn distinct_opaque_colors_dedupes_and_skips_transparent() {
+        // 4 pixels: two identical red, one transparent (skipped), one blue.
+        let rgba: Vec<u8> = vec![
+            255, 0, 0, 255, // red
+            255, 0, 0, 255, // red (dup)
+            9, 9, 9, 0, // fully transparent — skipped
+            0, 0, 255, 255, // blue
+        ];
+        let cols = distinct_opaque_colors(&rgba);
+        assert_eq!(cols, vec![[0, 0, 255, 255], [255, 0, 0, 255]]);
+    }
+
+    #[test]
+    fn distinct_opaque_colors_has_no_swatch_cap() {
+        // Unlike `extract_palette`, this feeds median_cut and keeps ALL colors —
+        // that's what lets a >SWATCH_CAP image be reduced. Reducing it works.
+        let n = (SWATCH_CAP + 500) as u32;
+        let mut rgba = Vec::with_capacity(n as usize * 4);
+        for i in 0..n {
+            rgba.extend_from_slice(&[(i % 256) as u8, (i / 256) as u8, (i * 7 % 256) as u8, 255]);
+        }
+        let cols = distinct_opaque_colors(&rgba);
+        assert!(cols.len() > SWATCH_CAP, "no cap: {} colors kept", cols.len());
+        let reduced = median_cut(&cols, 16);
+        assert!(!reduced.is_empty() && reduced.len() <= 16);
     }
 
     #[test]
