@@ -1015,14 +1015,24 @@ drag can't shrink them into a black sliver. A `Pad` (`pads: Vec<Pad>`, always
 16) holds `buf: Option<Arc<SampleBuf>>`, an assigned MIDI `note`, `volume`/`muted`/`soloed`, and
 per-pad **pitch / loop region / loop_on / loop_type (Forward/Reverse/Ping-pong)** + a **`note_lock`
 key-lock** (see drag-move below), plus **`pan`** (−1..1), a **`choke_group`** (0 = none, 1–8), and an
-**amplitude ADSR** (`amp_attack`/`amp_decay`/`amp_sustain`/`amp_release`). Pan is an Ableton-style
-`pan_knob` in the tile's top-right (drag vertically, double-click to center); choke + ADSR live in the
-pad drill-in editor row. All three are **baked into the voice at trigger time** — `apply_amp_env`
-shapes the region gain (release only fades a one-shot's tail; a looping pad holds sustain) and
-`apply_pan` applies an equal-power law (expanding a mono region to stereo → `trigger_pad_voice` takes
-an explicit `channels`); a **choke** stops every other live voice sharing the group before the new one
-starts. All persist in `Pad::record`/`from_record` (appended fields 15–20, defaults for old kits) and
-**export to native SFZ** (`pan`, `group`/`off_by`/`off_mode=fast`, `ampeg_*`). Pads **auto-map chromatically from a base note** (`pad_base_note`,
+**amplitude ADSR** (`amp_env_on` gate + `amp_attack`/`amp_decay`/`amp_sustain`/`amp_release`). Pan is
+an Ableton-style `pan_knob` in the tile's top-right (drag vertically, double-click to center); choke +
+the envelope controls live in the pad drill-in editor row. All are **baked into the voice at trigger
+time** — `apply_amp_env` shapes the region gain **only when `amp_env_on`** (release fades a one-shot's
+tail; a looping pad holds sustain) and `apply_pan` applies an equal-power law (expanding a mono region
+to stereo → `trigger_pad_voice` takes an explicit `channels`); a **choke** stops every other live voice
+sharing the group before the new one starts. All persist in `Pad::record`/`from_record` (appended
+fields 15–21, defaults for old kits; `amp_env_on` at 21 is inferred true for a pre-field kit that
+already carried a non-default ADSR) and **export to native SFZ** (`pan`, `group`/`off_by`/`off_mode=fast`,
+and `ampeg_*` **only when the envelope is enabled** — off ⇒ the region plays raw with no `ampeg_*`).
+**Visual ADSR editor:** the drill-in row's **`[x] (AMP ENVELOPE)`** — a checkbox to enable + a button
+that toggles `env_edit`, an **on-waveform overlay** (`env_editing = big && env_edit && drilled into a
+pad`) drawing the ADSR contour + three draggable handles (attack X · decay+sustain X·Y · release X)
+right on the waveform. The overlay's handles are `ui.interact` widgets allocated *after* the waveform
+`resp` (so a grab claims the pointer) and the selection drag-start is gated off while `env_editing`;
+handle edits defer through `want_env` (the player is borrowed immutably while drawing). Enabling a flat
+envelope seeds a gentle starter shape (`seed_pad_env_if_flat`) so the handles aren't stacked. `env_edit`
+is transient (reset on `focus_back` / navigation). Pads **auto-map chromatically from a base note** (`pad_base_note`,
 default 48 = C3, a header dropdown); `pad_note(i)` = the individual override (MIDI-learn / a pinned
 key-lock) or `base + i`. Per pad: ⟲ load (captures the current editor
 selection → `load_pad`, WAV write-through to `<data>/pads/pad_NN.wav`), **e** drill-in editor

@@ -806,10 +806,12 @@ pub struct PixelView {
     // it, else the non-owner maps the global pointer through its own (far-away) rect and clobbers it
     nudge_lock: Option<(Edge, f32)>, // (edge, last wheel-nudge time): keep nudging it as it drifts
     wave_view: Option<(f32, f32)>, // zoomed view window (start,end secs); None = whole file (transient)
-    sel_undo: Vec<(f32, f32)>,     // selection history: previous (start,end)s for undo (transient)
-    sel_redo: Vec<(f32, f32)>,     // undone selections, for redo (transient)
+    env_edit: bool, // amp-envelope edit mode: overlay the ADSR curve + draggable handles on the
+    // waveform while drilled into a pad (transient; reset on Back / navigation)
+    sel_undo: Vec<(f32, f32)>, // selection history: previous (start,end)s for undo (transient)
+    sel_redo: Vec<(f32, f32)>, // undone selections, for redo (transient)
     sel_undo_pending: Option<(f32, f32)>, // pre-change selection, pushed to sel_undo on commit
-    play_from_mark: Option<f32>,   // where the last middle-click started playback (neon ▶ marker)
+    play_from_mark: Option<f32>, // where the last middle-click started playback (neon ▶ marker)
     zoom_edit_pct: u32, // "Zoom Edit %": magnification of the edge inset (0 = off); persisted
     wave_amp: f32,      // waveform vertical magnification (1 = normal); persisted
     // Transient / BPM / musical-grid state (item 10). Marks are detected times (secs), cached for
@@ -1835,6 +1837,7 @@ impl PixelView {
             play_from_mark: None,
             nudge_lock: None,
             wave_view: None,
+            env_edit: false,
             zoom_edit_pct: cc
                 .storage
                 .and_then(|s| eframe::get_value::<u32>(s, Self::ZOOM_EDIT_KEY))
@@ -3012,16 +3015,20 @@ impl PixelView {
         // (which may turn a mono region stereo — carry its channel count to the voice).
         let ch = buf.channels.get() as usize;
         let sr = buf.sample_rate.get() as f32;
-        let region = apply_amp_env(
-            region,
-            ch,
-            sr,
-            pad.amp_attack,
-            pad.amp_decay,
-            pad.amp_sustain,
-            pad.amp_release,
-            !pad.loop_on,
-        );
+        let region = if pad.amp_env_on {
+            apply_amp_env(
+                region,
+                ch,
+                sr,
+                pad.amp_attack,
+                pad.amp_decay,
+                pad.amp_sustain,
+                pad.amp_release,
+                !pad.loop_on,
+            )
+        } else {
+            region
+        };
         let (region, eff_ch) = apply_pan(region, ch, pad.pan);
         let channels = std::num::NonZeroU16::new(eff_ch as u16).unwrap_or(buf.channels);
         let (pitch, loop_it) = (pad.pitch, pad.loop_on);
@@ -3050,6 +3057,25 @@ impl PixelView {
         self.note_flash.retain(|_, t| now - *t < 1.0); // bound the map
         self.note_flash.insert(note, now);
         self.want_repaint = true; // animate the key-light fade
+    }
+
+    /// When the amp envelope is switched on with an all-neutral ADSR, seed a gentle, visibly
+    /// editable starter shape — otherwise the overlay's attack/decay/release handles stack at the
+    /// top-left (a≈0, d≈0, s≈1) and can't be grabbed individually.
+    fn seed_pad_env_if_flat(&mut self, i: usize) {
+        let Some(p) = self.pads.get_mut(i) else {
+            return;
+        };
+        let flat = p.amp_attack < 1e-4
+            && p.amp_decay < 1e-4
+            && (p.amp_sustain - 1.0).abs() < 1e-4
+            && p.amp_release < 1e-4;
+        if flat {
+            p.amp_attack = 0.01;
+            p.amp_decay = 0.10;
+            p.amp_sustain = 0.75;
+            p.amp_release = 0.15;
+        }
     }
 
     /// Load the current editor buffer (selection region if set, else the whole sample) into pad
@@ -3131,6 +3157,7 @@ impl PixelView {
             // Reloading a sample onto a configured pad keeps its mix shaping (like note/pitch/color).
             pan: if old.is_empty() { 0.0 } else { old.pan },
             choke_group: if old.is_empty() { 0 } else { old.choke_group },
+            amp_env_on: !old.is_empty() && old.amp_env_on,
             amp_attack: if old.is_empty() { 0.0 } else { old.amp_attack },
             amp_decay: if old.is_empty() { 0.0 } else { old.amp_decay },
             amp_sustain: if old.is_empty() { 1.0 } else { old.amp_sustain },
@@ -3250,6 +3277,7 @@ impl PixelView {
     /// stashed editor buffer + focus (the song / tracker sample you were on before).
     fn focus_back(&mut self) {
         self.wave_view = None; // leaving a pad drill-in resets the zoom
+        self.env_edit = false; // and closes the amp-envelope overlay
         self.transient_dirty = true;
         self.clear_sel_history();
         if let (EditFocus::Pad(i), Some(ap)) = (self.edit_focus, self.audio_player.as_ref()) {
@@ -3469,22 +3497,25 @@ impl PixelView {
                 let g = pad.choke_group;
                 sfz.push_str(&format!("group={g}\noff_by={g}\noff_mode=fast\n"));
             }
-            // Amplitude ADSR (`ampeg_*`; sustain is a percentage in SFZ). Emit only non-default
-            // stages so a plain pad stays terse.
-            if pad.amp_attack > 1e-4 {
-                sfz.push_str(&format!("ampeg_attack={:.3}\n", pad.amp_attack));
-            }
-            if pad.amp_decay > 1e-4 {
-                sfz.push_str(&format!("ampeg_decay={:.3}\n", pad.amp_decay));
-            }
-            if (pad.amp_sustain - 1.0).abs() > 1e-4 {
-                sfz.push_str(&format!(
-                    "ampeg_sustain={:.1}\n",
-                    pad.amp_sustain.clamp(0.0, 1.0) * 100.0
-                ));
-            }
-            if pad.amp_release > 1e-4 {
-                sfz.push_str(&format!("ampeg_release={:.3}\n", pad.amp_release));
+            // Amplitude ADSR (`ampeg_*`; sustain is a percentage in SFZ). Only when the pad's
+            // envelope is enabled — off ⇒ omit it entirely (the sample plays raw). Emit only
+            // non-default stages so a plain pad stays terse.
+            if pad.amp_env_on {
+                if pad.amp_attack > 1e-4 {
+                    sfz.push_str(&format!("ampeg_attack={:.3}\n", pad.amp_attack));
+                }
+                if pad.amp_decay > 1e-4 {
+                    sfz.push_str(&format!("ampeg_decay={:.3}\n", pad.amp_decay));
+                }
+                if (pad.amp_sustain - 1.0).abs() > 1e-4 {
+                    sfz.push_str(&format!(
+                        "ampeg_sustain={:.1}\n",
+                        pad.amp_sustain.clamp(0.0, 1.0) * 100.0
+                    ));
+                }
+                if pad.amp_release > 1e-4 {
+                    sfz.push_str(&format!("ampeg_release={:.3}\n", pad.amp_release));
+                }
             }
             if pad.loop_on {
                 let (ls, le) = pad.loop_region(*dur);
@@ -4573,6 +4604,9 @@ impl PixelView {
         let mut want_select: Option<(f32, f32)> = None;
         let mut want_commit = false;
         let mut want_seek: Option<f32> = None;
+        // Amp-envelope overlay edit → deferred (pad, attack, decay, sustain, release), applied after
+        // the `ap` borrow ends (the handles are drawn while the player is borrowed immutably).
+        let mut want_env: Option<(usize, f32, f32, f32, f32)> = None;
         let mut want_play_at: Option<f32> = None; // middle-click the waveform → play from here
         let mut want_play_region = false; // play the current selection now (middle-click transient slice)
         let mut want_sel_undo = false; // restore the previous selection from the undo stack
@@ -4758,43 +4792,77 @@ impl PixelView {
                                     }
                                 }
                             });
-                        ui.add(egui::Label::new(egui::RichText::new("Amp env").weak()))
+                        ui.separator();
+                        // Amp envelope: [x] enable + an (AMP ENVELOPE) button that toggles the
+                        // on-waveform ADSR editor overlay. Off ⇒ raw sample (no ampeg_* in SFZ).
+                        let mut env_on = self.pads[i].amp_env_on;
+                        if ui
+                            .checkbox(&mut env_on, "")
                             .on_hover_text(
-                                "Attack / Decay / Sustain / Release — shapes the pad's volume over \
-                                 time (release fades a one-shot's tail). Baked into playback and \
-                                 exported to SFZ.",
+                                "Enable the amplitude envelope. Off = the sample plays raw (and \
+                                 no ampeg_* is written to the SFZ export).",
+                            )
+                            .changed()
+                        {
+                            self.pads[i].amp_env_on = env_on;
+                            if env_on {
+                                self.seed_pad_env_if_flat(i); // give the overlay a grabbable shape
+                            } else {
+                                self.env_edit = false; // disabling also closes the overlay
+                            }
+                        }
+                        let editing = self.env_edit;
+                        if ui
+                            .add(
+                                egui::Button::new(egui::RichText::new("AMP ENVELOPE").strong())
+                                    .selected(editing),
+                            )
+                            .on_hover_text(
+                                "Edit the ADSR curve directly on the waveform — drag the handles \
+                                 (attack · decay/sustain · release). Click to toggle the overlay.",
+                            )
+                            .clicked()
+                        {
+                            self.env_edit = !self.env_edit;
+                            if self.env_edit {
+                                self.pads[i].amp_env_on = true; // editing implies enabled
+                                self.seed_pad_env_if_flat(i);
+                            }
+                        }
+                        // Numeric fine-tune (shown while the envelope is enabled).
+                        if self.pads[i].amp_env_on {
+                            ui.weak("A");
+                            ui.add(
+                                egui::DragValue::new(&mut self.pads[i].amp_attack)
+                                    .range(0.0..=4.0)
+                                    .speed(0.005)
+                                    .suffix(" s")
+                                    .max_decimals(3),
                             );
-                        ui.weak("A");
-                        ui.add(
-                            egui::DragValue::new(&mut self.pads[i].amp_attack)
-                                .range(0.0..=4.0)
-                                .speed(0.005)
-                                .suffix(" s")
-                                .max_decimals(3),
-                        );
-                        ui.weak("D");
-                        ui.add(
-                            egui::DragValue::new(&mut self.pads[i].amp_decay)
-                                .range(0.0..=4.0)
-                                .speed(0.005)
-                                .suffix(" s")
-                                .max_decimals(3),
-                        );
-                        ui.weak("S");
-                        ui.add(
-                            egui::DragValue::new(&mut self.pads[i].amp_sustain)
-                                .range(0.0..=1.0)
-                                .speed(0.01)
-                                .max_decimals(2),
-                        );
-                        ui.weak("R");
-                        ui.add(
-                            egui::DragValue::new(&mut self.pads[i].amp_release)
-                                .range(0.0..=4.0)
-                                .speed(0.005)
-                                .suffix(" s")
-                                .max_decimals(3),
-                        );
+                            ui.weak("D");
+                            ui.add(
+                                egui::DragValue::new(&mut self.pads[i].amp_decay)
+                                    .range(0.0..=4.0)
+                                    .speed(0.005)
+                                    .suffix(" s")
+                                    .max_decimals(3),
+                            );
+                            ui.weak("S");
+                            ui.add(
+                                egui::DragValue::new(&mut self.pads[i].amp_sustain)
+                                    .range(0.0..=1.0)
+                                    .speed(0.01)
+                                    .max_decimals(2),
+                            );
+                            ui.weak("R");
+                            ui.add(
+                                egui::DragValue::new(&mut self.pads[i].amp_release)
+                                    .range(0.0..=4.0)
+                                    .speed(0.005)
+                                    .suffix(" s")
+                                    .max_decimals(3),
+                            );
+                        }
                     });
                 }
             }
@@ -4847,6 +4915,10 @@ impl PixelView {
             );
             let w = rect.width().max(1.0);
             let amp = self.wave_amp.clamp(1.0, 8.0);
+            // Amp-envelope edit mode: overlay the ADSR curve + draggable handles (big view, drilled
+            // into a pad). While on, the waveform's own selection drag is suppressed so a handle grab
+            // doesn't also carve a selection.
+            let env_editing = big && self.env_edit && matches!(self.edit_focus, EditFocus::Pad(_));
             let sr = ap.sample_rate.get() as f32;
             let ch = ap.channels.get() as usize;
             let nframes = if ch > 0 { ap.samples.len() / ch } else { 0 };
@@ -4909,7 +4981,7 @@ impl PixelView {
                 }
             };
 
-            if resp.drag_started() {
+            if resp.drag_started() && !env_editing {
                 // Anchor at the TRUE press position (`press_origin`), not the post-threshold drag
                 // pos — so a fresh selection starts exactly where the button went down (a few px of
                 // threshold slop otherwise shifted every selection's start).
@@ -5325,6 +5397,86 @@ impl PixelView {
                     egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 224, 130)),
                 );
             }
+            // ---- Amp-envelope overlay (edit the ADSR curve directly on the waveform) ----
+            if env_editing {
+                if let EditFocus::Pad(pi) = self.edit_focus {
+                    // Read the pad's ADSR (immutable — the player is borrowed); edits are deferred
+                    // into `want_env` and applied after this block.
+                    let mut a = self.pads[pi].amp_attack;
+                    let mut d = self.pads[pi].amp_decay;
+                    let mut s = self.pads[pi].amp_sustain;
+                    let mut rel = self.pads[pi].amp_release;
+                    let orig = (a, d, s, rel);
+                    let pad_y = 6.0;
+                    let span_y = (rect.height() - 2.0 * pad_y).max(1.0);
+                    let y_of = |lvl: f32| rect.bottom() - pad_y - lvl.clamp(0.0, 1.0) * span_y;
+                    let level_at = |y: f32| ((rect.bottom() - pad_y - y) / span_y).clamp(0.0, 1.0);
+                    // Key time points along the sample (release measured back from the end).
+                    let t_a = a.clamp(0.0, dur);
+                    let t_d = (a + d).clamp(0.0, dur);
+                    let t_r = (dur - rel).clamp(t_d, dur);
+                    let p0 = egui::pos2(x_of(0.0), y_of(0.0));
+                    let pa = egui::pos2(x_of(t_a), y_of(1.0));
+                    let pd = egui::pos2(x_of(t_d), y_of(s));
+                    let pr = egui::pos2(x_of(t_r), y_of(s));
+                    let pe = egui::pos2(x_of(dur), y_of(0.0));
+                    let env_col = egui::Color32::from_rgb(255, 210, 90);
+                    // Outline of the ADSR contour.
+                    p.add(egui::Shape::line(
+                        vec![p0, pa, pd, pr, pe],
+                        egui::Stroke::new(2.0, env_col),
+                    ));
+                    // Draggable handles: attack (X), decay+sustain (X·Y), release (X). Allocated on
+                    // top of the waveform so a grab claims the pointer (the selection drag is gated
+                    // off by `env_editing`). Driven from the global pointer so a drag past the rect
+                    // edge stays clamped.
+                    let hr = 6.0;
+                    let ptr = ui.input(|inp| inp.pointer.latest_pos());
+                    let do_handle = |key: &str, center: egui::Pos2| -> Option<egui::Pos2> {
+                        let hid = ui.id().with(("env_handle", pi, key));
+                        let hrect = egui::Rect::from_center_size(center, egui::vec2(16.0, 16.0));
+                        let hresp = ui.interact(hrect, hid, egui::Sense::drag());
+                        let hot = hresp.hovered() || hresp.dragged();
+                        p.circle_filled(center, if hot { hr + 1.5 } else { hr }, env_col);
+                        p.circle_stroke(
+                            center,
+                            if hot { hr + 1.5 } else { hr },
+                            egui::Stroke::new(1.5, egui::Color32::from_gray(20)),
+                        );
+                        if hresp.dragged() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                            ui.ctx().request_repaint();
+                            ptr
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(pp) = do_handle("attack", pa) {
+                        a = t_at(pp.x).clamp(0.0, dur);
+                    }
+                    if let Some(pp) = do_handle("decay", pd) {
+                        d = (t_at(pp.x) - a).clamp(0.0, dur);
+                        s = level_at(pp.y);
+                    }
+                    if let Some(pp) = do_handle("release", pr) {
+                        rel = (dur - t_at(pp.x)).clamp(0.0, dur);
+                    }
+                    // Compact label so it's clear you're in envelope-edit mode.
+                    p.text(
+                        egui::pos2(rect.left() + 4.0, rect.top() + 2.0),
+                        egui::Align2::LEFT_TOP,
+                        format!(
+                            "AMP ENV  A {a:.2}  D {d:.2}  S {:.0}%  R {rel:.2}",
+                            s * 100.0
+                        ),
+                        egui::FontId::proportional(11.0),
+                        env_col,
+                    );
+                    if (a, d, s, rel) != orig {
+                        want_env = Some((pi, a, d, s, rel));
+                    }
+                }
+            }
             // Zoom readout, top-left, when zoomed in.
             if self.wave_view.is_some() {
                 p.text(
@@ -5709,6 +5861,15 @@ impl PixelView {
         // Apply the collected actions (order: adjust the region/loop before (re)starting).
         if let Some(b) = want_autoplay {
             self.audio_autoplay = b;
+        }
+        if let Some((pi, a, d, s, rel)) = want_env {
+            if pi < self.pads.len() {
+                self.pads[pi].amp_attack = a;
+                self.pads[pi].amp_decay = d;
+                self.pads[pi].amp_sustain = s;
+                self.pads[pi].amp_release = rel;
+                self.pads[pi].amp_env_on = true;
+            }
         }
         if let Some((lo, hi)) = want_select {
             // Minimum selection width: ~2 samples (not 0.01 s = 441 samples), so sample-accurate
@@ -19660,9 +19821,10 @@ struct Pad {
     // Choke/mute group: 0 = none, 1..=8 = a group. Triggering a pad silences every other pad in
     // the same group (the classic open/closed hi-hat choke) → SFZ `group=N off_by=N` on export.
     choke_group: u8,
-    // Per-pad amplitude ADSR, baked into the voice at trigger time (attack/decay/release in
-    // seconds, sustain 0..1). Since a pad hit has no note-off, release fades the tail of a
-    // one-shot; a looping pad holds at sustain. Exports to SFZ `ampeg_*`.
+    // Per-pad amplitude ADSR, baked into the voice at trigger time when `amp_env_on` (attack/decay/
+    // release in seconds, sustain 0..1). Since a pad hit has no note-off, release fades the tail of a
+    // one-shot; a looping pad holds at sustain. Off ⇒ raw sample + no `ampeg_*` in the SFZ export.
+    amp_env_on: bool,
     amp_attack: f32,
     amp_decay: f32,
     amp_sustain: f32,
@@ -19749,6 +19911,7 @@ impl Pad {
             vel_track: true,
             pan: 0.0,
             choke_group: 0,
+            amp_env_on: false,
             amp_attack: 0.0,
             amp_decay: 0.0,
             amp_sustain: 1.0,
@@ -19802,6 +19965,8 @@ impl Pad {
             format!("{}", self.amp_decay),
             format!("{}", self.amp_sustain),
             format!("{}", self.amp_release),
+            // Index 21: envelope enable (old kits infer it from a non-default ADSR — see from_record).
+            if self.amp_env_on { "1" } else { "0" }.to_string(),
         ]
     }
 
@@ -19835,6 +20000,18 @@ impl Pad {
             note_lock: g(14) == "1", // default off (old records without the field aren't locked)
             pan: g(15).parse().unwrap_or(0.0),
             choke_group: g(16).parse().unwrap_or(0),
+            amp_env_on: match r.get(21) {
+                Some(v) => v == "1",
+                // Pre-enable field: a kit saved with the first ADSR (non-default) should stay
+                // enabled; a truly-old kit (all defaults) stays off.
+                None => {
+                    let a: f32 = g(17).parse().unwrap_or(0.0);
+                    let d: f32 = g(18).parse().unwrap_or(0.0);
+                    let s: f32 = g(19).parse().unwrap_or(1.0);
+                    let rl: f32 = g(20).parse().unwrap_or(0.0);
+                    a > 1e-4 || d > 1e-4 || (s - 1.0).abs() > 1e-4 || rl > 1e-4
+                }
+            },
             amp_attack: g(17).parse().unwrap_or(0.0),
             amp_decay: g(18).parse().unwrap_or(0.0),
             amp_sustain: g(19).parse().unwrap_or(1.0), // default full sustain (old kits = no env)
@@ -23035,6 +23212,7 @@ mod tests {
             note_lock: true,
             pan: -0.5,
             choke_group: 3,
+            amp_env_on: true,
             amp_attack: 0.01,
             amp_decay: 0.2,
             amp_sustain: 0.6,
@@ -23059,7 +23237,8 @@ mod tests {
         assert!((r.amp_decay - 0.2).abs() < 1e-6);
         assert!((r.amp_sustain - 0.6).abs() < 1e-6);
         assert!((r.amp_release - 0.15).abs() < 1e-6); // ADSR survives
-                                                      // A short/garbage row degrades gracefully to sane defaults.
+        assert!(r.amp_env_on); // envelope-enable survives
+                               // A short/garbage row degrades gracefully to sane defaults.
         let (d, _) = Pad::from_record(&["1".to_string()]);
         assert_eq!(d.note, None);
         assert_eq!(d.volume, 1.0);
@@ -23067,6 +23246,14 @@ mod tests {
         assert_eq!(d.pan, 0.0); // missing pan → center
         assert_eq!(d.choke_group, 0); // missing → no choke
         assert_eq!(d.amp_sustain, 1.0); // missing sustain → full (no envelope)
+        assert!(!d.amp_env_on); // missing + default ADSR → envelope off
+                                // Migration: a pre-`amp_env_on` kit that already carried a non-default
+                                // envelope (a release) infers the envelope ON (index 21 absent).
+        let mut legacy = Pad::empty().record();
+        legacy.truncate(21); // drop the amp_env_on field, keep 0..=20
+        legacy[20] = "0.2".to_string(); // a non-default release
+        let (m, _) = Pad::from_record(&legacy);
+        assert!(m.amp_env_on);
     }
 
     #[test]
