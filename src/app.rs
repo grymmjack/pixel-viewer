@@ -2992,9 +2992,38 @@ impl PixelView {
                 }
             }
         }
+        // Choke group: firing this pad silences every OTHER pad sharing its non-zero group (the
+        // open/closed hi-hat idiom). Do it before the new voice starts so the old one cuts cleanly.
+        let choke = self.pads[i].choke_group;
+        if choke != 0 {
+            let victims: Vec<usize> = (0..self.pads.len())
+                .filter(|&j| j != i && self.pads[j].choke_group == choke)
+                .collect();
+            if let Some(ap) = &mut self.audio_player {
+                for j in victims {
+                    ap.stop_pad(j);
+                }
+            }
+        }
         let pad = &self.pads[i];
         let (ls, le) = pad.loop_region(buf.duration);
         let region = build_pad_region(&buf, ls, le, pad.loop_type);
+        // Bake the per-pad amplitude ADSR (release only shapes a one-shot's tail), then the pan
+        // (which may turn a mono region stereo — carry its channel count to the voice).
+        let ch = buf.channels.get() as usize;
+        let sr = buf.sample_rate.get() as f32;
+        let region = apply_amp_env(
+            region,
+            ch,
+            sr,
+            pad.amp_attack,
+            pad.amp_decay,
+            pad.amp_sustain,
+            pad.amp_release,
+            !pad.loop_on,
+        );
+        let (region, eff_ch) = apply_pan(region, ch, pad.pan);
+        let channels = std::num::NonZeroU16::new(eff_ch as u16).unwrap_or(buf.channels);
         let (pitch, loop_it) = (pad.pitch, pad.loop_on);
         // Velocity: a kit-wide fixed velocity (global) overrides everything; else the pad tracks
         // the incoming velocity, or ignores it (fixed 127) when its own tracking is off.
@@ -3011,7 +3040,7 @@ impl PixelView {
             pad.volume
         }) * (vel as f32 / 127.0).clamp(0.0, 1.0);
         if let Some(ap) = &mut self.audio_player {
-            ap.trigger_pad_voice(i, buf, region, pitch, gain, loop_it);
+            ap.trigger_pad_voice(i, buf, region, channels, pitch, gain, loop_it);
         }
         self.pads[i].flash_t = now;
         // Light this pad's assigned key on the onscreen keyboard too (red — it routes to a pad), so
@@ -3099,6 +3128,13 @@ impl PixelView {
             loop_end,
             loop_type,
             vel_track: if old.is_empty() { true } else { old.vel_track },
+            // Reloading a sample onto a configured pad keeps its mix shaping (like note/pitch/color).
+            pan: if old.is_empty() { 0.0 } else { old.pan },
+            choke_group: if old.is_empty() { 0 } else { old.choke_group },
+            amp_attack: if old.is_empty() { 0.0 } else { old.amp_attack },
+            amp_decay: if old.is_empty() { 0.0 } else { old.amp_decay },
+            amp_sustain: if old.is_empty() { 1.0 } else { old.amp_sustain },
+            amp_release: if old.is_empty() { 0.0 } else { old.amp_release },
             color: old.color,
             source,
             note_lock: old.note_lock, // reloading a sample keeps the key-lock
@@ -3424,6 +3460,32 @@ impl PixelView {
                 100
             };
             sfz.push_str(&format!("amp_veltrack={veltrack}\n"));
+            // Pan (SFZ pan is −100..100).
+            if pad.pan.abs() > 1e-3 {
+                sfz.push_str(&format!("pan={:.1}\n", pad.pan.clamp(-1.0, 1.0) * 100.0));
+            }
+            // Choke group: `group=N off_by=N` makes every pad in group N cut the others (hi-hats).
+            if pad.choke_group != 0 {
+                let g = pad.choke_group;
+                sfz.push_str(&format!("group={g}\noff_by={g}\noff_mode=fast\n"));
+            }
+            // Amplitude ADSR (`ampeg_*`; sustain is a percentage in SFZ). Emit only non-default
+            // stages so a plain pad stays terse.
+            if pad.amp_attack > 1e-4 {
+                sfz.push_str(&format!("ampeg_attack={:.3}\n", pad.amp_attack));
+            }
+            if pad.amp_decay > 1e-4 {
+                sfz.push_str(&format!("ampeg_decay={:.3}\n", pad.amp_decay));
+            }
+            if (pad.amp_sustain - 1.0).abs() > 1e-4 {
+                sfz.push_str(&format!(
+                    "ampeg_sustain={:.1}\n",
+                    pad.amp_sustain.clamp(0.0, 1.0) * 100.0
+                ));
+            }
+            if pad.amp_release > 1e-4 {
+                sfz.push_str(&format!("ampeg_release={:.3}\n", pad.amp_release));
+            }
             if pad.loop_on {
                 let (ls, le) = pad.loop_region(*dur);
                 let (sf, ef) = (
@@ -4670,7 +4732,69 @@ impl PixelView {
                         if ui.small_button("Oct +").clicked() {
                             self.pads[i].pitch = (self.pads[i].pitch + 12).min(24);
                         }
-                        ui.weak("· drag the waveform to set the loop · click the pad / press its key to audition");
+                    });
+                    // Choke group + amplitude ADSR (baked into the voice at trigger; exported to
+                    // SFZ as `group`/`off_by` + `ampeg_*`).
+                    ui.horizontal_wrapped(|ui| {
+                        ui.weak("Choke");
+                        let cg = self.pads[i].choke_group;
+                        egui::ComboBox::from_id_salt("pad_choke_group")
+                            .selected_text(if cg == 0 {
+                                "Off".to_string()
+                            } else {
+                                cg.to_string()
+                            })
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(cg == 0, "Off")
+                                    .on_hover_text("No choke group")
+                                    .clicked()
+                                {
+                                    self.pads[i].choke_group = 0;
+                                }
+                                for g in 1..=8u8 {
+                                    if ui.selectable_label(cg == g, g.to_string()).clicked() {
+                                        self.pads[i].choke_group = g;
+                                    }
+                                }
+                            });
+                        ui.add(egui::Label::new(egui::RichText::new("Amp env").weak()))
+                            .on_hover_text(
+                                "Attack / Decay / Sustain / Release — shapes the pad's volume over \
+                                 time (release fades a one-shot's tail). Baked into playback and \
+                                 exported to SFZ.",
+                            );
+                        ui.weak("A");
+                        ui.add(
+                            egui::DragValue::new(&mut self.pads[i].amp_attack)
+                                .range(0.0..=4.0)
+                                .speed(0.005)
+                                .suffix(" s")
+                                .max_decimals(3),
+                        );
+                        ui.weak("D");
+                        ui.add(
+                            egui::DragValue::new(&mut self.pads[i].amp_decay)
+                                .range(0.0..=4.0)
+                                .speed(0.005)
+                                .suffix(" s")
+                                .max_decimals(3),
+                        );
+                        ui.weak("S");
+                        ui.add(
+                            egui::DragValue::new(&mut self.pads[i].amp_sustain)
+                                .range(0.0..=1.0)
+                                .speed(0.01)
+                                .max_decimals(2),
+                        );
+                        ui.weak("R");
+                        ui.add(
+                            egui::DragValue::new(&mut self.pads[i].amp_release)
+                                .range(0.0..=4.0)
+                                .speed(0.005)
+                                .suffix(" s")
+                                .max_decimals(3),
+                        );
                     });
                 }
             }
@@ -6119,6 +6243,7 @@ impl PixelView {
         let mut want_solo: Option<usize> = None;
         let mut want_vel_track: Option<usize> = None;
         let mut want_vol: Option<(usize, f32)> = None;
+        let mut want_pan: Option<(usize, f32)> = None;
         let mut want_base: Option<i32> = None;
         let mut want_assign: Option<usize> = None;
         let mut want_lock: Option<usize> = None; // toggle a pad's key-lock
@@ -6243,6 +6368,7 @@ impl PixelView {
                     let soloed = self.pads[i].soloed;
                     let vel_track = self.pads[i].vel_track;
                     let mut volume = self.pads[i].volume;
+                    let mut pan = self.pads[i].pan;
                     let name = self.pads[i].name.clone();
                     let flash_t = self.pads[i].flash_t;
                     let overridden = self.pads[i].note.is_some();
@@ -6434,6 +6560,25 @@ impl PixelView {
                             {
                                 want_vol = Some((i, volume));
                             }
+                        }
+
+                        // Pan knob in the top-right corner — dead space above the fader, clear of
+                        // the VU. Non-advancing `new_child` (same reason as the fader) so it can't
+                        // disturb the tile's horizontal cursor. Anchored to the top so it fits any
+                        // tile height.
+                        let kd = 20.0f32;
+                        let krect = egui::Rect::from_min_size(
+                            egui::pos2(rect.right() - 32.0, rect.top() + 2.0),
+                            egui::vec2(kd, kd),
+                        );
+                        let parent_clip = ui.clip_rect();
+                        let mut kchild =
+                            ui.new_child(egui::UiBuilder::new().max_rect(krect).layout(
+                                egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                            ));
+                        kchild.set_clip_rect(rect.intersect(parent_clip));
+                        if pan_knob(&mut kchild, &mut pan, kd).changed() {
+                            want_pan = Some((i, pan));
                         }
                     }
 
@@ -6682,6 +6827,9 @@ impl PixelView {
         }
         if let Some((i, v)) = want_vol {
             self.pads[i].volume = v;
+        }
+        if let Some((i, p)) = want_pan {
+            self.pads[i].pan = p.clamp(-1.0, 1.0);
         }
         if let Some(i) = want_lock {
             if i < self.pads.len() {
@@ -19508,6 +19656,17 @@ struct Pad {
     loop_end: f32,   // loop region end (seconds; ≤ start ⇒ the whole sample)
     loop_type: u8,   // playback direction: 0 = forward, 1 = reverse, 2 = ping-pong
     vel_track: bool, // track incoming MIDI velocity (on) vs. fixed max velocity 127 (off)
+    pan: f32,        // stereo pan −1.0 (hard left) … 0 (center) … +1.0 (hard right)
+    // Choke/mute group: 0 = none, 1..=8 = a group. Triggering a pad silences every other pad in
+    // the same group (the classic open/closed hi-hat choke) → SFZ `group=N off_by=N` on export.
+    choke_group: u8,
+    // Per-pad amplitude ADSR, baked into the voice at trigger time (attack/decay/release in
+    // seconds, sustain 0..1). Since a pad hit has no note-off, release fades the tail of a
+    // one-shot; a looping pad holds at sustain. Exports to SFZ `ampeg_*`.
+    amp_attack: f32,
+    amp_decay: f32,
+    amp_sustain: f32,
+    amp_release: f32,
     color: Option<[u8; 3]>, // optional tile color tag (right-click → colorize)
     source: Option<String>, // original sample path (for the sample-list hover); "" if unknown
     note_lock: bool, // key-lock: keep this pad firing on the same note when it's dragged to a new
@@ -19588,6 +19747,12 @@ impl Pad {
             loop_end: 0.0,
             loop_type: 0,
             vel_track: true,
+            pan: 0.0,
+            choke_group: 0,
+            amp_attack: 0.0,
+            amp_decay: 0.0,
+            amp_sustain: 1.0,
+            amp_release: 0.0,
             color: None,
             source: None,
             note_lock: false,
@@ -19630,6 +19795,13 @@ impl Pad {
                 .unwrap_or_default(),
             self.source.clone().unwrap_or_default(),
             if self.note_lock { "1" } else { "0" }.to_string(),
+            // Appended (indices 15..=20) — older kits without these load with defaults.
+            format!("{}", self.pan),
+            self.choke_group.to_string(),
+            format!("{}", self.amp_attack),
+            format!("{}", self.amp_decay),
+            format!("{}", self.amp_sustain),
+            format!("{}", self.amp_release),
         ]
     }
 
@@ -19661,6 +19833,12 @@ impl Pad {
             },
             source: Some(g(13)).filter(|s| !s.is_empty()),
             note_lock: g(14) == "1", // default off (old records without the field aren't locked)
+            pan: g(15).parse().unwrap_or(0.0),
+            choke_group: g(16).parse().unwrap_or(0),
+            amp_attack: g(17).parse().unwrap_or(0.0),
+            amp_decay: g(18).parse().unwrap_or(0.0),
+            amp_sustain: g(19).parse().unwrap_or(1.0), // default full sustain (old kits = no env)
+            amp_release: g(20).parse().unwrap_or(0.0),
             flash_t: -1.0,
         };
         (pad, has_audio)
@@ -19847,6 +20025,166 @@ fn build_pad_region(buf: &SampleBuf, start: f32, end: f32, loop_type: u8) -> Vec
         }
         _ => fwd.to_vec(), // forward
     }
+}
+
+/// Bake a per-pad **amplitude ADSR** into an interleaved region (all channels share the frame
+/// envelope). Times are in seconds at `sr`. A pad hit has no note-off, so:
+///   attack (0→1) → decay (1→sustain) → hold sustain → for a **one-shot**, release (sustain→0)
+///   fades the tail so it never clicks; a **looping** pad (`one_shot=false`) skips the release and
+///   holds sustain to the end (the region is what repeats).
+/// A neutral envelope (a≈0, d≈0, sustain≈1, r≈0) returns the region untouched (cheap fast-path).
+#[allow(clippy::too_many_arguments)]
+fn apply_amp_env(
+    mut region: Vec<f32>,
+    ch: usize,
+    sr: f32,
+    attack: f32,
+    decay: f32,
+    sustain: f32,
+    release: f32,
+    one_shot: bool,
+) -> Vec<f32> {
+    let ch = ch.max(1);
+    let sustain = sustain.clamp(0.0, 1.0);
+    let (a, d) = (attack.max(0.0), decay.max(0.0));
+    let r = if one_shot { release.max(0.0) } else { 0.0 };
+    // Nothing to do — no ramps and full sustain → identity.
+    if a < 1e-4 && d < 1e-4 && r < 1e-4 && (sustain - 1.0).abs() < 1e-4 {
+        return region;
+    }
+    let frames = region.len() / ch;
+    if frames == 0 {
+        return region;
+    }
+    let a_f = (a * sr) as usize;
+    let d_f = (d * sr) as usize;
+    let r_f = ((r * sr) as usize).min(frames);
+    let rel_start = frames.saturating_sub(r_f); // release begins here (one-shot only)
+    for f in 0..frames {
+        // Attack/decay/sustain envelope from the onset.
+        let env_ad = if f < a_f {
+            f as f32 / a_f.max(1) as f32 // 0 → 1 over attack
+        } else if f < a_f + d_f {
+            let t = (f - a_f) as f32 / d_f.max(1) as f32;
+            1.0 + (sustain - 1.0) * t // 1 → sustain over decay
+        } else {
+            sustain // hold
+        };
+        // Release ramp at the tail (one-shot): multiply the sustain body down to 0.
+        let env = if r_f > 0 && f >= rel_start {
+            let t = (f - rel_start) as f32 / r_f.max(1) as f32;
+            env_ad * (1.0 - t)
+        } else {
+            env_ad
+        };
+        for c in 0..ch {
+            region[f * ch + c] *= env;
+        }
+    }
+    region
+}
+
+/// Bake a constant-power **stereo pan** into an interleaved region. `pan` is −1 (hard left) …
+/// 0 (center) … +1 (hard right). A stereo region is scaled per channel; a **mono** region is
+/// expanded to stereo (so it can pan at all). Returns the (possibly re-channeled) region and its
+/// new channel count. `pan≈0` is a no-op (returns the input unchanged, same channels).
+fn apply_pan(region: Vec<f32>, ch: usize, pan: f32) -> (Vec<f32>, usize) {
+    let pan = pan.clamp(-1.0, 1.0);
+    if pan.abs() < 1e-3 {
+        return (region, ch);
+    }
+    // Equal-power law: θ sweeps 0..π/2 as pan goes −1..+1; gains are cos/sin so L²+R²≈1.
+    let theta = (pan + 1.0) * 0.5 * std::f32::consts::FRAC_PI_2;
+    let (lg, rg) = (theta.cos(), theta.sin());
+    match ch {
+        2 => {
+            let mut r = region;
+            for f in r.chunks_exact_mut(2) {
+                f[0] *= lg;
+                f[1] *= rg;
+            }
+            (r, 2)
+        }
+        1 => {
+            let mut out = Vec::with_capacity(region.len() * 2);
+            for &s in &region {
+                out.push(s * lg);
+                out.push(s * rg);
+            }
+            (out, 2)
+        }
+        _ => (region, ch), // >2 channels: leave as-is (uncommon for a pad sample)
+    }
+}
+
+/// A small **Ableton-style pan knob**: a round dial whose pointer swings ±135° from top as `pan`
+/// goes −1 (hard left) … 0 (center, pointer straight up) … +1 (hard right), with a bright arc from
+/// top showing the offset direction/amount. Drag **vertically** to change (up = right), double-click
+/// to recenter. Returns the `Response` (with `changed()` set) so the caller can persist on change.
+fn pan_knob(ui: &mut egui::Ui, pan: &mut f32, diameter: f32) -> egui::Response {
+    let (rect, mut resp) = ui.allocate_exact_size(
+        egui::vec2(diameter, diameter),
+        egui::Sense::click_and_drag(),
+    );
+    let c = rect.center();
+    let r = diameter * 0.5 - 2.0;
+    // Interaction: vertical drag (≈150 px = full −1..+1 sweep); double-click recenters.
+    let mut changed = false;
+    if resp.dragged() {
+        let dy = resp.drag_delta().y;
+        if dy != 0.0 {
+            *pan = (*pan - dy * (2.0 / 150.0)).clamp(-1.0, 1.0);
+            changed = true;
+        }
+    }
+    if resp.double_clicked() {
+        *pan = 0.0;
+        changed = true;
+    }
+    let p = pan.clamp(-1.0, 1.0);
+    let painter = ui.painter_at(rect);
+    // Dial body + rim.
+    painter.circle_filled(c, r, egui::Color32::from_gray(24));
+    let rim = if resp.hovered() {
+        egui::Color32::from_gray(140)
+    } else {
+        egui::Color32::from_gray(95)
+    };
+    painter.circle_stroke(c, r, egui::Stroke::new(1.0, rim));
+    // Angle: 0 = straight up (−y), swings ±135° (0.75π) with pan. Screen point on the rim.
+    let ang = p * 0.75 * std::f32::consts::PI;
+    let (sa, ca) = ang.sin_cos();
+    let tip = egui::pos2(c.x + r * sa, c.y - r * ca);
+    // Bright arc from the top reference to the pointer, showing the pan offset (a few segments).
+    let steps = 10;
+    let accent = egui::Color32::from_rgb(120, 190, 255);
+    let mut prev = egui::pos2(c.x, c.y - r); // top reference (pan = 0)
+    for k in 1..=steps {
+        let t = k as f32 / steps as f32;
+        let a = ang * t;
+        let (s2, c2) = a.sin_cos();
+        let pt = egui::pos2(c.x + r * s2, c.y - r * c2);
+        painter.line_segment([prev, pt], egui::Stroke::new(2.0, accent));
+        prev = pt;
+    }
+    // Pointer line from center to the rim.
+    painter.line_segment(
+        [c, tip],
+        egui::Stroke::new(2.0, egui::Color32::from_gray(230)),
+    );
+    painter.circle_filled(c, 1.6, egui::Color32::from_gray(200));
+    let label = if p.abs() < 1e-3 {
+        "Pan C".to_string()
+    } else if p < 0.0 {
+        format!("Pan L{:.0}", -p * 100.0)
+    } else {
+        format!("Pan R{:.0}", p * 100.0)
+    };
+    resp = resp.on_hover_text(format!("{label}  ·  drag to pan, double-click to center"));
+    if changed {
+        resp.mark_changed();
+    }
+    resp
 }
 
 /// Solo/mute fold for a pad grid: a muted pad is silent; if ANY pad is soloed only soloed pads
@@ -20144,19 +20482,20 @@ impl AudioPlayer {
     /// direction already applied); `loop_it` repeats it forever (a looping pad replaces its own
     /// prior voice so it can't stack). `gain` is the fully-resolved level (master · per-pad ·
     /// solo/mute · velocity). `buf` (Arc, shared with the `Pad`) is kept for the VU meter.
+    #[allow(clippy::too_many_arguments)]
     fn trigger_pad_voice(
         &mut self,
         pad: usize,
         buf: std::sync::Arc<SampleBuf>,
         region: Vec<rodio::Sample>,
+        channels: rodio::ChannelCount, // the region's channel count (pan may expand mono → stereo)
         semitone: i32,
         gain: f32,
         loop_it: bool,
     ) {
         use rodio::Source;
         let speed = 2.0f32.powf(semitone as f32 / 12.0);
-        let src =
-            rodio::buffer::SamplesBuffer::new(buf.channels, buf.sample_rate, region).speed(speed);
+        let src = rodio::buffer::SamplesBuffer::new(channels, buf.sample_rate, region).speed(speed);
         let player = rodio::Player::connect_new(self._stream.mixer());
         player.set_volume(gain);
         if loop_it {
@@ -22694,6 +23033,12 @@ mod tests {
             color: Some([200, 50, 90]),
             source: Some("/samples/kick.wav".into()),
             note_lock: true,
+            pan: -0.5,
+            choke_group: 3,
+            amp_attack: 0.01,
+            amp_decay: 0.2,
+            amp_sustain: 0.6,
+            amp_release: 0.15,
             ..Pad::empty()
         };
         let (r, has_audio) = Pad::from_record(&p.record());
@@ -22708,11 +23053,20 @@ mod tests {
         assert_eq!(r.color, Some([200, 50, 90]));
         assert_eq!(r.source.as_deref(), Some("/samples/kick.wav"));
         assert!(r.note_lock); // key-lock survives the round-trip
-                              // A short/garbage row degrades gracefully to sane defaults.
+        assert!((r.pan + 0.5).abs() < 1e-6); // pan survives
+        assert_eq!(r.choke_group, 3); // choke group survives
+        assert!((r.amp_attack - 0.01).abs() < 1e-6);
+        assert!((r.amp_decay - 0.2).abs() < 1e-6);
+        assert!((r.amp_sustain - 0.6).abs() < 1e-6);
+        assert!((r.amp_release - 0.15).abs() < 1e-6); // ADSR survives
+                                                      // A short/garbage row degrades gracefully to sane defaults.
         let (d, _) = Pad::from_record(&["1".to_string()]);
         assert_eq!(d.note, None);
         assert_eq!(d.volume, 1.0);
         assert!(!d.note_lock); // missing field → unlocked
+        assert_eq!(d.pan, 0.0); // missing pan → center
+        assert_eq!(d.choke_group, 0); // missing → no choke
+        assert_eq!(d.amp_sustain, 1.0); // missing sustain → full (no envelope)
     }
 
     #[test]
@@ -22732,6 +23086,45 @@ mod tests {
         assert!(pad_is_audible(&solo, 0)); // soloed
         assert!(!pad_is_audible(&solo, 1)); // not soloed while a solo is active
         assert!(!pad_is_audible(&solo, 2)); // soloed but also muted → mute wins
+    }
+
+    #[test]
+    fn amp_env_shapes_and_identity() {
+        let sr = 100.0; // 100 fps → 1 frame = 10 ms, so times are easy to reason about
+        let mono = vec![1.0f32; 100]; // 1.0s of full-scale mono
+                                      // Neutral envelope (no ramps, full sustain) is a cheap identity.
+        let id = apply_amp_env(mono.clone(), 1, sr, 0.0, 0.0, 1.0, 0.0, true);
+        assert_eq!(id, mono);
+        // Attack 0.1s (10 frames): frame 0 is silent, ramps up, full by the attack end.
+        let atk = apply_amp_env(mono.clone(), 1, sr, 0.1, 0.0, 1.0, 0.0, true);
+        assert!(atk[0].abs() < 1e-6); // starts at 0
+        assert!(atk[5] > 0.3 && atk[5] < 0.7); // mid-ramp
+        assert!((atk[20] - 1.0).abs() < 1e-6); // fully open past the attack
+                                               // Sustain 0.5 with an immediate decay pulls the body down to half.
+        let sus = apply_amp_env(mono.clone(), 1, sr, 0.0, 0.05, 0.5, 0.0, true);
+        assert!((sus[80] - 0.5).abs() < 1e-6);
+        // Release (one-shot) fades the very tail to ~0; a looping pad keeps sustain to the end.
+        let rel = apply_amp_env(mono.clone(), 1, sr, 0.0, 0.0, 1.0, 0.1, true);
+        assert!(rel[99] < 0.2); // tail faded
+        let loop_ = apply_amp_env(mono.clone(), 1, sr, 0.0, 0.0, 1.0, 0.1, false);
+        assert!((loop_[99] - 1.0).abs() < 1e-6); // no release when looping
+    }
+
+    #[test]
+    fn pan_law_and_channel_expansion() {
+        // Center pan is a no-op (returns input + same channels).
+        let stereo = vec![0.5f32, 0.5, 0.5, 0.5];
+        let (r, ch) = apply_pan(stereo.clone(), 2, 0.0);
+        assert_eq!((r, ch), (stereo.clone(), 2));
+        // Hard left: left channel keeps ~full gain, right goes silent.
+        let (r, ch) = apply_pan(stereo.clone(), 2, -1.0);
+        assert_eq!(ch, 2);
+        assert!(r[0] > 0.45 && r[1].abs() < 1e-4);
+        // A mono region expands to stereo so it can pan at all; right-panned → R louder than L.
+        let (r, ch) = apply_pan(vec![1.0f32; 4], 1, 1.0);
+        assert_eq!(ch, 2);
+        assert_eq!(r.len(), 8); // 4 frames × 2 channels
+        assert!(r[1] > r[0] && r[0].abs() < 1e-4); // frame0: L≈0, R≈full
     }
 
     #[test]
