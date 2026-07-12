@@ -971,10 +971,11 @@ pub struct PixelView {
     resize_fx: f32,                                         // width factor  (0,1] of native
     resize_fy: f32,                                         // height factor (0,1] of native
     resize_lock: bool,                                      // lock aspect (fx == fy)
-    postfx: PostFx, // CRT post-filters (scanlines/glow/vignette/phosphor markers)
-    balance_color: [u8; 3], // color-balance op: ±offset color (128 = neutral)
-    balance_strength: f32, // color-balance op: 0..1 amount
-    balance_hex: String, // live buffer for the hex paste field
+    scale_algo: crate::scale::Scaler, // pixel-art upscaler applied before the pipeline
+    postfx: PostFx,                   // CRT post-filters (scanlines/glow/vignette/phosphor markers)
+    balance_color: [u8; 3],           // color-balance op: ±offset color (128 = neutral)
+    balance_strength: f32,            // color-balance op: 0..1 amount
+    balance_hex: String,              // live buffer for the hex paste field
     quantize_cache: Option<(PathBuf, usize, Vec<[u8; 4]>)>, // memoized reduction
     // Colors to feed the Reduce median-cut when the image has too many colors to
     // extract a swatch palette (`palettes[path]` is `Some(None)`): its pixels
@@ -1307,6 +1308,7 @@ impl PixelView {
     const RESIZE_FX_KEY: &'static str = "resize_fx";
     const RESIZE_FY_KEY: &'static str = "resize_fy";
     const RESIZE_LOCK_KEY: &'static str = "resize_lock";
+    const SCALE_ALGO_KEY: &'static str = "scale_algo"; // pixel-art upscaler (index)
     const BALANCE_COLOR_KEY: &'static str = "balance_color";
     const BALANCE_STRENGTH_KEY: &'static str = "balance_strength";
     const PALETTE_DIR_KEY: &'static str = "palette_dir";
@@ -1726,6 +1728,11 @@ impl PixelView {
             .unwrap_or(1.0)
             .clamp(0.005, 1.0);
         let resize_lock = get_bool(Self::RESIZE_LOCK_KEY).unwrap_or(true);
+        let scale_algo = cc
+            .storage
+            .and_then(|s| eframe::get_value::<u8>(s, Self::SCALE_ALGO_KEY))
+            .map(crate::scale::Scaler::from_u8)
+            .unwrap_or_default();
         let balance_color = cc
             .storage
             .and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::BALANCE_COLOR_KEY))
@@ -1973,6 +1980,7 @@ impl PixelView {
             resize_fx,
             resize_fy,
             resize_lock,
+            scale_algo,
             postfx,
             balance_color,
             balance_strength,
@@ -8556,6 +8564,18 @@ impl PixelView {
         (tw, th)
     }
 
+    /// Apply the active pixel-art **upscaler** to a source buffer, returning the
+    /// (possibly enlarged) `(w, h, rgba)`. A no-op when the scaler is `None`. Runs
+    /// *before* the recolor pipeline, so the whole stack (adjustments / dither /
+    /// palette / post-FX) + Save operate on the enlarged art.
+    fn scale_source(&self, w: usize, h: usize, rgba: Vec<u8>) -> (usize, usize, Vec<u8>) {
+        if self.scale_algo == crate::scale::Scaler::None {
+            return (w, h, rgba);
+        }
+        let (out, ow, oh) = self.scale_algo.apply(&rgba, w, h);
+        (ow, oh, out)
+    }
+
     /// Snapshot the entire recolor stack (adjustments + order, post-FX, dither, color
     /// balance, resize, reduce, active palette) into a named PixelFX preset.
     fn capture_fx_preset(&self, name: String) -> FxPreset {
@@ -8581,6 +8601,7 @@ impl PixelView {
             resize_fx: self.resize_fx,
             resize_fy: self.resize_fy,
             resize_lock: self.resize_lock,
+            scale_algo: self.scale_algo as u8,
             quantize_on: self.quantize_on,
             quantize_n: self.quantize_n,
             selected_palette: self.selected_palette.clone(),
@@ -8623,6 +8644,7 @@ impl PixelView {
         self.resize_fx = p.resize_fx.clamp(0.005, 1.0);
         self.resize_fy = p.resize_fy.clamp(0.005, 1.0);
         self.resize_lock = p.resize_lock;
+        self.scale_algo = crate::scale::Scaler::from_u8(p.scale_algo);
         self.quantize_on = p.quantize_on;
         self.quantize_n = p.quantize_n.clamp(2, 256);
         self.selected_palette = p.selected_palette.clone();
@@ -8643,6 +8665,7 @@ impl PixelView {
             || self.resize_active()
             || self.postfx.active()
             || self.pixelate_h >= 2.0 // vertical-only pixelate (width can be off)
+            || self.scale_algo != crate::scale::Scaler::None
     }
 
     /// True when the Resize/resample actually downsamples (on + a factor below 1).
@@ -8674,7 +8697,12 @@ impl PixelView {
             self.resize_on as u8,
             self.resize_fx,
             self.resize_fy,
-        ) + &format!("|FX{}|PXH{:.0}", self.postfx.key(), self.pixelate_h)
+        ) + &format!(
+            "|FX{}|PXH{:.0}|SC{}",
+            self.postfx.key(),
+            self.pixelate_h,
+            self.scale_algo as u8
+        )
     }
 
     /// The palette to remap the inspected image to right now, plus a cache key
@@ -8758,12 +8786,15 @@ impl PixelView {
                 return Some(tex.clone());
             }
         }
-        let (w, h, mut rgba) = self.thumb_rgba.get(path)?.clone();
+        let (w, h, rgba) = self.thumb_rgba.get(path)?.clone();
         let palette = self.tile_palette(path);
+        // Pixel-art upscale (if any) first, then the pipeline on the enlarged tile.
+        let (w, h, mut rgba) = self.scale_source(w, h, rgba);
+        let f = self.scale_algo.factor();
         let (native_w, native_h) = self
             .img_meta
             .get(path)
-            .map(|m| (m.w as usize, m.h as usize))
+            .map(|m| (m.w as usize * f, m.h as usize * f))
             .unwrap_or((w, h));
         let dsx = self.eff_dither_scale(self.dither_scale_x, w, native_w);
         let dsy = self.eff_dither_scale(self.dither_scale_y, h, native_h);
@@ -8868,14 +8899,19 @@ impl PixelView {
             };
             self.preview_src = Some((path.to_path_buf(), w, h, rgba));
         }
-        let (w, h, mut rgba) = {
+        let (w, h, rgba) = {
             let s = self.preview_src.as_ref().unwrap();
             (s.1, s.2, s.3.clone())
         };
+        // Pixel-art upscale (if any) runs first — the enlarged art then feeds the pipeline.
+        let (w, h, mut rgba) = self.scale_source(w, h, rgba);
+        // The dither preview-vs-full ratio keys off native dims — scaled by the same
+        // upscale factor so the small preview still predicts the full view.
+        let f = self.scale_algo.factor();
         let (native_w, native_h) = self
             .img_meta
             .get(path)
-            .map(|m| (m.w as usize, m.h as usize))
+            .map(|m| (m.w as usize * f, m.h as usize * f))
             .unwrap_or((w, h));
         let dsx = self.eff_dither_scale(self.dither_scale_x, w, native_w);
         let dsy = self.eff_dither_scale(self.dither_scale_y, h, native_h);
@@ -8903,14 +8939,16 @@ impl PixelView {
                 return Some(tt.clone());
             }
         }
-        let (size, mut rgba) = match &self.full_src {
+        let (size, rgba) = match &self.full_src {
             Some((p, sz, px)) if p == path => (*sz, px.clone()),
             _ => {
                 let img = self.registry.decode_path(path).ok()?;
                 ([img.width as usize, img.height as usize], img.rgba_bytes())
             }
         };
-        let (w, h) = (size[0], size[1]);
+        // Pixel-art upscale (if any) first; the enlarged art feeds the pipeline + Save.
+        let (w, h, mut rgba) = self.scale_source(size[0], size[1], rgba);
+        let size = [w, h];
         // Full-res buffer: native == buffer, so eff_dither_scale is the raw scale.
         let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
         let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
@@ -9582,6 +9620,7 @@ impl PixelView {
                 self.dither_scale_y = 1;
                 self.pixelate_h = 0.0;
                 self.postfx = PostFx::default();
+                self.scale_algo = crate::scale::Scaler::None;
                 self.resize_on = false;
                 self.resize_fx = 1.0;
                 self.resize_fy = 1.0;
@@ -9788,7 +9827,9 @@ impl PixelView {
                     } else {
                         (0, 0)
                     };
-                    let header = if self.resize_active() {
+                    let header = if self.scale_algo != crate::scale::Scaler::None {
+                        format!("Resize *  · {}", self.scale_algo.label())
+                    } else if self.resize_active() {
                         format!("Resize *  · {tw}×{th}")
                     } else {
                         "Resize".to_string()
@@ -9801,6 +9842,26 @@ impl PixelView {
                                 ui.weak("(load the image to resize it)");
                                 return;
                             }
+                            // Pixel-art upscaler — enlarges the source with edge-aware
+                            // interpolation (runs before the whole pipeline). Independent
+                            // of the downsample sliders below; combine for any final size.
+                            ui.horizontal(|ui| {
+                                ui.label("Upscale").on_hover_text(
+                                    "Pixel-art scaler applied first (2×/3×). The enlarged art \
+                                     then flows through the whole recolor stack + Save.",
+                                );
+                                let mut si = self.scale_algo as usize;
+                                let cr = egui::ComboBox::from_id_salt("scale_algo")
+                                    .selected_text(self.scale_algo.label())
+                                    .show_ui(ui, |ui| {
+                                        for (i, s) in crate::scale::Scaler::ALL.iter().enumerate() {
+                                            ui.selectable_value(&mut si, i, s.label());
+                                        }
+                                    });
+                                wheel_cycle(ui, &cr.response, &mut si, crate::scale::Scaler::ALL.len());
+                                self.scale_algo = crate::scale::Scaler::from_u8(si as u8);
+                            });
+                            ui.separator();
                             ui.checkbox(&mut self.resize_on, "Enable").on_hover_text(
                                 "Downsample then upscale back — the low-res look at the \
                                  same on-screen size. Dither/adjustments below apply at \
@@ -10912,7 +10973,7 @@ impl PixelView {
             self.status = "Pick a palette/Reduce or set an adjustment first".into();
             return;
         }
-        let (size, mut rgba) = match &self.full_src {
+        let (size, rgba) = match &self.full_src {
             Some((p, sz, px)) if p == path => (*sz, px.clone()),
             _ => match self.registry.decode_path(path) {
                 Ok(img) => ([img.width as usize, img.height as usize], img.rgba_bytes()),
@@ -10922,8 +10983,8 @@ impl PixelView {
                 }
             },
         };
-        let (w, h) = (size[0], size[1]);
-        // Save the image AS SHOWN: full-res, so the raw dither scale + resample apply.
+        // Save the image AS SHOWN: pixel-art upscale, then full-res dither scale + resample.
+        let (w, h, mut rgba) = self.scale_source(size[0], size[1], rgba);
         let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
         let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
         let (tw, th) = self.resize_target(w, h);
@@ -10946,7 +11007,7 @@ impl PixelView {
         let Some(dest) = dest else {
             return; // cancelled
         };
-        match image::RgbaImage::from_raw(size[0] as u32, size[1] as u32, rgba) {
+        match image::RgbaImage::from_raw(w as u32, h as u32, rgba) {
             Some(img) => match img.save(&dest) {
                 Ok(()) => self.status = format!("Saved {}", short_name(&dest)),
                 Err(e) => self.status = format!("Save failed: {e}"),
@@ -16997,6 +17058,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::RESIZE_FX_KEY, &self.resize_fx);
         eframe::set_value(storage, Self::RESIZE_FY_KEY, &self.resize_fy);
         eframe::set_value(storage, Self::RESIZE_LOCK_KEY, &self.resize_lock);
+        eframe::set_value(storage, Self::SCALE_ALGO_KEY, &(self.scale_algo as u8));
         eframe::set_value(storage, Self::POSTFX_KEY, &self.postfx.to_record());
         eframe::set_value(storage, Self::BALANCE_COLOR_KEY, &self.balance_color);
         eframe::set_value(storage, Self::BALANCE_STRENGTH_KEY, &self.balance_strength);
@@ -17926,6 +17988,7 @@ struct FxPreset {
     resize_fx: f32,
     resize_fy: f32,
     resize_lock: bool,
+    scale_algo: u8, // pixel-art upscaler index (crate::scale::Scaler)
     quantize_on: bool,
     quantize_n: usize,
     selected_palette: Option<PathBuf>,
@@ -17956,6 +18019,7 @@ impl Default for FxPreset {
             resize_fx: 1.0,
             resize_fy: 1.0,
             resize_lock: true,
+            scale_algo: 0,
             quantize_on: false,
             quantize_n: 16,
             selected_palette: None,

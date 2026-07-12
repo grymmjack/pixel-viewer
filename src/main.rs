@@ -12,6 +12,7 @@ mod palettes_builtin;
 mod rating;
 mod ratings;
 mod sauce;
+mod scale;
 mod sfz;
 mod sixteen;
 mod soundfont;
