@@ -21139,7 +21139,7 @@ const LFO_WAVES: [&str; 6] = ["Sine", "Tri", "Saw up", "Saw dn", "Square", "S&H"
 /// tempo-sync (`Lfo.sync_div`): `(label, beats per cycle)`. `freq = (bpm/60)/beats`; grid step =
 /// `(60/bpm)*beats`. **Appended, never reordered** — indices 0..=5 stay whole…1/32 so persisted
 /// `musical_div`/`sync_div` values keep meaning; the finer straight divisions + triplets follow.
-const BEAT_DIVS: [(&str, f32); 13] = [
+const BEAT_DIVS: [(&str, f32); 18] = [
     ("1/1", 4.0),          // 0
     ("1/2", 2.0),          // 1
     ("1/4", 1.0),          // 2
@@ -21148,11 +21148,16 @@ const BEAT_DIVS: [(&str, f32); 13] = [
     ("1/32", 0.125),       // 5
     ("1/64", 0.0625),      // 6
     ("1/128", 0.03125),    // 7
-    ("1/2T", 4.0 / 3.0),   // 8
+    ("1/2T", 4.0 / 3.0),   // 8  — triplets (⅔ of the straight)
     ("1/4T", 2.0 / 3.0),   // 9
     ("1/8T", 1.0 / 3.0),   // 10
     ("1/16T", 1.0 / 6.0),  // 11
     ("1/32T", 1.0 / 12.0), // 12
+    ("1/2.", 3.0),         // 13 — dotted (1.5× the straight)
+    ("1/4.", 1.5),         // 14
+    ("1/8.", 0.75),        // 15
+    ("1/16.", 0.375),      // 16
+    ("1/32.", 0.1875),     // 17
 ];
 
 /// A per-target **low-frequency oscillator** — tremolo (amp), vibrato (pitch) or filter wobble
