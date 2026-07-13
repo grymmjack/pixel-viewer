@@ -23366,14 +23366,24 @@ fn decode_audio(
         let (s, c, r) = render_midi(&bytes, &sf)?;
         (s, c, r, Vec::new())
     } else {
-        // Parse the WAV loop BEFORE the bytes are moved into the decoder (returns None for
-        // non-WAV/loop-less files).
+        // Parse the WAV loop + AIFF frame count BEFORE the bytes are moved into the decoder
+        // (both return None for formats they don't apply to).
         wav_loop_frames = parse_wav_loop(&bytes);
+        let aiff_frames = parse_aiff_frames(&bytes);
         let decoder = rodio::Decoder::new(std::io::Cursor::new(bytes))
             .map_err(|_| "can't decode this audio format in-app".to_string())?;
         let channels = decoder.channels();
         let sample_rate = decoder.sample_rate();
-        let samples: Vec<rodio::Sample> = decoder.collect();
+        let mut samples: Vec<rodio::Sample> = decoder.collect();
+        // symphonia's AIFF reader over-reads past the real SSND audio (see parse_aiff_frames) — the
+        // extra frames are the next chunk's bytes as garbage PCM, an audible pop after the sample.
+        // Trim to the COMM-declared frame count (× the decoder's channel count for interleave).
+        if let Some((frames, _)) = aiff_frames {
+            let want = frames as usize * channels.get() as usize;
+            if want > 0 && samples.len() > want {
+                samples.truncate(want);
+            }
+        }
         (samples, channels, sample_rate, Vec::new())
     };
     let ch = channels.get() as usize;
@@ -23400,6 +23410,33 @@ fn decode_audio(
         tracker_samples,
         loop_region,
     })
+}
+
+/// Parse an AIFF/AIFF-C `COMM` chunk for `(numSampleFrames, channels)`. **Why:** symphonia's AIFF
+/// reader over-reads — it treats the SSND chunk *size* as the sample-data length without subtracting
+/// the 8-byte `offset`+`blockSize` header, so it decodes ~2 extra frames of whatever follows SSND
+/// (a trailing `INST`/`MARK`/metadata chunk) as garbage PCM: an audible **pop after the audio ends**.
+/// `decode_audio` uses this to trim the buffer to the authoritative COMM frame count. `None` for
+/// non-AIFF (or a malformed/absent COMM).
+fn parse_aiff_frames(bytes: &[u8]) -> Option<(u32, u16)> {
+    if bytes.len() < 12 || &bytes[0..4] != b"FORM" {
+        return None;
+    }
+    let form = &bytes[8..12];
+    if form != b"AIFF" && form != b"AIFC" {
+        return None;
+    }
+    let mut p = 12usize;
+    while p + 8 <= bytes.len() {
+        let sz = u32::from_be_bytes(bytes[p + 4..p + 8].try_into().ok()?) as usize;
+        if &bytes[p..p + 4] == b"COMM" && p + 14 <= bytes.len() {
+            let channels = u16::from_be_bytes(bytes[p + 8..p + 10].try_into().ok()?);
+            let frames = u32::from_be_bytes(bytes[p + 10..p + 14].try_into().ok()?);
+            return Some((frames, channels));
+        }
+        p += 8 + sz + (sz & 1); // chunks are word-aligned (pad an odd size)
+    }
+    None
 }
 
 /// Parse an embedded loop from a WAV `smpl` chunk. Returns the first loop's
@@ -26000,11 +26037,15 @@ mod tests {
         for &s in &samples {
             ssnd.extend_from_slice(&s.to_be_bytes()); // big-endian PCM
         }
+        // An INST chunk AFTER SSND — the real-file layout that made symphonia's AIFF reader over-read
+        // the SSND header length into this chunk's bytes as ~2 garbage frames (the pop). `decode_audio`
+        // must trim back to `n` frames exactly, so this is a regression guard, not just a smoke test.
+        let inst = vec![0u8; 20];
         let mut body = Vec::from(*b"AIFF");
-        for (tag, chunk) in [(b"COMM", &comm), (b"SSND", &ssnd)] {
+        for (tag, chunk) in [(&b"COMM"[..], &comm), (&b"SSND"[..], &ssnd), (&b"INST"[..], &inst)] {
             body.extend_from_slice(tag);
             body.extend_from_slice(&(chunk.len() as u32).to_be_bytes());
-            body.extend_from_slice(chunk); // both chunks are even-sized (word-aligned)
+            body.extend_from_slice(chunk); // all chunks are even-sized (word-aligned)
         }
         let mut aiff = Vec::from(*b"FORM");
         aiff.extend_from_slice(&(body.len() as u32).to_be_bytes());
@@ -26013,11 +26054,8 @@ mod tests {
         let d = decode_audio(std::path::Path::new("x.aif"), aiff, None).expect("decode AIFF");
         assert_eq!(d.channels.get(), 1);
         assert_eq!(d.sample_rate.get(), 8000);
-        assert!(
-            (d.samples.len() as i64 - n as i64).abs() <= 4,
-            "AIFF frame count {} ~ {n}",
-            d.samples.len()
-        );
+        // EXACT frame count — no over-read garbage past the declared COMM length.
+        assert_eq!(d.samples.len(), n as usize, "AIFF trimmed to the COMM frame count");
     }
 
     #[test]

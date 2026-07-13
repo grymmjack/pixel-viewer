@@ -34,7 +34,9 @@ PDF on stdin, PNG on stdout — falling back to a labeled placeholder if poppler
 page-count/size/title/author metadata via pure-Rust `lopdf`), and **audio**
 (`decode/audio.rs`: a real waveform tile for mp3/wav/ogg/flac/**aiff** via `symphonia` — AIFF
 needs the `aiff` feature on symphonia + `symphonia-aiff` on rodio, else `.aif` decoded to a flat
-silent buffer — else a
+silent buffer; symphonia's AIFF reader also **over-reads** (SSND size not minus its 8-byte
+offset/blockSize header → ~2 garbage frames from the next chunk = a pop after the audio), so
+`decode_audio` trims to the `COMM` frame count via `parse_aiff_frames` — else a
 music-note icon for trackers/voc/au/midi; duration/rate/channels/codec in Details, plus an
 **in-app play/pause/seek preview** via `rodio`). These three are **toggleable plugins**
 (Preferences → "Format plugins" checkboxes; a runtime atomic flag on the `Registry` — off
