@@ -492,10 +492,14 @@ The audio player goes further than playback:
   **`Env:` selector — Amp · Pitch · Cutoff · Res**. Edit the ADSR **visually**: drag the round **node**
   handles (attack / decay+sustain / release) and the diamond **curvature** handles (bow each segment
   concave/convex). A **live playhead** sweeps across as the pad plays so you can see the modulation
-  shape the sound, and an optional **BPM beat grid** snaps nodes to tempo. Each pad also has a built-in
-  **low-pass filter** (cutoff + resonance). A linear envelope exports as universal SFZ (`ampeg_*` /
-  `pitcheg_*` / `fileg_*` + `cutoff`/`resonance`); a curved one exports as an SFZ v2 **flex EG**
-  (`egN_shape*`) that ARIA-based samplers (sforzando, Bitwig) read.
+  shape the sound, and an optional **BPM beat grid** snaps nodes to tempo. You can drag the **release
+  end** node to gate the envelope (silence the tail), pick **preset shapes** (Pluck / Perc / Saw / Gate
+  / Pad), and **save your own**. Each pad also has a built-in **low-pass filter** (cutoff + resonance)
+  and a per-target **LFO** (tremolo / vibrato / filter wobble — sine · triangle · saw · square ·
+  sample&hold, free-running or **tempo-synced**, with fade-in). A linear envelope exports as universal
+  SFZ (`ampeg_*` / `pitcheg_*` / `fileg_*` + `cutoff`/`resonance`); a curved one exports as an SFZ v2
+  **flex EG** (`egN_shape*`), and LFOs export as native `amplfo`/`pitchlfo`/`fillfo` — all read by
+  ARIA-based samplers (sforzando, Bitwig).
 - **Browse a sample bank as a folder.** A **SoundFont (`.sf2`)**, **SFZ (`.sfz`)**, **DLS
   (`.dls`)**, **FastTracker II instrument (`.xi`)**, or **Renoise song/instrument
   (`.xrns`/`.xrni`)** shows as an enterable "folder"; its Details pane reports what's inside

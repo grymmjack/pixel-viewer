@@ -3036,32 +3036,40 @@ impl PixelView {
         let pad = &self.pads[i];
         let (ls, le) = pad.loop_region(buf.duration);
         let region = build_pad_region(&buf, ls, le, pad.loop_type);
-        // Bake the modulation chain: pitch env → amp ADSR → filter (sweep or static) → pan (which
-        // may turn a mono region stereo — carry its channel count to the voice).
+        // Bake the modulation chain: pitch (env+LFO) → amp ADSR → amp LFO → filter (env+LFO or
+        // static) → pan (which may turn a mono region stereo — carry its channel count).
         let ch = buf.channels.get() as usize;
         let sr = buf.sample_rate.get() as f32;
-        // 1. Pitch envelope FIRST (variable-rate resample changes the frame count).
-        let region = if pad.pitch_env.on {
-            apply_pitch_env(
-                region,
-                ch,
-                sr,
-                pad.pitch_depth,
-                &pad.pitch_env,
-                !pad.loop_on,
-            )
-        } else {
-            region
-        };
+        let one_shot = !pad.loop_on;
+        let bpm = self.bpm;
+        let pad = &self.pads[i];
+        // 1. Pitch modulation FIRST (variable-rate resample changes the frame count).
+        let region = apply_pitch_mod(
+            region,
+            ch,
+            sr,
+            pad.pitch_depth,
+            pad.pitch_env.on.then_some(&pad.pitch_env),
+            pad.pitch_lfo.on.then_some(&pad.pitch_lfo),
+            bpm,
+            one_shot,
+        );
         // 2. Amplitude ADSR (release only shapes a one-shot's tail; the gate can end it early).
         let region = if pad.amp_env_on {
-            apply_amp_env(region, ch, sr, &pad.amp_env(), !pad.loop_on)
+            apply_amp_env(region, ch, sr, &pad.amp_env(), one_shot)
         } else {
             region
         };
-        // 3. Low-pass filter: a cutoff/resonance ENVELOPE sweep if either is on, else the static
+        // 3. Amplitude LFO (tremolo).
+        let region = if pad.amp_lfo.on {
+            apply_amp_lfo(region, ch, sr, &pad.amp_lfo, bpm)
+        } else {
+            region
+        };
+        // 4. Low-pass filter: a cutoff/resonance ENVELOPE or LFO if any is on, else the static
         // filter (if enabled).
-        let region = if pad.cutoff_env.on || pad.res_env.on {
+        let filt_mod = pad.cutoff_env.on || pad.res_env.on || pad.cutoff_lfo.on || pad.res_lfo.on;
+        let region = if filt_mod {
             apply_lowpass_env(
                 region,
                 ch,
@@ -3070,14 +3078,17 @@ impl PixelView {
                 pad.resonance,
                 pad.cutoff_env.on.then_some(&pad.cutoff_env),
                 pad.res_env.on.then_some(&pad.res_env),
-                !pad.loop_on,
+                pad.cutoff_lfo.on.then_some(&pad.cutoff_lfo),
+                pad.res_lfo.on.then_some(&pad.res_lfo),
+                bpm,
+                one_shot,
             )
         } else if pad.filter_on {
             apply_lowpass(region, ch, sr, pad.cutoff_hz, pad.resonance)
         } else {
             region
         };
-        // 4. Pan.
+        // 5. Pan.
         let (region, eff_ch) = apply_pan(region, ch, pad.pan);
         let channels = std::num::NonZeroU16::new(eff_ch as u16).unwrap_or(buf.channels);
         let (pitch, loop_it) = (pad.pitch, pad.loop_on);
@@ -3276,6 +3287,26 @@ impl PixelView {
             },
             mono: !old.is_empty() && old.mono,
             amp_rel_end: if old.is_empty() { 0.0 } else { old.amp_rel_end },
+            amp_lfo: if old.is_empty() {
+                Lfo::seeded()
+            } else {
+                old.amp_lfo
+            },
+            pitch_lfo: if old.is_empty() {
+                Lfo::seeded()
+            } else {
+                old.pitch_lfo
+            },
+            cutoff_lfo: if old.is_empty() {
+                Lfo::seeded()
+            } else {
+                old.cutoff_lfo
+            },
+            res_lfo: if old.is_empty() {
+                Lfo::seeded()
+            } else {
+                old.res_lfo
+            },
             amp_attack: if old.is_empty() { 0.0 } else { old.amp_attack },
             amp_decay: if old.is_empty() { 0.0 } else { old.amp_decay },
             amp_sustain: if old.is_empty() { 1.0 } else { old.amp_sustain },
@@ -3575,6 +3606,7 @@ impl PixelView {
         );
         // Dedupe filenames (two pads could share a base name) so each WAV is distinct.
         let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let bpm = self.bpm; // for resolving tempo-synced LFO rates
         for (note, fname, wav, pad, dur, rate) in &pads {
             let mut fname = fname.clone();
             let mut n = 2;
@@ -3728,6 +3760,59 @@ impl PixelView {
                 sfz.push_str(&format!(
                     "fil_type=lpf_2p\ncutoff={:.1}\nresonance={res_db:.2}\n",
                     pad.cutoff_hz
+                ));
+            }
+            // LFOs → the native v1 dedicated LFOs (amplfo/pitchlfo/fillfo) — SINE, universally
+            // supported — carrying the resolved rate (Hz, incl. tempo-sync), depth and fade. A
+            // resonance LFO uses a v2 flex LFO (v1 has none). Non-sine waves + S&H are baked into the
+            // audio in-app but export as a sine approximation (SFZ v1 LFOs are sine).
+            if pad.amp_lfo.on && pad.amp_lfo.depth > 1e-3 {
+                let l = &pad.amp_lfo;
+                sfz.push_str(&format!(
+                    "amplfo_freq={:.3}\namplfo_depth={:.2}\n",
+                    l.freq(bpm),
+                    l.depth.clamp(0.0, 1.0) * 12.0
+                ));
+                if l.fade > 1e-3 {
+                    sfz.push_str(&format!("amplfo_fade={:.3}\n", l.fade));
+                }
+            }
+            if pad.pitch_lfo.on && pad.pitch_lfo.depth.abs() > 1e-3 {
+                let l = &pad.pitch_lfo;
+                sfz.push_str(&format!(
+                    "pitchlfo_freq={:.3}\npitchlfo_depth={}\n",
+                    l.freq(bpm),
+                    (l.depth * 100.0).round() as i32
+                ));
+                if l.fade > 1e-3 {
+                    sfz.push_str(&format!("pitchlfo_fade={:.3}\n", l.fade));
+                }
+            }
+            let filt_present = pad.filter_on || pad.cutoff_env.on || pad.cutoff_lfo.on;
+            if pad.cutoff_lfo.on && pad.cutoff_lfo.depth.abs() > 1e-3 {
+                let l = &pad.cutoff_lfo;
+                if !filt_present {
+                    sfz.push_str("fil_type=lpf_2p\n");
+                }
+                sfz.push_str(&format!(
+                    "fillfo_freq={:.3}\nfillfo_depth={}\n",
+                    l.freq(bpm),
+                    (l.depth * 1200.0).round() as i32
+                ));
+                if l.fade > 1e-3 {
+                    sfz.push_str(&format!("fillfo_fade={:.3}\n", l.fade));
+                }
+            }
+            if pad.res_lfo.on && pad.res_lfo.depth.abs() > 1e-3 {
+                let l = &pad.res_lfo;
+                if !filt_present {
+                    sfz.push_str("fil_type=lpf_2p\n");
+                }
+                // v1 has no resonance LFO → a v2 flex LFO (sine) on resonance.
+                sfz.push_str(&format!(
+                    "lfo04_wave=1\nlfo04_freq={:.3}\nlfo04_resonance={:.2}\n",
+                    l.freq(bpm),
+                    l.depth.clamp(0.0, 1.0) * 12.0
                 ));
             }
             if pad.loop_on {
@@ -5227,6 +5312,74 @@ impl PixelView {
                                 });
                         }
                     });
+                    // LFO for the CURRENT target (tremolo / vibrato / filter wobble) — shown while
+                    // the envelope editor is open. Baked into the voice + exported to SFZ.
+                    if self.env_edit {
+                        let t = self.env_target;
+                        ui.horizontal_wrapped(|ui| {
+                            let l = self.pads[i].lfo_mut(t);
+                            ui.checkbox(&mut l.on, "LFO").on_hover_text(
+                                "Low-frequency oscillator on this target (tremolo / vibrato / \
+                                 filter wobble). Tempo-syncs to the BPM when Sync is on.",
+                            );
+                            if l.on {
+                                egui::ComboBox::from_id_salt("lfo_wave")
+                                    .selected_text(LFO_WAVES[(l.wave as usize).min(5)])
+                                    .width(66.0)
+                                    .show_ui(ui, |ui| {
+                                        for (wi, name) in LFO_WAVES.iter().enumerate() {
+                                            ui.selectable_value(&mut l.wave, wi as u8, *name);
+                                        }
+                                    });
+                                ui.checkbox(&mut l.sync, "Sync")
+                                    .on_hover_text("Lock the rate to the BPM (beat divisions)");
+                                if l.sync {
+                                    egui::ComboBox::from_id_salt("lfo_div")
+                                        .selected_text(LFO_SYNC[(l.sync_div as usize).min(4)].0)
+                                        .width(52.0)
+                                        .show_ui(ui, |ui| {
+                                            for (di, (name, _)) in LFO_SYNC.iter().enumerate() {
+                                                ui.selectable_value(
+                                                    &mut l.sync_div,
+                                                    di as u8,
+                                                    *name,
+                                                );
+                                            }
+                                        });
+                                } else {
+                                    ui.weak("Rate");
+                                    ui.add(
+                                        egui::DragValue::new(&mut l.rate_hz)
+                                            .range(0.01..=40.0)
+                                            .speed(0.05)
+                                            .suffix(" Hz")
+                                            .max_decimals(2),
+                                    );
+                                }
+                                ui.weak("Depth");
+                                let (dmax, suffix) = match t {
+                                    EnvTarget::Pitch => (12.0, " st"),
+                                    EnvTarget::Cutoff => (4.0, " oct"),
+                                    _ => (1.0, ""),
+                                };
+                                ui.add(
+                                    egui::DragValue::new(&mut l.depth)
+                                        .range(0.0..=dmax)
+                                        .speed(dmax / 200.0)
+                                        .suffix(suffix)
+                                        .max_decimals(2),
+                                );
+                                ui.weak("Fade");
+                                ui.add(
+                                    egui::DragValue::new(&mut l.fade)
+                                        .range(0.0..=4.0)
+                                        .speed(0.01)
+                                        .suffix(" s")
+                                        .max_decimals(2),
+                                );
+                            }
+                        });
+                    }
                     // Low-pass filter (static cutoff/resonance; baked + exported as SFZ
                     // cutoff/resonance/fil_type).
                     ui.horizontal_wrapped(|ui| {
@@ -6032,6 +6185,26 @@ impl PixelView {
                     );
                     if (a, d, s, rel, ca, cd, cr, rend) != orig {
                         want_env = Some((pi, target, [a, d, s, rel, ca, cd, cr, rend]));
+                    }
+                    // Visual LFO preview: the current target's LFO waveform drawn centered (shape +
+                    // rate + fade visible) in a fainter shade. Editable via the LFO controls row.
+                    let l = self.pads[pi].lfo(target);
+                    if l.on && l.depth.abs() > 1e-3 {
+                        let bpm = self.bpm;
+                        let mid_y = rect.center().y;
+                        let amp_px = span_y * 0.28;
+                        let steps = (w as usize).clamp(2, 1024);
+                        let mut pts = Vec::with_capacity(steps + 1);
+                        for k in 0..=steps {
+                            let u = k as f32 / steps as f32;
+                            let tt = vs + u * (ve - vs);
+                            let v = eval_lfo(l, tt, bpm);
+                            pts.push(egui::pos2(rect.left() + u * w, mid_y - v * amp_px));
+                        }
+                        p.add(egui::Shape::line(
+                            pts,
+                            egui::Stroke::new(1.0, env_col.gamma_multiply(0.5)),
+                        ));
                     }
                 }
             }
@@ -20455,6 +20628,12 @@ struct Pad {
     pitch_depth: f32,
     cutoff_env: Env,
     res_env: Env,
+    // Per-target LFOs (tremolo / vibrato / filter-wobble). `Lfo.depth` is in target units (amp 0..1
+    // dip, pitch semitones, cutoff octaves, res 0..1); tempo-syncs to the editor BPM when `sync`.
+    amp_lfo: Lfo,
+    pitch_lfo: Lfo,
+    cutoff_lfo: Lfo,
+    res_lfo: Lfo,
     // Monophonic: a new hit cuts this pad's own previous voice (self-choke). Looping pads are
     // always monophonic; this makes a one-shot pad mono too (hi-hats, 808s). Shown by a tile chip.
     mono: bool,
@@ -20559,6 +20738,128 @@ impl Env {
             self.rel_end
         }
     }
+}
+
+/// LFO waveform names (indexed by `Lfo.wave`), and the tempo-sync beat divisions (label + beats
+/// per cycle — `freq = (bpm/60)/beats`).
+const LFO_WAVES: [&str; 6] = ["Sine", "Tri", "Saw up", "Saw dn", "Square", "S&H"];
+const LFO_SYNC: [(&str, f32); 5] = [
+    ("1/1", 4.0),
+    ("1/2", 2.0),
+    ("1/4", 1.0),
+    ("1/8", 0.5),
+    ("1/16", 0.25),
+];
+
+/// A per-target **low-frequency oscillator** — tremolo (amp), vibrato (pitch) or filter wobble
+/// (cutoff/res). `depth` is in target units (amp 0..1 dip · pitch semitones · cutoff octaves ·
+/// res 0..1). Free-running in Hz, or tempo-synced to the editor BPM. `fade`/`delay`/`phase` shape
+/// the onset. Serializes to one flat record field like `Env`.
+#[derive(Clone, Copy)]
+struct Lfo {
+    on: bool,
+    wave: u8,     // index into LFO_WAVES
+    rate_hz: f32, // free-running frequency
+    sync: bool,   // tempo-sync (rate from BPM + sync_div)
+    sync_div: u8, // index into LFO_SYNC
+    depth: f32,   // modulation depth in target units
+    fade: f32,    // fade-in seconds
+    delay: f32,   // delay before onset (seconds)
+    phase: f32,   // start phase 0..1
+}
+
+impl Lfo {
+    fn seeded() -> Self {
+        Lfo {
+            on: false,
+            wave: 0,
+            rate_hz: 5.0,
+            sync: false,
+            sync_div: 2, // 1/4
+            depth: 0.0,
+            fade: 0.0,
+            delay: 0.0,
+            phase: 0.0,
+        }
+    }
+    fn to_field(self) -> String {
+        format!(
+            "{};{};{};{};{};{};{};{};{}",
+            if self.on { 1 } else { 0 },
+            self.wave,
+            self.rate_hz,
+            if self.sync { 1 } else { 0 },
+            self.sync_div,
+            self.depth,
+            self.fade,
+            self.delay,
+            self.phase
+        )
+    }
+    fn from_field(s: &str) -> Self {
+        let p: Vec<&str> = s.split(';').collect();
+        let g = |i: usize, d: f32| p.get(i).and_then(|x| x.parse().ok()).unwrap_or(d);
+        let b = Self::seeded();
+        Lfo {
+            on: p.first() == Some(&"1"),
+            wave: g(1, 0.0) as u8,
+            rate_hz: g(2, b.rate_hz),
+            sync: p.get(3) == Some(&"1"),
+            sync_div: g(4, 2.0) as u8,
+            depth: g(5, 0.0),
+            fade: g(6, 0.0),
+            delay: g(7, 0.0),
+            phase: g(8, 0.0),
+        }
+    }
+    /// The effective frequency (Hz) — from the tempo-sync division if `sync`, else the free rate.
+    fn freq(&self, bpm: f32) -> f32 {
+        if self.sync {
+            let beats = LFO_SYNC[(self.sync_div as usize).min(LFO_SYNC.len() - 1)].1;
+            (bpm.max(1.0) / 60.0) / beats.max(1e-3)
+        } else {
+            self.rate_hz.max(0.0)
+        }
+    }
+}
+
+/// Evaluate an LFO at time `t` seconds → its waveform value in −1..1, scaled by the fade-in and
+/// gated by the delay (0 before `delay`). `bpm` resolves a tempo-synced rate. Pure (unit-tested).
+fn eval_lfo(l: &Lfo, t: f32, bpm: f32) -> f32 {
+    if t < l.delay {
+        return 0.0;
+    }
+    let ph = (t - l.delay) * l.freq(bpm) + l.phase;
+    let frac = ph - ph.floor();
+    let raw = match l.wave {
+        0 => (std::f32::consts::TAU * ph).sin(),
+        1 => 4.0 * (frac - 0.5).abs() - 1.0, // triangle (1 at edges, −1 at 0.5)
+        2 => 2.0 * frac - 1.0,               // saw up
+        3 => 1.0 - 2.0 * frac,               // saw down
+        4 => {
+            if frac < 0.5 {
+                1.0
+            } else {
+                -1.0
+            }
+        } // square
+        5 => {
+            // sample & hold: one pseudo-random value per cycle (hash the cycle index)
+            let cyc = ph.floor() as i64 as u64;
+            let h = cyc
+                .wrapping_mul(0x9E3779B97F4A7C15)
+                .rotate_left(31)
+                .wrapping_mul(0xBF58476D1CE4E5B9);
+            ((h >> 40) as f32 / 8_388_608.0) - 1.0 // 24-bit → −1..1
+        }
+        _ => 0.0,
+    };
+    let fade = if l.fade > 1e-4 {
+        ((t - l.delay) / l.fade).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    raw * fade
 }
 
 /// Named starter shapes for the envelope editor. Times are **duration-proportional** so a shape
@@ -20798,6 +21099,10 @@ impl Pad {
             pitch_depth: -12.0,
             cutoff_env: Env::seeded(),
             res_env: Env::seeded(),
+            amp_lfo: Lfo::seeded(),
+            pitch_lfo: Lfo::seeded(),
+            cutoff_lfo: Lfo::seeded(),
+            res_lfo: Lfo::seeded(),
             mono: false,
             color: None,
             source: None,
@@ -20867,6 +21172,11 @@ impl Pad {
             if self.mono { "1" } else { "0" }.to_string(),
             // Index 33: amp envelope gate end (0 = sample end).
             format!("{}", self.amp_rel_end),
+            // Indices 34..=37: per-target LFOs (each one flat field).
+            self.amp_lfo.to_field(),
+            self.pitch_lfo.to_field(),
+            self.cutoff_lfo.to_field(),
+            self.res_lfo.to_field(),
         ]
     }
 
@@ -20940,6 +21250,23 @@ impl Pad {
             EnvTarget::Res => self.res_env.on,
         }
     }
+    fn lfo(&self, target: EnvTarget) -> &Lfo {
+        match target {
+            EnvTarget::Amp => &self.amp_lfo,
+            EnvTarget::Pitch => &self.pitch_lfo,
+            EnvTarget::Cutoff => &self.cutoff_lfo,
+            EnvTarget::Res => &self.res_lfo,
+        }
+    }
+    /// The LFO for a modulation `target` (mutable — the LFO controls edit it in place).
+    fn lfo_mut(&mut self, target: EnvTarget) -> &mut Lfo {
+        match target {
+            EnvTarget::Amp => &mut self.amp_lfo,
+            EnvTarget::Pitch => &mut self.pitch_lfo,
+            EnvTarget::Cutoff => &mut self.cutoff_lfo,
+            EnvTarget::Res => &mut self.res_lfo,
+        }
+    }
     fn set_env_on(&mut self, target: EnvTarget, on: bool) {
         match target {
             EnvTarget::Amp => self.amp_env_on = on,
@@ -21007,6 +21334,10 @@ impl Pad {
             res_env: Env::from_field(&g(31)),
             mono: g(32) == "1",
             amp_rel_end: g(33).parse().unwrap_or(0.0),
+            amp_lfo: Lfo::from_field(&g(34)),
+            pitch_lfo: Lfo::from_field(&g(35)),
+            cutoff_lfo: Lfo::from_field(&g(36)),
+            res_lfo: Lfo::from_field(&g(37)),
             flash_t: -1.0,
         };
         (pad, has_audio)
@@ -21239,6 +21570,24 @@ fn apply_amp_env(mut region: Vec<f32>, ch: usize, sr: f32, env: &Env, one_shot: 
     region
 }
 
+/// Bake an **amplitude LFO** (tremolo) into a region: `gain = 1 − depth·½·(1 − lfo)` so the level
+/// dips toward `1 − depth` at troughs and never boosts past 1 (no clipping). `depth` 0..1.
+fn apply_amp_lfo(mut region: Vec<f32>, ch: usize, sr: f32, lfo: &Lfo, bpm: f32) -> Vec<f32> {
+    let ch = ch.max(1);
+    let depth = lfo.depth.clamp(0.0, 1.0);
+    if depth < 1e-4 {
+        return region;
+    }
+    let frames = region.len() / ch;
+    for f in 0..frames {
+        let g = 1.0 - depth * 0.5 * (1.0 - eval_lfo(lfo, f as f32 / sr, bpm));
+        for c in 0..ch {
+            region[f * ch + c] *= g;
+        }
+    }
+    region
+}
+
 /// A biquad **low-pass** (RBJ cookbook) with per-channel state (≤2 ch). Coefficients can be
 /// recomputed mid-stream (`set_lowpass`) for a cutoff *envelope*; a static filter just sets them
 /// once. `resonance` 0..1 maps to Q ≈ 0.707 … ~11 (a peak at cutoff).
@@ -21318,10 +21667,10 @@ fn apply_lowpass(
     region
 }
 
-/// Apply a low-pass whose cutoff and/or resonance are **modulated by an envelope** over time
-/// (a filter sweep). `cutoff_env` sweeps the cutoff 30 Hz…`cutoff_max` (log); `res_env` sweeps the
-/// resonance 0…1; a `None` env holds that parameter static. Coeffs recompute only when a value
-/// moves enough (cheap). Time reference = source seconds, `one_shot` gates the release.
+/// Apply a low-pass whose cutoff and/or resonance are **modulated over time** by an envelope and/or
+/// an LFO (a filter sweep + wobble). `cutoff_env` sweeps 30 Hz…`cutoff_max` (log) and `cutoff_lfo`
+/// multiplies the cutoff by `2^(depth·lfo)` octaves; `res_env`/`res_lfo` move the resonance 0…1. A
+/// `None` source contributes nothing. Coeffs recompute only when a value moves enough (cheap).
 #[allow(clippy::too_many_arguments)]
 fn apply_lowpass_env(
     mut region: Vec<f32>,
@@ -21331,9 +21680,16 @@ fn apply_lowpass_env(
     res_static: f32,
     cutoff_env: Option<&Env>,
     res_env: Option<&Env>,
+    cutoff_lfo: Option<&Lfo>,
+    res_lfo: Option<&Lfo>,
+    bpm: f32,
     one_shot: bool,
 ) -> Vec<f32> {
-    if ch == 0 || ch > 2 || (cutoff_env.is_none() && res_env.is_none()) {
+    let any = cutoff_env.is_some()
+        || res_env.is_some()
+        || cutoff_lfo.is_some_and(|l| l.depth.abs() > 1e-3)
+        || res_lfo.is_some_and(|l| l.depth.abs() > 1e-3);
+    if ch == 0 || ch > 2 || !any {
         return region;
     }
     let frames = region.len() / ch;
@@ -21344,14 +21700,21 @@ fn apply_lowpass_env(
     let (mut last_c, mut last_r) = (-1.0f32, -1.0f32);
     for f in 0..frames {
         let t = f as f32 / sr;
-        let cutoff = match cutoff_env {
+        let mut cutoff = match cutoff_env {
             Some(e) => cutoff_min * ratio.powf(eval_env(e, t, dur, one_shot).clamp(0.0, 1.0)),
             None => cutoff_max,
         };
-        let res = match res_env {
+        if let Some(l) = cutoff_lfo.filter(|l| l.depth.abs() > 1e-3) {
+            cutoff *= 2.0f32.powf(l.depth * eval_lfo(l, t, bpm)); // ± octaves
+        }
+        cutoff = cutoff.clamp(20.0, sr * 0.49);
+        let mut res = match res_env {
             Some(e) => eval_env(e, t, dur, one_shot).clamp(0.0, 1.0),
             None => res_static,
         };
+        if let Some(l) = res_lfo.filter(|l| l.depth.abs() > 1e-3) {
+            res = (res + l.depth * eval_lfo(l, t, bpm)).clamp(0.0, 1.0);
+        }
         // Recompute coefficients only when the cutoff moved >1% or resonance >0.01.
         if (cutoff - last_c).abs() > last_c.abs() * 0.01 + 0.5 || (res - last_r).abs() > 0.01 {
             bq.set_lowpass(cutoff, res, sr);
@@ -21366,19 +21729,25 @@ fn apply_lowpass_env(
     region
 }
 
-/// Bake a **pitch envelope** into an interleaved region by variable-rate resampling: at each output
-/// frame the read rate is `2^(depth·env(t)/12)` (semitones), so the pitch glides with the envelope
-/// (e.g. a fast decay to 0 = an 808 "drop"). Linear interpolation; output length varies with the
-/// average rate (capped so an extreme down-sweep can't balloon memory). `depth` is signed semitones.
-fn apply_pitch_env(
+/// Bake **pitch modulation** (envelope and/or LFO) into a region by variable-rate resampling: at
+/// each output frame the read rate is `2^(semitones(t)/12)`, where `semitones` sums the pitch
+/// envelope (`env_depth·env(t)`, e.g. an 808 drop) and the pitch LFO (`lfo.depth·lfo(t)`, vibrato).
+/// Linear interpolation; output length varies with the average rate (capped so a slow down-sweep
+/// can't balloon memory). A `None` source contributes nothing; both `None` ⇒ untouched.
+#[allow(clippy::too_many_arguments)]
+fn apply_pitch_mod(
     region: Vec<f32>,
     ch: usize,
     sr: f32,
-    depth: f32,
-    env: &Env,
+    env_depth: f32,
+    env: Option<&Env>,
+    lfo: Option<&Lfo>,
+    bpm: f32,
     one_shot: bool,
 ) -> Vec<f32> {
-    if ch == 0 || depth.abs() < 1e-3 {
+    let env_on = env.is_some() && env_depth.abs() > 1e-3;
+    let lfo_on = lfo.is_some_and(|l| l.depth.abs() > 1e-3);
+    if ch == 0 || (!env_on && !lfo_on) {
         return region;
     }
     let frames = region.len() / ch;
@@ -21391,8 +21760,14 @@ fn apply_pitch_env(
     let mut pos = 0.0f32; // fractional source frame
     while pos < (frames - 1) as f32 && out.len() < cap {
         let t = pos / sr;
-        let ev = eval_env(env, t, dur, one_shot);
-        let rate = 2.0f32.powf(depth * ev / 12.0).clamp(0.03125, 32.0);
+        let mut semis = 0.0;
+        if let Some(e) = env.filter(|_| env_on) {
+            semis += env_depth * eval_env(e, t, dur, one_shot);
+        }
+        if let Some(l) = lfo.filter(|_| lfo_on) {
+            semis += l.depth * eval_lfo(l, t, bpm);
+        }
+        let rate = 2.0f32.powf(semis / 12.0).clamp(0.03125, 32.0);
         let i0 = pos.floor() as usize;
         let frac = pos - i0 as f32;
         for c in 0..ch {
@@ -24632,16 +25007,57 @@ mod tests {
             cr: 0.0,
             rel_end: 0.0,
         };
-        let out = apply_pitch_env(mono.clone(), 1, sr, -12.0, &down, false);
+        let out = apply_pitch_mod(mono.clone(), 1, sr, -12.0, Some(&down), None, 120.0, false);
         assert!(out.len() > mono.len()); // slower playback → more output frames
                                          // An upward pitch reads faster → SHORTER output.
-        let up = apply_pitch_env(mono.clone(), 1, sr, 12.0, &down, false);
+        let up = apply_pitch_mod(mono.clone(), 1, sr, 12.0, Some(&down), None, 120.0, false);
         assert!(up.len() < mono.len());
-        // Zero depth is a no-op.
+        // Zero depth + no LFO is a no-op.
         assert_eq!(
-            apply_pitch_env(mono.clone(), 1, sr, 0.0, &down, false),
+            apply_pitch_mod(mono.clone(), 1, sr, 0.0, Some(&down), None, 120.0, false),
             mono
         );
+        // A pitch LFO alone (no env) still resamples (vibrato).
+        let mut vib = Lfo::seeded();
+        vib.on = true;
+        vib.rate_hz = 6.0;
+        vib.depth = 2.0; // ±2 st
+        let v = apply_pitch_mod(mono.clone(), 1, sr, 0.0, None, Some(&vib), 120.0, false);
+        assert!(!v.is_empty());
+    }
+
+    #[test]
+    fn lfo_eval_field_and_tremolo() {
+        let mut l = Lfo::seeded();
+        l.on = true;
+        l.wave = 0; // sine
+        l.rate_hz = 1.0; // 1 Hz
+        l.depth = 1.0;
+        // Sine at t=0 ≈ 0, quarter period (0.25s) ≈ +1, half (0.5s) ≈ 0.
+        assert!(eval_lfo(&l, 0.0, 120.0).abs() < 1e-3);
+        assert!((eval_lfo(&l, 0.25, 120.0) - 1.0).abs() < 1e-3);
+        assert!(eval_lfo(&l, 0.5, 120.0).abs() < 1e-3);
+        // Delay gates it: nothing before `delay`.
+        l.delay = 0.5;
+        assert!(eval_lfo(&l, 0.2, 120.0).abs() < 1e-9);
+        l.delay = 0.0;
+        // Tempo sync: a 1/4 LFO at 120 BPM = 2 Hz (one cycle per quarter note = 0.5 s).
+        l.sync = true;
+        l.sync_div = 2; // 1/4
+        assert!((l.freq(120.0) - 2.0).abs() < 1e-6);
+        // Field round-trip.
+        let r = Lfo::from_field(&l.to_field());
+        assert!(r.on && r.sync && r.sync_div == 2 && (r.depth - 1.0).abs() < 1e-6);
+        // Tremolo dips the level toward 1−depth and never boosts past 1.
+        let mono = vec![1.0f32; 200];
+        let mut tl = Lfo::seeded();
+        tl.on = true;
+        tl.wave = 0;
+        tl.rate_hz = 2.5;
+        tl.depth = 0.8;
+        let out = apply_amp_lfo(mono, 1, 100.0, &tl, 120.0);
+        assert!(out.iter().all(|&x| x <= 1.0 + 1e-6 && x >= 0.2 - 1e-6));
+        assert!(out.iter().cloned().fold(1.0f32, f32::min) < 0.5); // it dips
     }
 
     #[test]

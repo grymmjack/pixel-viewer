@@ -1064,8 +1064,16 @@ straight through and holds 0 = the gate); a plain linear un-gated envelope stays
 (0..1, mirrors `apply_amp_env`'s shape) drives the non-amp bakers. **Filter**: a `Biquad` low-pass
 (`filter_on`/`cutoff_hz`/`resonance`, records 25–27); `apply_lowpass` (static) or `apply_lowpass_env`
 (cutoff swept 30 Hz…`cutoff_hz` log and/or resonance 0…1, coeffs recomputed only when they move).
-**Pitch env**: `apply_pitch_env` variable-rate resamples (`2^(depth·env/12)`; changes length, capped) —
-baked FIRST since it changes the frame count. Trigger order: **pitch → amp → filter → pan**. **Export
+**Pitch env**: variable-rate resample (`2^(semis/12)`; changes length, capped) — baked FIRST.
+**LFOs (`Lfo` per target, `amp_lfo`/`pitch_lfo`/`cutoff_lfo`/`res_lfo`, records 34–37):** tremolo /
+vibrato / filter-wobble. `eval_lfo` (−1..1, sine/tri/saw±/square/S&H, `fade`/`delay`/`phase`, and a
+tempo-synced `freq(bpm)` from `LFO_SYNC`). Baked: `apply_amp_lfo` (a gain-dip pass), `apply_pitch_mod`
+combines the pitch env + LFO into ONE resample, `apply_lowpass_env` combines cutoff/res env + LFO into
+the biquad. Trigger order: **pitch(env+LFO) → amp env → amp LFO → filter(env+LFO or static) → pan**.
+A faint LFO-shape preview draws centered on the waveform; LFO controls (wave/rate/sync/depth/fade) sit
+in an `LFO` row under the envelope controls. Export: native v1 `amplfo`/`pitchlfo`/`fillfo` (SINE,
+carrying the resolved Hz incl. tempo-sync + depth + fade) + a v2 flex `lfo04_resonance` (v1 has no res
+LFO); **non-sine waves are baked in-app but export as a sine approximation** (SFZ v1 LFOs are sine). **Export
 is hybrid per target**: linear amp→`ampeg_*`, pitch→`pitcheg_*`+`pitcheg_depth`(cents),
 cutoff→`fil_type`+`cutoff`+`fileg_*`+`fileg_depth`; a **curved** one uses a v2 flex EG via `push_flex_eg`
 (eg01 amp / eg02 pitch / eg03 cutoff / eg04 resonance — SFZ v1 has no res EG, so resonance is always
