@@ -25951,6 +25951,62 @@ mod tests {
     }
 
     #[test]
+    fn aiff_pcm_decodes() {
+        // Guards the AIFF decode support (rodio `symphonia-aiff` + symphonia `aiff` features): a
+        // huge chunk of the user's sample library is `.aif`, and without the feature `rodio::Decoder`
+        // rejected them (flat/silent waveform). Synthesize a minimal 16-bit PCM AIFF and decode it.
+        // 80-bit IEEE-754 extended (big-endian) sample rate — the one fiddly AIFF field.
+        fn ext80(rate: u32) -> [u8; 10] {
+            let mut out = [0u8; 10];
+            if rate == 0 {
+                return out;
+            }
+            let (mut m, mut exp) = (rate as u64, 63i32);
+            while m & (1 << 63) == 0 {
+                m <<= 1;
+                exp -= 1;
+            }
+            let biased = (16383 + exp) as u16; // sign bit stays 0 (positive)
+            out[0..2].copy_from_slice(&biased.to_be_bytes());
+            out[2..10].copy_from_slice(&m.to_be_bytes());
+            out
+        }
+        let samples: Vec<i16> = (0..1000)
+            .map(|i| ((i as f32 * 0.1).sin() * 10000.0) as i16)
+            .collect();
+        let n = samples.len() as u32;
+        let mut comm = Vec::new();
+        comm.extend_from_slice(&1u16.to_be_bytes()); // channels
+        comm.extend_from_slice(&n.to_be_bytes()); // sample frames
+        comm.extend_from_slice(&16u16.to_be_bytes()); // bits/sample
+        comm.extend_from_slice(&ext80(8000));
+        let mut ssnd = Vec::new();
+        ssnd.extend_from_slice(&0u32.to_be_bytes()); // offset
+        ssnd.extend_from_slice(&0u32.to_be_bytes()); // blockSize
+        for &s in &samples {
+            ssnd.extend_from_slice(&s.to_be_bytes()); // big-endian PCM
+        }
+        let mut body = Vec::from(*b"AIFF");
+        for (tag, chunk) in [(b"COMM", &comm), (b"SSND", &ssnd)] {
+            body.extend_from_slice(tag);
+            body.extend_from_slice(&(chunk.len() as u32).to_be_bytes());
+            body.extend_from_slice(chunk); // both chunks are even-sized (word-aligned)
+        }
+        let mut aiff = Vec::from(*b"FORM");
+        aiff.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        aiff.extend_from_slice(&body);
+
+        let d = decode_audio(std::path::Path::new("x.aif"), aiff, None).expect("decode AIFF");
+        assert_eq!(d.channels.get(), 1);
+        assert_eq!(d.sample_rate.get(), 8000);
+        assert!(
+            (d.samples.len() as i64 - n as i64).abs() <= 4,
+            "AIFF frame count {} ~ {n}",
+            d.samples.len()
+        );
+    }
+
+    #[test]
     fn parses_wav_smpl_loop_and_maps_type() {
         let u = |v: u32| v.to_le_bytes();
         // A minimal WAV: RIFF/WAVE, a fmt chunk + an ODD-sized data chunk (both skipped, exercising
