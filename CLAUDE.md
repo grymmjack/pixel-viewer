@@ -1047,7 +1047,14 @@ tinted its target color, `EnvTarget::color`). A reusable **`Env`** struct `{on,a
 serializes to ONE record field (`to_field`/`from_field`, `;`-joined) so the Pad record stays flat
 (indices 28–31: `pitch_env`, `pitch_depth`, `cutoff_env`, `res_env`; amp keeps its legacy flat fields).
 The overlay reads/writes the selected target generically via `Pad::env_values`/`set_env_values`/
-`env_on`/`set_env_on`; `want_env` carries `(pad, EnvTarget, [f32;7])`. **`eval_env(env,t,dur,one_shot)`**
+`env_on`/`set_env_on` (an 8-value `[a,d,s,rel,ca,cd,cr,rel_end]`); `want_env` carries
+`(pad, EnvTarget, [f32;8])`. **Gate / release-end node:** each envelope has a `rel_end` (seconds; 0 =
+sample end) — a 4th draggable node at the release end lets the envelope finish **before** the sample
+(the tail is silenced; `Env::end(dur)` resolves it, `eval_env` returns 0 past it). Amp is baked
+through the SAME `eval_env` now (`apply_amp_env(&Env)` — no more bespoke frame math), so amp, pitch,
+cutoff and res all share one shape + gate. A gated OR curved envelope forces the **flex-EG** export
+(`push_flex_eg` emits a 5-point EG incl. an explicit sustain-hold, no `egN_sustain`, so it plays
+straight through and holds 0 = the gate); a plain linear un-gated envelope stays v1. **`eval_env(env,t,dur,one_shot)`**
 (0..1, mirrors `apply_amp_env`'s shape) drives the non-amp bakers. **Filter**: a `Biquad` low-pass
 (`filter_on`/`cutoff_hz`/`resonance`, records 25–27); `apply_lowpass` (static) or `apply_lowpass_env`
 (cutoff swept 30 Hz…`cutoff_hz` log and/or resonance 0…1, coeffs recomputed only when they move).

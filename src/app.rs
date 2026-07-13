@@ -3043,23 +3043,9 @@ impl PixelView {
         } else {
             region
         };
-        // 2. Amplitude ADSR (release only shapes a one-shot's tail).
+        // 2. Amplitude ADSR (release only shapes a one-shot's tail; the gate can end it early).
         let region = if pad.amp_env_on {
-            apply_amp_env(
-                region,
-                ch,
-                sr,
-                pad.amp_attack,
-                pad.amp_decay,
-                pad.amp_sustain,
-                pad.amp_release,
-                [
-                    pad.amp_attack_curve,
-                    pad.amp_decay_curve,
-                    pad.amp_release_curve,
-                ],
-                !pad.loop_on,
-            )
+            apply_amp_env(region, ch, sr, &pad.amp_env(), !pad.loop_on)
         } else {
             region
         };
@@ -3147,8 +3133,9 @@ impl PixelView {
         let v = p.env_values(target); // [a, d, s, rel, ca, cd, cr]
         let flat = v[0] < 1e-4 && v[1] < 1e-4 && (v[2] - 1.0).abs() < 1e-4 && v[3] < 1e-4;
         if flat {
-            // No attack (node pins top-left, clear of decay), 100 ms decay, sustain, release tail.
-            p.set_env_values(target, [0.0, 0.10, 0.75, 0.20, v[4], v[5], v[6]]);
+            // No attack (node pins top-left, clear of decay), 100 ms decay, sustain, release tail,
+            // no gate.
+            p.set_env_values(target, [0.0, 0.10, 0.75, 0.20, v[4], v[5], v[6], 0.0]);
         }
     }
 
@@ -3275,6 +3262,7 @@ impl PixelView {
                 old.res_env
             },
             mono: !old.is_empty() && old.mono,
+            amp_rel_end: if old.is_empty() { 0.0 } else { old.amp_rel_end },
             amp_attack: if old.is_empty() { 0.0 } else { old.amp_attack },
             amp_decay: if old.is_empty() { 0.0 } else { old.amp_decay },
             amp_sustain: if old.is_empty() { 1.0 } else { old.amp_sustain },
@@ -3621,9 +3609,11 @@ impl PixelView {
             // players (sforzando, Bitwig, …) read it, and the curve is a close translation of the
             // in-app `curve_shape` (exact rendering is player-dependent).
             if pad.amp_env_on {
+                // A curved OR gated (ends before the sample) envelope needs the flex EG.
                 let curved = pad.amp_attack_curve.abs() > 1e-3
                     || pad.amp_decay_curve.abs() > 1e-3
-                    || pad.amp_release_curve.abs() > 1e-3;
+                    || pad.amp_release_curve.abs() > 1e-3
+                    || pad.amp_env().end(*dur) < *dur - 1e-3;
                 let sustain_pct = pad.amp_sustain.clamp(0.0, 1.0) * 100.0;
                 if !curved {
                     // v1 ADSR — emit only non-default stages so a plain pad stays terse.
@@ -3641,25 +3631,20 @@ impl PixelView {
                     }
                 } else {
                     // v2 flex EG on amplitude (eg01): `egN_shapeX` bows each segment.
-                    let amp = Env {
-                        on: true,
-                        a: pad.amp_attack,
-                        d: pad.amp_decay,
-                        s: pad.amp_sustain,
-                        rel: pad.amp_release,
-                        ca: pad.amp_attack_curve,
-                        cd: pad.amp_decay_curve,
-                        cr: pad.amp_release_curve,
-                    };
-                    push_flex_eg(&mut sfz, 1, "amplitude", "100", &amp);
+                    push_flex_eg(&mut sfz, 1, "amplitude", "100", &pad.amp_env(), *dur);
                 }
             }
             // Pitch envelope → v1 `pitcheg_*` (+ depth in cents) if linear, else a v2 flex EG (eg02).
             if pad.pitch_env.on && pad.pitch_depth.abs() > 1e-3 {
                 let e = &pad.pitch_env;
                 let cents = (pad.pitch_depth * 100.0).round() as i32;
-                let curved = e.ca.abs() > 1e-3 || e.cd.abs() > 1e-3 || e.cr.abs() > 1e-3;
-                if !curved {
+                // A curved OR gated (ends before the sample) envelope needs the flex EG; the plain
+                // v1 `pitcheg_*` can't express curvature or an early gate.
+                let flex = e.ca.abs() > 1e-3
+                    || e.cd.abs() > 1e-3
+                    || e.cr.abs() > 1e-3
+                    || e.end(*dur) < *dur - 1e-3;
+                if !flex {
                     sfz.push_str(&format!("pitcheg_depth={cents}\n"));
                     if e.a > 1e-4 {
                         sfz.push_str(&format!("pitcheg_attack={:.3}\n", e.a));
@@ -3677,7 +3662,7 @@ impl PixelView {
                         sfz.push_str(&format!("pitcheg_release={:.3}\n", e.rel));
                     }
                 } else {
-                    push_flex_eg(&mut sfz, 2, "pitch", &cents.to_string(), e);
+                    push_flex_eg(&mut sfz, 2, "pitch", &cents.to_string(), e, *dur);
                 }
             }
             // Cutoff envelope → a low-pass (base 30 Hz) swept up to cutoff_hz. v1 `fileg_*` (depth in
@@ -3691,8 +3676,11 @@ impl PixelView {
                 if pad.resonance > 1e-3 {
                     sfz.push_str(&format!("resonance={:.2}\n", pad.resonance * 24.0));
                 }
-                let curved = e.ca.abs() > 1e-3 || e.cd.abs() > 1e-3 || e.cr.abs() > 1e-3;
-                if !curved {
+                let flex = e.ca.abs() > 1e-3
+                    || e.cd.abs() > 1e-3
+                    || e.cr.abs() > 1e-3
+                    || e.end(*dur) < *dur - 1e-3;
+                if !flex {
                     sfz.push_str(&format!("fileg_depth={depth_cents}\n"));
                     if e.a > 1e-4 {
                         sfz.push_str(&format!("fileg_attack={:.3}\n", e.a));
@@ -3710,7 +3698,7 @@ impl PixelView {
                         sfz.push_str(&format!("fileg_release={:.3}\n", e.rel));
                     }
                 } else {
-                    push_flex_eg(&mut sfz, 3, "cutoff", &depth_cents.to_string(), e);
+                    push_flex_eg(&mut sfz, 3, "cutoff", &depth_cents.to_string(), e, *dur);
                 }
             }
             // Resonance envelope → a v2 flex EG (eg04; SFZ v1 has no resonance envelope).
@@ -3718,7 +3706,7 @@ impl PixelView {
                 if !pad.cutoff_env.on {
                     sfz.push_str("fil_type=lpf_2p\n");
                 }
-                push_flex_eg(&mut sfz, 4, "resonance", "12", &pad.res_env);
+                push_flex_eg(&mut sfz, 4, "resonance", "12", &pad.res_env, *dur);
             }
             // Low-pass filter → native SFZ `cutoff` / `resonance` (dB) / `fil_type`. resonance 0..1
             // maps to ~0..24 dB (matching the biquad's Q = 0.707·2^(4·res)).
@@ -4819,7 +4807,7 @@ impl PixelView {
         // Envelope overlay edit → deferred (pad, target, [a, d, s, rel, curve_a, curve_d, curve_r]),
         // applied after the `ap` borrow ends (the handles are drawn while the player is borrowed
         // immutably).
-        let mut want_env: Option<(usize, EnvTarget, [f32; 7])> = None;
+        let mut want_env: Option<(usize, EnvTarget, [f32; 8])> = None;
         let mut want_play_at: Option<f32> = None; // middle-click the waveform → play from here
         let mut want_play_region = false; // play the current selection now (middle-click transient slice)
         let mut want_sel_undo = false; // restore the previous selection from the undo stack
@@ -5778,20 +5766,24 @@ impl PixelView {
                     let vals = self.pads[pi].env_values(target);
                     let (mut a, mut d, mut s, mut rel) = (vals[0], vals[1], vals[2], vals[3]);
                     let (mut ca, mut cd, mut cr) = (vals[4], vals[5], vals[6]);
-                    let orig = (a, d, s, rel, ca, cd, cr);
+                    let mut rend = vals[7]; // gate end (0 = sample end)
+                    let orig = (a, d, s, rel, ca, cd, cr, rend);
                     let pad_y = 6.0;
                     let span_y = (rect.height() - 2.0 * pad_y).max(1.0);
                     let y_of = |lvl: f32| rect.bottom() - pad_y - lvl.clamp(0.0, 1.0) * span_y;
                     let level_at = |y: f32| ((rect.bottom() - pad_y - y) / span_y).clamp(0.0, 1.0);
+                    // Resolve the gate end (0 or ≥dur ⇒ sample end).
+                    let gate_end = |re: f32| if re <= 1e-4 || re >= dur { dur } else { re };
                     const NS: usize = 28;
-                    // Build a CURVED contour polyline from a target's 7 values (ramps sampled through
-                    // `curve_shape`, the sustain flat).
-                    let build_contour = |v: &[f32; 7]| -> Vec<egui::Pos2> {
+                    // Build a CURVED contour from a target's 8 values (ramps via `curve_shape`, the
+                    // sustain flat, and a flat-zero tail after the gate end = the silenced part).
+                    let build_contour = |v: &[f32; 8]| -> Vec<egui::Pos2> {
                         let (a, d, s, rel, ca, cd, cr) = (v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
-                        let t_a = a.clamp(0.0, dur);
-                        let t_d = (a + d).clamp(0.0, dur);
-                        let t_r = (dur - rel).clamp(t_d, dur);
-                        let mut c = Vec::with_capacity(NS * 3 + 3);
+                        let end = gate_end(v[7]);
+                        let t_a = a.clamp(0.0, end);
+                        let t_d = (a + d).clamp(0.0, end);
+                        let t_rs = (end - rel).clamp(t_d, end); // release start
+                        let mut c = Vec::with_capacity(NS * 3 + 4);
                         for k in 0..=NS {
                             let u = k as f32 / NS as f32;
                             c.push(egui::pos2(x_of(t_a * u), y_of(curve_shape(u, ca))));
@@ -5803,13 +5795,16 @@ impl PixelView {
                                 y_of(1.0 + (s - 1.0) * curve_shape(u, cd)),
                             ));
                         }
-                        c.push(egui::pos2(x_of(t_r), y_of(s)));
+                        c.push(egui::pos2(x_of(t_rs), y_of(s)));
                         for k in 1..=NS {
                             let u = k as f32 / NS as f32;
                             c.push(egui::pos2(
-                                x_of(t_r + (dur - t_r) * u),
+                                x_of(t_rs + (end - t_rs) * u),
                                 y_of(s * (1.0 - curve_shape(u, cr))),
                             ));
+                        }
+                        if end < dur - 1e-4 {
+                            c.push(egui::pos2(x_of(dur), y_of(0.0))); // silenced tail after the gate
                         }
                         c
                     };
@@ -5824,24 +5819,26 @@ impl PixelView {
                             ));
                         }
                     }
-                    // Foreground node positions for the handles (release measured back from the end).
-                    let t_a = a.clamp(0.0, dur);
-                    let t_d = (a + d).clamp(0.0, dur);
-                    let t_r = (dur - rel).clamp(t_d, dur);
+                    // Foreground node positions for the handles.
+                    let end = gate_end(rend);
+                    let t_a = a.clamp(0.0, end);
+                    let t_d = (a + d).clamp(0.0, end);
+                    let t_rs = (end - rel).clamp(t_d, end); // release start
                     let pa = egui::pos2(x_of(t_a), y_of(1.0));
                     let pd = egui::pos2(x_of(t_d), y_of(s));
-                    let pr = egui::pos2(x_of(t_r), y_of(s));
+                    let p_rs = egui::pos2(x_of(t_rs), y_of(s));
+                    let p_re = egui::pos2(x_of(end), y_of(0.0)); // release END / gate
                     let env_col = target.color();
                     let curve_col = env_col.gamma_multiply(0.8);
                     // Foreground contour (full opacity, editable).
                     p.add(egui::Shape::line(
-                        build_contour(&[a, d, s, rel, ca, cd, cr]),
+                        build_contour(&[a, d, s, rel, ca, cd, cr, rend]),
                         egui::Stroke::new(2.0, env_col),
                     ));
-                    // ---- Node handles (circles): attack (X), decay+sustain (X·Y), release (X).
-                    // Allocated on top of the waveform so a grab claims the pointer (the selection
-                    // drag is gated off by `env_editing`). Driven from the global pointer so a drag
-                    // past the rect edge stays clamped.
+                    // ---- Node handles (circles): attack (X), decay+sustain (X·Y), release-start (X),
+                    // release-END/gate (X). Allocated on top of the waveform so a grab claims the
+                    // pointer (the selection drag is gated off). Driven from the global pointer so a
+                    // drag past the rect edge stays clamped.
                     let hr = 6.0;
                     let ptr = ui.input(|inp| inp.pointer.latest_pos());
                     let do_handle = |key: &str, center: egui::Pos2| -> Option<egui::Pos2> {
@@ -5863,8 +5860,7 @@ impl PixelView {
                             None
                         }
                     };
-                    // Nodes snap their ABSOLUTE time to the grid: attack ends at `a`, decay ends at
-                    // `a+d`, release starts at `dur-rel` — so a snapped node lands on a beat.
+                    // Nodes snap their ABSOLUTE time to the grid so they land on a beat.
                     if let Some(pp) = do_handle("attack", pa) {
                         a = snap(t_at(pp.x)).clamp(0.0, dur);
                     }
@@ -5872,8 +5868,14 @@ impl PixelView {
                         d = (snap(t_at(pp.x)) - a).clamp(0.0, dur);
                         s = level_at(pp.y);
                     }
-                    if let Some(pp) = do_handle("release", pr) {
-                        rel = (dur - snap(t_at(pp.x))).clamp(0.0, dur);
+                    if let Some(pp) = do_handle("relstart", p_rs) {
+                        rel = (end - snap(t_at(pp.x))).clamp(0.0, end); // drag left = longer release
+                    }
+                    // Release END / gate: drag left to finish the envelope before the sample (the
+                    // tail goes silent). Dragged to the far right ⇒ back to "sample end" (rend = 0).
+                    if let Some(pp) = do_handle("relend", p_re) {
+                        let nx = snap(t_at(pp.x)).clamp(t_d + 1e-3, dur);
+                        rend = if nx >= dur - 1e-3 { 0.0 } else { nx };
                     }
                     // ---- Curvature handles (diamonds at each segment's midpoint): drag vertically
                     // to bow the segment. Falling segments invert the sign so "up" always bows up.
@@ -5922,9 +5924,9 @@ impl PixelView {
                             cd = (cd - dy * CSENS).clamp(-1.0, 1.0);
                         }
                     }
-                    if dur - t_r > 1e-3 {
+                    if end - t_rs > 1e-3 {
                         let mid = egui::pos2(
-                            x_of((t_r + dur) * 0.5),
+                            x_of((t_rs + end) * 0.5),
                             y_of(s * (1.0 - curve_shape(0.5, cr))),
                         );
                         let dy = do_curve("release", mid);
@@ -5932,20 +5934,25 @@ impl PixelView {
                             cr = (cr - dy * CSENS).clamp(-1.0, 1.0);
                         }
                     }
-                    // Compact label so it's clear which envelope you're shaping.
+                    // Compact label so it's clear which envelope you're shaping (+ the gate if set).
+                    let gate_txt = if gate_end(rend) < dur - 1e-3 {
+                        format!("  gate {:.2}s", gate_end(rend))
+                    } else {
+                        String::new()
+                    };
                     p.text(
                         egui::pos2(rect.left() + 4.0, rect.top() + 2.0),
                         egui::Align2::LEFT_TOP,
                         format!(
-                            "{} ENV  A {a:.2}  D {d:.2}  S {:.0}%  R {rel:.2}",
+                            "{} ENV  A {a:.2}  D {d:.2}  S {:.0}%  R {rel:.2}{gate_txt}",
                             target.label(),
                             s * 100.0
                         ),
                         egui::FontId::proportional(11.0),
                         env_col,
                     );
-                    if (a, d, s, rel, ca, cd, cr) != orig {
-                        want_env = Some((pi, target, [a, d, s, rel, ca, cd, cr]));
+                    if (a, d, s, rel, ca, cd, cr, rend) != orig {
+                        want_env = Some((pi, target, [a, d, s, rel, ca, cd, cr, rend]));
                     }
                 }
             }
@@ -20356,6 +20363,7 @@ struct Pad {
     amp_attack_curve: f32,
     amp_decay_curve: f32,
     amp_release_curve: f32,
+    amp_rel_end: f32, // amp gate end (seconds; 0 = sample end / no gate)
     // Per-pad low-pass filter (baked via a biquad). `cutoff_hz` at/above Nyquist = open.
     filter_on: bool,
     cutoff_hz: f32,
@@ -20389,6 +20397,9 @@ struct Env {
     ca: f32,
     cd: f32,
     cr: f32,
+    // Gate end (seconds): where the envelope reaches 0 and STAYS 0 (silence after). 0 = "sample
+    // end" (no gate — sustain fills to `dur − rel`). >0 lets the sound stop before the sample does.
+    rel_end: f32,
 }
 
 impl Env {
@@ -20404,12 +20415,13 @@ impl Env {
             ca: 0.0,
             cd: 0.0,
             cr: 0.0,
+            rel_end: 0.0, // 0 = release ends at the sample end (no gate)
         }
     }
-    /// Serialize to one record field (`on;a;d;s;rel;ca;cd;cr`) so a Pad record stays flat.
+    /// Serialize to one record field (`on;a;d;s;rel;ca;cd;cr;rel_end`) so a Pad record stays flat.
     fn to_field(self) -> String {
         format!(
-            "{};{};{};{};{};{};{};{}",
+            "{};{};{};{};{};{};{};{};{}",
             if self.on { 1 } else { 0 },
             self.a,
             self.d,
@@ -20417,7 +20429,8 @@ impl Env {
             self.rel,
             self.ca,
             self.cd,
-            self.cr
+            self.cr,
+            self.rel_end
         )
     }
     fn from_field(s: &str) -> Self {
@@ -20433,12 +20446,22 @@ impl Env {
             ca: g(5, 0.0),
             cd: g(6, 0.0),
             cr: g(7, 0.0),
+            rel_end: g(8, 0.0),
         }
     }
-    fn values(&self) -> [f32; 7] {
-        [self.a, self.d, self.s, self.rel, self.ca, self.cd, self.cr]
+    fn values(&self) -> [f32; 8] {
+        [
+            self.a,
+            self.d,
+            self.s,
+            self.rel,
+            self.ca,
+            self.cd,
+            self.cr,
+            self.rel_end,
+        ]
     }
-    fn set_values(&mut self, v: [f32; 7]) {
+    fn set_values(&mut self, v: [f32; 8]) {
         self.a = v[0];
         self.d = v[1];
         self.s = v[2];
@@ -20446,6 +20469,15 @@ impl Env {
         self.ca = v[4];
         self.cd = v[5];
         self.cr = v[6];
+        self.rel_end = v[7];
+    }
+    /// The effective gate end (seconds) resolved against the sample `dur`: 0 or ≥ dur ⇒ `dur`.
+    fn end(&self, dur: f32) -> f32 {
+        if self.rel_end <= 1e-4 || self.rel_end >= dur {
+            dur
+        } else {
+            self.rel_end
+        }
     }
 }
 
@@ -20485,12 +20517,18 @@ impl EnvTarget {
 }
 
 /// Evaluate an ADSR+curve `Env` at time `t` seconds (over `dur`), returning 0..1. Mirrors the
-/// per-frame shape `apply_amp_env` bakes; used by the pitch / cutoff / resonance modulation bakers.
+/// per-frame shape `apply_amp_env` bakes; used by every modulation baker. Honors the **gate**
+/// (`rel_end`): for a one-shot the release ends at `end`, and past `end` the value stays 0 (silence).
 fn eval_env(e: &Env, t: f32, dur: f32, one_shot: bool) -> f32 {
     let (a, d) = (e.a.max(0.0), e.d.max(0.0));
     let s = e.s.clamp(0.0, 1.0);
     let r = if one_shot { e.rel.max(0.0) } else { 0.0 };
-    let rel_start = (dur - r).max(0.0);
+    // A loop holds sustain forever (no gate); a one-shot's release ends at the gate `end`.
+    let end = if one_shot { e.end(dur) } else { dur };
+    if one_shot && t >= end {
+        return 0.0; // gated silence after the envelope finishes
+    }
+    let rel_start = (end - r).max(0.0);
     let ad = if t < a {
         curve_shape((t / a.max(1e-6)).clamp(0.0, 1.0), e.ca)
     } else if t < a + d {
@@ -20505,28 +20543,32 @@ fn eval_env(e: &Env, t: f32, dur: f32, one_shot: bool) -> f32 {
     }
 }
 
-/// Emit an SFZ **v2 flex EG** (`egN_*`) driving `target` (e.g. `amplitude`/`pitch`/`cutoff`/
-/// `resonance`) by `depth`, with the `Env`'s ADSR + per-segment `shape` curvature. Points:
-/// 0 (no mod) → attack (full) → decay (sustain, held) → release (no mod).
-fn push_flex_eg(sfz: &mut String, idx: u32, target: &str, depth: &str, e: &Env) {
+/// Emit an SFZ **v2 flex EG** (`egN_*`) driving `target` (`amplitude`/`pitch`/`cutoff`/`resonance`)
+/// by `depth`, with the `Env`'s ADSR + per-segment `shape` curvature and its **gate**. Points:
+/// 0 (no mod) → attack (full) → decay (sustain) → sustain-hold (flat) → release (no mod). A pad has
+/// no note-off, so we DON'T mark a sustain point — the EG plays straight through and then holds 0,
+/// which reproduces the gate (the sound goes silent when the envelope finishes before the sample).
+fn push_flex_eg(sfz: &mut String, idx: u32, target: &str, depth: &str, e: &Env, dur: f32) {
     let shp = |c: f32| format!("{:.2}", c.clamp(-1.0, 1.0) * 8.0);
+    let (a, d, rel) = (e.a.max(0.0), e.d.max(0.0), e.rel.max(0.0));
+    let s = e.s.clamp(0.0, 1.0);
+    let end = e.end(dur);
+    let sus_hold = ((end - rel) - (a + d)).max(0.0); // flat sustain between decay-end and release
     sfz.push_str(&format!("eg{idx:02}_{target}={depth}\n"));
     sfz.push_str(&format!("eg{idx:02}_time1=0\neg{idx:02}_level1=0\n"));
     sfz.push_str(&format!(
-        "eg{idx:02}_time2={:.3}\neg{idx:02}_level2=1\neg{idx:02}_shape2={}\n",
-        e.a,
+        "eg{idx:02}_time2={a:.3}\neg{idx:02}_level2=1\neg{idx:02}_shape2={}\n",
         shp(e.ca)
     ));
     sfz.push_str(&format!(
-        "eg{idx:02}_time3={:.3}\neg{idx:02}_level3={:.3}\neg{idx:02}_shape3={}\n",
-        e.d,
-        e.s.clamp(0.0, 1.0),
+        "eg{idx:02}_time3={d:.3}\neg{idx:02}_level3={s:.3}\neg{idx:02}_shape3={}\n",
         shp(e.cd)
     ));
-    sfz.push_str(&format!("eg{idx:02}_sustain=3\n"));
     sfz.push_str(&format!(
-        "eg{idx:02}_time4={:.3}\neg{idx:02}_level4=0\neg{idx:02}_shape4={}\n",
-        e.rel,
+        "eg{idx:02}_time4={sus_hold:.3}\neg{idx:02}_level4={s:.3}\n"
+    ));
+    sfz.push_str(&format!(
+        "eg{idx:02}_time5={rel:.3}\neg{idx:02}_level5=0\neg{idx:02}_shape5={}\n",
         shp(e.cr)
     ));
 }
@@ -20614,6 +20656,7 @@ impl Pad {
             amp_attack_curve: 0.0,
             amp_decay_curve: 0.0,
             amp_release_curve: 0.0,
+            amp_rel_end: 0.0,
             filter_on: false,
             cutoff_hz: 20000.0,
             resonance: 0.0,
@@ -20688,11 +20731,29 @@ impl Pad {
             self.res_env.to_field(),
             // Index 32: monophonic self-choke.
             if self.mono { "1" } else { "0" }.to_string(),
+            // Index 33: amp envelope gate end (0 = sample end).
+            format!("{}", self.amp_rel_end),
         ]
     }
 
-    /// The 7 editable envelope values (a,d,s,rel + 3 curves) for a modulation `target`.
-    fn env_values(&self, target: EnvTarget) -> [f32; 7] {
+    /// The amp envelope as an `Env` (its shape lives in flat fields; this bundles them so the
+    /// shared `eval_env`/`push_flex_eg` can treat amp like the other targets).
+    fn amp_env(&self) -> Env {
+        Env {
+            on: self.amp_env_on,
+            a: self.amp_attack,
+            d: self.amp_decay,
+            s: self.amp_sustain,
+            rel: self.amp_release,
+            ca: self.amp_attack_curve,
+            cd: self.amp_decay_curve,
+            cr: self.amp_release_curve,
+            rel_end: self.amp_rel_end,
+        }
+    }
+
+    /// The 8 editable envelope values (a,d,s,rel + 3 curves + gate end) for a modulation `target`.
+    fn env_values(&self, target: EnvTarget) -> [f32; 8] {
         match target {
             EnvTarget::Amp => [
                 self.amp_attack,
@@ -20702,14 +20763,15 @@ impl Pad {
                 self.amp_attack_curve,
                 self.amp_decay_curve,
                 self.amp_release_curve,
+                self.amp_rel_end,
             ],
             EnvTarget::Pitch => self.pitch_env.values(),
             EnvTarget::Cutoff => self.cutoff_env.values(),
             EnvTarget::Res => self.res_env.values(),
         }
     }
-    /// Write the 7 envelope values back for `target` and mark that target's envelope enabled.
-    fn set_env_values(&mut self, target: EnvTarget, v: [f32; 7]) {
+    /// Write the 8 envelope values back for `target` and mark that target's envelope enabled.
+    fn set_env_values(&mut self, target: EnvTarget, v: [f32; 8]) {
         match target {
             EnvTarget::Amp => {
                 self.amp_attack = v[0];
@@ -20719,6 +20781,7 @@ impl Pad {
                 self.amp_attack_curve = v[4];
                 self.amp_decay_curve = v[5];
                 self.amp_release_curve = v[6];
+                self.amp_rel_end = v[7];
                 self.amp_env_on = true;
             }
             EnvTarget::Pitch => {
@@ -20809,6 +20872,7 @@ impl Pad {
             cutoff_env: Env::from_field(&g(30)),
             res_env: Env::from_field(&g(31)),
             mono: g(32) == "1",
+            amp_rel_end: g(33).parse().unwrap_or(0.0),
             flash_t: -1.0,
         };
         (pad, has_audio)
@@ -21011,61 +21075,31 @@ fn curve_shape(t: f32, c: f32) -> f32 {
     ((k * t).exp() - 1.0) / (k.exp() - 1.0)
 }
 
-/// Bake a per-pad **amplitude ADSR** into an interleaved region (all channels share the frame
-/// envelope). Times are in seconds at `sr`. A pad hit has no note-off, so:
-///   attack (0→1) → decay (1→sustain) → hold sustain → for a **one-shot**, release (sustain→0)
-///   fades the tail so it never clicks; a **looping** pad (`one_shot=false`) skips the release and
-///   holds sustain to the end (the region is what repeats).
-/// `curve` = per-segment curvature `[attack, decay, release]` (0 = linear) applied to each ramp.
-/// A neutral envelope (a≈0, d≈0, sustain≈1, r≈0) returns the region untouched (cheap fast-path).
-#[allow(clippy::too_many_arguments)]
-fn apply_amp_env(
-    mut region: Vec<f32>,
-    ch: usize,
-    sr: f32,
-    attack: f32,
-    decay: f32,
-    sustain: f32,
-    release: f32,
-    curve: [f32; 3],
-    one_shot: bool,
-) -> Vec<f32> {
+/// Bake an **amplitude envelope** into an interleaved region (all channels share the frame
+/// envelope) by multiplying each frame's gain from the shared `eval_env` — so amp uses exactly the
+/// same shape (curves + `rel_end` gate) as the pitch/cutoff/res bakers. A one-shot's release fades
+/// the tail (never clicks) and past the gate `end` it's silent; a looping pad holds sustain to the
+/// region end (the region is what repeats). A neutral envelope returns the region untouched.
+fn apply_amp_env(mut region: Vec<f32>, ch: usize, sr: f32, env: &Env, one_shot: bool) -> Vec<f32> {
     let ch = ch.max(1);
-    let sustain = sustain.clamp(0.0, 1.0);
-    let (a, d) = (attack.max(0.0), decay.max(0.0));
-    let r = if one_shot { release.max(0.0) } else { 0.0 };
-    // Nothing to do — no ramps and full sustain → identity.
-    if a < 1e-4 && d < 1e-4 && r < 1e-4 && (sustain - 1.0).abs() < 1e-4 {
+    // Nothing to do — no ramps, full sustain, no gate → identity.
+    if env.a < 1e-4
+        && env.d < 1e-4
+        && env.rel < 1e-4
+        && (env.s - 1.0).abs() < 1e-4
+        && env.rel_end <= 1e-4
+    {
         return region;
     }
     let frames = region.len() / ch;
     if frames == 0 {
         return region;
     }
-    let a_f = (a * sr) as usize;
-    let d_f = (d * sr) as usize;
-    let r_f = ((r * sr) as usize).min(frames);
-    let rel_start = frames.saturating_sub(r_f); // release begins here (one-shot only)
+    let dur = frames as f32 / sr;
     for f in 0..frames {
-        // Attack/decay/sustain envelope from the onset (each ramp shaped by its curvature).
-        let env_ad = if f < a_f {
-            let t = f as f32 / a_f.max(1) as f32;
-            curve_shape(t, curve[0]) // 0 → 1 over attack
-        } else if f < a_f + d_f {
-            let t = (f - a_f) as f32 / d_f.max(1) as f32;
-            1.0 + (sustain - 1.0) * curve_shape(t, curve[1]) // 1 → sustain over decay
-        } else {
-            sustain // hold
-        };
-        // Release ramp at the tail (one-shot): multiply the sustain body down to 0.
-        let env = if r_f > 0 && f >= rel_start {
-            let t = (f - rel_start) as f32 / r_f.max(1) as f32;
-            env_ad * (1.0 - curve_shape(t, curve[2]))
-        } else {
-            env_ad
-        };
+        let g = eval_env(env, f as f32 / sr, dur, one_shot);
         for c in 0..ch {
-            region[f * ch + c] *= env;
+            region[f * ch + c] *= g;
         }
     }
     region
@@ -24274,6 +24308,7 @@ mod tests {
                 ca: 0.0,
                 cd: 0.3,
                 cr: 0.0,
+                rel_end: 0.0,
             },
             ..Pad::empty()
         };
@@ -24349,36 +24384,42 @@ mod tests {
     fn amp_env_shapes_and_identity() {
         let sr = 100.0; // 100 fps → 1 frame = 10 ms, so times are easy to reason about
         let mono = vec![1.0f32; 100]; // 1.0s of full-scale mono
-        let lin = [0.0f32; 3]; // linear segments
-                               // Neutral envelope (no ramps, full sustain) is a cheap identity.
-        let id = apply_amp_env(mono.clone(), 1, sr, 0.0, 0.0, 1.0, 0.0, lin, true);
+        let mk = |a: f32, d: f32, s: f32, rel: f32, ca: f32| Env {
+            on: true,
+            a,
+            d,
+            s,
+            rel,
+            ca,
+            cd: 0.0,
+            cr: 0.0,
+            rel_end: 0.0,
+        };
+        // Neutral envelope (no ramps, full sustain) is a cheap identity.
+        let id = apply_amp_env(mono.clone(), 1, sr, &mk(0.0, 0.0, 1.0, 0.0, 0.0), true);
         assert_eq!(id, mono);
         // Attack 0.1s (10 frames): frame 0 is silent, ramps up, full by the attack end.
-        let atk = apply_amp_env(mono.clone(), 1, sr, 0.1, 0.0, 1.0, 0.0, lin, true);
+        let atk = apply_amp_env(mono.clone(), 1, sr, &mk(0.1, 0.0, 1.0, 0.0, 0.0), true);
         assert!(atk[0].abs() < 1e-6); // starts at 0
         assert!(atk[5] > 0.3 && atk[5] < 0.7); // mid-ramp
         assert!((atk[20] - 1.0).abs() < 1e-6); // fully open past the attack
                                                // Sustain 0.5 with an immediate decay pulls the body down to half.
-        let sus = apply_amp_env(mono.clone(), 1, sr, 0.0, 0.05, 0.5, 0.0, lin, true);
+        let sus = apply_amp_env(mono.clone(), 1, sr, &mk(0.0, 0.05, 0.5, 0.0, 0.0), true);
         assert!((sus[80] - 0.5).abs() < 1e-6);
         // Release (one-shot) fades the very tail to ~0; a looping pad keeps sustain to the end.
-        let rel = apply_amp_env(mono.clone(), 1, sr, 0.0, 0.0, 1.0, 0.1, lin, true);
+        let rel = apply_amp_env(mono.clone(), 1, sr, &mk(0.0, 0.0, 1.0, 0.1, 0.0), true);
         assert!(rel[99] < 0.2); // tail faded
-        let loop_ = apply_amp_env(mono.clone(), 1, sr, 0.0, 0.0, 1.0, 0.1, lin, false);
+        let loop_ = apply_amp_env(mono.clone(), 1, sr, &mk(0.0, 0.0, 1.0, 0.1, 0.0), false);
         assert!((loop_[99] - 1.0).abs() < 1e-6); // no release when looping
                                                  // A convex attack curve sits BELOW the linear ramp at its midpoint (slow start).
-        let curved = apply_amp_env(
-            mono.clone(),
-            1,
-            sr,
-            0.1,
-            0.0,
-            1.0,
-            0.0,
-            [1.0, 0.0, 0.0],
-            true,
-        );
+        let curved = apply_amp_env(mono.clone(), 1, sr, &mk(0.1, 0.0, 1.0, 0.0, 1.0), true);
         assert!(curved[5] < atk[5]); // convex (c=+1) is lower mid-ramp than linear
+                                     // GATE: rel_end at 0.5s silences everything after the gate (one-shot only).
+        let mut gated = mk(0.0, 0.0, 1.0, 0.1, 0.0);
+        gated.rel_end = 0.5;
+        let g = apply_amp_env(mono.clone(), 1, sr, &gated, true);
+        assert!((g[40] - 1.0).abs() < 1e-6); // sustain body before the release
+        assert!(g[60].abs() < 1e-6); // fully silent past the gate end
     }
 
     #[test]
@@ -24414,9 +24455,11 @@ mod tests {
             ca: 0.6,
             cd: -0.5,
             cr: 0.1,
+            rel_end: 0.9,
         };
         let r = Env::from_field(&e.to_field());
         assert!(r.on);
+        assert!((r.rel_end - 0.9).abs() < 1e-6); // gate end survives the field round-trip
         assert!((r.a - 0.02).abs() < 1e-6 && (r.d - 0.3).abs() < 1e-6);
         assert!((r.s - 0.4).abs() < 1e-6 && (r.rel - 0.25).abs() < 1e-6);
         assert!((r.ca - 0.6).abs() < 1e-6 && (r.cd + 0.5).abs() < 1e-6);
@@ -24432,6 +24475,7 @@ mod tests {
             ca: 0.0,
             cd: 0.0,
             cr: 0.0,
+            rel_end: 0.0,
         };
         assert!(eval_env(&lin, 0.0, 1.0, true) < 1e-3);
         assert!((eval_env(&lin, 0.5, 1.0, true) - 0.5).abs() < 1e-3); // sustain body
@@ -24452,6 +24496,7 @@ mod tests {
             ca: 0.0,
             cd: 0.0,
             cr: 0.0,
+            rel_end: 0.0,
         };
         let out = apply_pitch_env(mono.clone(), 1, sr, -12.0, &down, false);
         assert!(out.len() > mono.len()); // slower playback → more output frames
