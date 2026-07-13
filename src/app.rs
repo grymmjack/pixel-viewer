@@ -21536,7 +21536,9 @@ impl Pad {
             cutoff_hz: 20000.0,
             resonance: 0.0,
             pitch_env: Env::seeded(),
-            pitch_depth: -12.0,
+            // Default to 0 semitones so enabling the pitch envelope is a NO-OP until the user
+            // dials in a depth — otherwise turning it on slammed a full-octave drop on the sample.
+            pitch_depth: 0.0,
             cutoff_env: Env::seeded(),
             res_env: Env::seeded(),
             amp_lfo: Lfo::seeded(),
@@ -21812,7 +21814,7 @@ impl Pad {
             cutoff_hz: g(26).parse().unwrap_or(20000.0),
             resonance: g(27).parse().unwrap_or(0.0),
             pitch_env: Env::from_field(&g(28)),
-            pitch_depth: g(29).parse().unwrap_or(-12.0),
+            pitch_depth: g(29).parse().unwrap_or(0.0),
             cutoff_env: Env::from_field(&g(30)),
             res_env: Env::from_field(&g(31)),
             mono: g(32) == "1",
