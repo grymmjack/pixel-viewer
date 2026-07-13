@@ -3043,20 +3043,48 @@ impl PixelView {
         let one_shot = !pad.loop_on;
         let bpm = self.bpm;
         let pad = &self.pads[i];
+        // Each target's shape source: its MSEG (if on) else its ADSR envelope (if on).
+        let amp_env = pad.amp_env();
+        let pitch_shape = if pad.pitch_mseg.on {
+            Some(ModShape::Mseg(&pad.pitch_mseg.points))
+        } else if pad.pitch_env.on {
+            Some(ModShape::Adsr(&pad.pitch_env))
+        } else {
+            None
+        };
+        let cutoff_shape = if pad.cutoff_mseg.on {
+            Some(ModShape::Mseg(&pad.cutoff_mseg.points))
+        } else if pad.cutoff_env.on {
+            Some(ModShape::Adsr(&pad.cutoff_env))
+        } else {
+            None
+        };
+        let res_shape = if pad.res_mseg.on {
+            Some(ModShape::Mseg(&pad.res_mseg.points))
+        } else if pad.res_env.on {
+            Some(ModShape::Adsr(&pad.res_env))
+        } else {
+            None
+        };
         // 1. Pitch modulation FIRST (variable-rate resample changes the frame count).
         let region = apply_pitch_mod(
             region,
             ch,
             sr,
             pad.pitch_depth,
-            pad.pitch_env.on.then_some(&pad.pitch_env),
+            pitch_shape,
             pad.pitch_lfo.on.then_some(&pad.pitch_lfo),
             bpm,
             one_shot,
         );
-        // 2. Amplitude ADSR (release only shapes a one-shot's tail; the gate can end it early).
-        let region = if pad.amp_env_on {
-            apply_amp_env(region, ch, sr, &pad.amp_env(), one_shot)
+        // 2. Amplitude ADSR / MSEG (release shapes a one-shot's tail; the gate can end it early).
+        let region = if pad.shape_active(EnvTarget::Amp) {
+            let shape = if pad.amp_mseg.on {
+                ModShape::Mseg(&pad.amp_mseg.points)
+            } else {
+                ModShape::Adsr(&amp_env)
+            };
+            apply_amp_env(region, ch, sr, &shape, one_shot)
         } else {
             region
         };
@@ -3066,9 +3094,10 @@ impl PixelView {
         } else {
             region
         };
-        // 4. Low-pass filter: a cutoff/resonance ENVELOPE or LFO if any is on, else the static
-        // filter (if enabled).
-        let filt_mod = pad.cutoff_env.on || pad.res_env.on || pad.cutoff_lfo.on || pad.res_lfo.on;
+        // 4. Low-pass filter: a cutoff/resonance shape (env or MSEG) or LFO if any is on, else the
+        // static filter (if enabled).
+        let filt_mod =
+            cutoff_shape.is_some() || res_shape.is_some() || pad.cutoff_lfo.on || pad.res_lfo.on;
         let region = if filt_mod {
             apply_lowpass_env(
                 region,
@@ -3076,8 +3105,8 @@ impl PixelView {
                 sr,
                 pad.cutoff_hz,
                 pad.resonance,
-                pad.cutoff_env.on.then_some(&pad.cutoff_env),
-                pad.res_env.on.then_some(&pad.res_env),
+                cutoff_shape,
+                res_shape,
                 pad.cutoff_lfo.on.then_some(&pad.cutoff_lfo),
                 pad.res_lfo.on.then_some(&pad.res_lfo),
                 bpm,
@@ -3306,6 +3335,26 @@ impl PixelView {
                 Lfo::seeded()
             } else {
                 old.res_lfo
+            },
+            amp_mseg: if old.is_empty() {
+                Mseg::default()
+            } else {
+                old.amp_mseg.clone()
+            },
+            pitch_mseg: if old.is_empty() {
+                Mseg::default()
+            } else {
+                old.pitch_mseg.clone()
+            },
+            cutoff_mseg: if old.is_empty() {
+                Mseg::default()
+            } else {
+                old.cutoff_mseg.clone()
+            },
+            res_mseg: if old.is_empty() {
+                Mseg::default()
+            } else {
+                old.res_mseg.clone()
             },
             amp_attack: if old.is_empty() { 0.0 } else { old.amp_attack },
             amp_decay: if old.is_empty() { 0.0 } else { old.amp_decay },
@@ -3653,7 +3702,9 @@ impl PixelView {
             // **SFZ v2 flex EG** bound to amplitude (`egN_shapeX` carries the curvature) — ARIA-based
             // players (sforzando, Bitwig, …) read it, and the curve is a close translation of the
             // in-app `curve_shape` (exact rendering is player-dependent).
-            if pad.amp_env_on {
+            if pad.amp_mseg.on {
+                push_flex_eg_points(&mut sfz, 1, "amplitude", "100", &pad.amp_mseg.points);
+            } else if pad.amp_env_on {
                 // A curved OR gated (ends before the sample) envelope needs the flex EG.
                 let curved = pad.amp_attack_curve.abs() > 1e-3
                     || pad.amp_decay_curve.abs() > 1e-3
@@ -3679,8 +3730,17 @@ impl PixelView {
                     push_flex_eg(&mut sfz, 1, "amplitude", "100", &pad.amp_env(), *dur);
                 }
             }
-            // Pitch envelope → v1 `pitcheg_*` (+ depth in cents) if linear, else a v2 flex EG (eg02).
-            if pad.pitch_env.on && pad.pitch_depth.abs() > 1e-3 {
+            // Pitch MSEG → flex EG points; else pitch envelope → v1 `pitcheg_*` (linear) / flex EG.
+            if pad.pitch_mseg.on && pad.pitch_depth.abs() > 1e-3 {
+                let cents = (pad.pitch_depth * 100.0).round() as i32;
+                push_flex_eg_points(
+                    &mut sfz,
+                    2,
+                    "pitch",
+                    &cents.to_string(),
+                    &pad.pitch_mseg.points,
+                );
+            } else if pad.pitch_env.on && pad.pitch_depth.abs() > 1e-3 {
                 let e = &pad.pitch_env;
                 let cents = (pad.pitch_depth * 100.0).round() as i32;
                 // A curved OR gated (ends before the sample) envelope needs the flex EG; the plain
@@ -3710,10 +3770,9 @@ impl PixelView {
                     push_flex_eg(&mut sfz, 2, "pitch", &cents.to_string(), e, *dur);
                 }
             }
-            // Cutoff envelope → a low-pass (base 30 Hz) swept up to cutoff_hz. v1 `fileg_*` (depth in
-            // cents) if linear, else a v2 flex EG (eg03).
-            if pad.cutoff_env.on {
-                let e = &pad.cutoff_env;
+            // Cutoff MSEG / envelope → a low-pass (base 30 Hz) swept up to cutoff_hz. MSEG → flex EG
+            // points; env → v1 `fileg_*` (linear) or a v2 flex EG (eg03).
+            if pad.cutoff_mseg.on || pad.cutoff_env.on {
                 let base = 30.0f32;
                 let depth_cents =
                     (1200.0 * (pad.cutoff_hz.max(base + 1.0) / base).log2()).round() as i32;
@@ -3721,34 +3780,51 @@ impl PixelView {
                 if pad.resonance > 1e-3 {
                     sfz.push_str(&format!("resonance={:.2}\n", pad.resonance * 24.0));
                 }
-                let flex = e.ca.abs() > 1e-3
-                    || e.cd.abs() > 1e-3
-                    || e.cr.abs() > 1e-3
-                    || e.end(*dur) < *dur - 1e-3;
-                if !flex {
-                    sfz.push_str(&format!("fileg_depth={depth_cents}\n"));
-                    if e.a > 1e-4 {
-                        sfz.push_str(&format!("fileg_attack={:.3}\n", e.a));
-                    }
-                    if e.d > 1e-4 {
-                        sfz.push_str(&format!("fileg_decay={:.3}\n", e.d));
-                    }
-                    if (e.s - 1.0).abs() > 1e-4 {
-                        sfz.push_str(&format!(
-                            "fileg_sustain={:.1}\n",
-                            e.s.clamp(0.0, 1.0) * 100.0
-                        ));
-                    }
-                    if e.rel > 1e-4 {
-                        sfz.push_str(&format!("fileg_release={:.3}\n", e.rel));
-                    }
+                if pad.cutoff_mseg.on {
+                    push_flex_eg_points(
+                        &mut sfz,
+                        3,
+                        "cutoff",
+                        &depth_cents.to_string(),
+                        &pad.cutoff_mseg.points,
+                    );
                 } else {
-                    push_flex_eg(&mut sfz, 3, "cutoff", &depth_cents.to_string(), e, *dur);
+                    let e = &pad.cutoff_env;
+                    let flex = e.ca.abs() > 1e-3
+                        || e.cd.abs() > 1e-3
+                        || e.cr.abs() > 1e-3
+                        || e.end(*dur) < *dur - 1e-3;
+                    if !flex {
+                        sfz.push_str(&format!("fileg_depth={depth_cents}\n"));
+                        if e.a > 1e-4 {
+                            sfz.push_str(&format!("fileg_attack={:.3}\n", e.a));
+                        }
+                        if e.d > 1e-4 {
+                            sfz.push_str(&format!("fileg_decay={:.3}\n", e.d));
+                        }
+                        if (e.s - 1.0).abs() > 1e-4 {
+                            sfz.push_str(&format!(
+                                "fileg_sustain={:.1}\n",
+                                e.s.clamp(0.0, 1.0) * 100.0
+                            ));
+                        }
+                        if e.rel > 1e-4 {
+                            sfz.push_str(&format!("fileg_release={:.3}\n", e.rel));
+                        }
+                    } else {
+                        push_flex_eg(&mut sfz, 3, "cutoff", &depth_cents.to_string(), e, *dur);
+                    }
                 }
             }
-            // Resonance envelope → a v2 flex EG (eg04; SFZ v1 has no resonance envelope).
-            if pad.res_env.on {
-                if !pad.cutoff_env.on {
+            // Resonance MSEG / envelope → a v2 flex EG (eg04; SFZ v1 has no resonance envelope).
+            let filt_here = pad.cutoff_env.on || pad.cutoff_mseg.on;
+            if pad.res_mseg.on {
+                if !filt_here {
+                    sfz.push_str("fil_type=lpf_2p\n");
+                }
+                push_flex_eg_points(&mut sfz, 4, "resonance", "12", &pad.res_mseg.points);
+            } else if pad.res_env.on {
+                if !filt_here {
                     sfz.push_str("fil_type=lpf_2p\n");
                 }
                 push_flex_eg(&mut sfz, 4, "resonance", "12", &pad.res_env, *dur);
@@ -4906,6 +4982,7 @@ impl PixelView {
         // applied after the `ap` borrow ends (the handles are drawn while the player is borrowed
         // immutably).
         let mut want_env: Option<(usize, EnvTarget, [f32; 8])> = None;
+        let mut want_mseg: Option<(usize, EnvTarget, MsegEdit)> = None;
         let mut want_play_at: Option<f32> = None; // middle-click the waveform → play from here
         let mut want_play_region = false; // play the current selection now (middle-click transient slice)
         let mut want_sel_undo = false; // restore the previous selection from the undo stack
@@ -5148,6 +5225,27 @@ impl PixelView {
                                 .changed()
                             {
                                 self.pads[i].set_env_on(t, on);
+                            }
+                            // MSEG mode: a free-form multi-node envelope that REPLACES the ADSR for
+                            // this target (double-click the waveform to add nodes). Seeds a shape the
+                            // first time it's turned on.
+                            let mut mseg_on = self.pads[i].mseg(t).on;
+                            if ui
+                                .checkbox(&mut mseg_on, "MSEG")
+                                .on_hover_text(
+                                    "Free-form multi-segment envelope (drag nodes, double-click to \
+                                     add, right-click to delete). Replaces the ADSR for this target.",
+                                )
+                                .changed()
+                            {
+                                if mseg_on && self.pads[i].mseg(t).points.len() < 2 {
+                                    *self.pads[i].mseg_mut(t) = Mseg::seeded(dur);
+                                } else {
+                                    self.pads[i].mseg_mut(t).on = mseg_on;
+                                }
+                                if mseg_on {
+                                    self.pads[i].set_env_on(t, true); // MSEG implies the target is active
+                                }
                             }
                             // Preset shapes: built-ins (duration-proportional) + your saved ones.
                             // Applied to the CURRENT target; deletes/saves are deferred out of the
@@ -5623,12 +5721,12 @@ impl PixelView {
                     want_commit = true;
                 }
             }
-            if resp.double_clicked() {
+            if resp.double_clicked() && !env_editing {
                 self.sel_undo_pending = Some((sel_lo, sel_hi));
                 want_select = Some((0.0, dur)); // double-click → select all + reset the zoom
                 want_commit = true;
                 self.wave_view = None;
-            } else if resp.middle_clicked() {
+            } else if resp.middle_clicked() && !env_editing {
                 if let Some(pp) = resp.interact_pointer_pos() {
                     let t = t_at(pp.x);
                     if !boundaries.is_empty() {
@@ -5656,7 +5754,7 @@ impl PixelView {
                         self.play_from_mark = Some(t); // neon ▶ marker where playback begins
                     }
                 }
-            } else if resp.clicked() {
+            } else if resp.clicked() && !env_editing {
                 if let Some(pp) = resp.interact_pointer_pos() {
                     // A plain click OUTSIDE a sub-selection deselects it (→ the whole file), so the
                     // next drag can carve out a fresh selection of any size; inside just seeks.
@@ -5995,6 +6093,8 @@ impl PixelView {
                     // Read the SELECTED target's ADSR + curves (immutable — the player is borrowed);
                     // edits are deferred into `want_env` and applied after this block.
                     let target = self.env_target;
+                    let is_mseg = self.pads[pi].mseg(target).on; // MSEG mode → free-form node editor
+                    let env_col = target.color();
                     let vals = self.pads[pi].env_values(target);
                     let (mut a, mut d, mut s, mut rel) = (vals[0], vals[1], vals[2], vals[3]);
                     let (mut ca, mut cd, mut cr) = (vals[4], vals[5], vals[6]);
@@ -6040,151 +6140,278 @@ impl PixelView {
                         }
                         c
                     };
-                    // Background: every OTHER enabled envelope, faded + non-editable, in its color —
-                    // so you see all your modulation at once (only the foreground one is editable).
+                    // Background: every OTHER active shape (ADSR or MSEG), faded + non-editable, in
+                    // its color — see all your modulation at once (only the foreground is editable).
+                    // Sampled generically via `eval_shape_at` so it works in either mode.
                     for ot in EnvTarget::ALL {
-                        if ot != target && self.pads[pi].env_on(ot) {
-                            let pts = build_contour(&self.pads[pi].env_values(ot));
+                        if ot != target && self.pads[pi].shape_active(ot) {
+                            let steps = 96;
+                            let mut line = Vec::with_capacity(steps + 1);
+                            for k in 0..=steps {
+                                let tt = vs + (k as f32 / steps as f32) * (ve - vs);
+                                let v = self.pads[pi].eval_shape_at(ot, tt, dur, true);
+                                line.push(egui::pos2(x_of(tt), y_of(v)));
+                            }
                             p.add(egui::Shape::line(
-                                pts,
+                                line,
                                 egui::Stroke::new(1.5, ot.color().gamma_multiply(0.32)),
                             ));
                         }
                     }
-                    // Foreground node positions for the handles.
-                    let end = gate_end(rend);
-                    let t_a = a.clamp(0.0, end);
-                    let t_d = (a + d).clamp(0.0, end);
-                    let t_rs = (end - rel).clamp(t_d, end); // release start
-                    let pa = egui::pos2(x_of(t_a), y_of(1.0));
-                    let pd = egui::pos2(x_of(t_d), y_of(s));
-                    let p_rs = egui::pos2(x_of(t_rs), y_of(s));
-                    let p_re = egui::pos2(x_of(end), y_of(0.0)); // release END / gate
-                    let env_col = target.color();
-                    let curve_col = env_col.gamma_multiply(0.8);
-                    // Foreground contour (full opacity, editable).
-                    p.add(egui::Shape::line(
-                        build_contour(&[a, d, s, rel, ca, cd, cr, rend]),
-                        egui::Stroke::new(2.0, env_col),
-                    ));
-                    // ---- Node handles (circles): attack (X), decay+sustain (X·Y), release-start (X),
-                    // release-END/gate (X). Allocated on top of the waveform so a grab claims the
-                    // pointer (the selection drag is gated off). Driven from the global pointer so a
-                    // drag past the rect edge stays clamped.
-                    let hr = 6.0;
-                    let ptr = ui.input(|inp| inp.pointer.latest_pos());
-                    let do_handle = |key: &str, center: egui::Pos2| -> Option<egui::Pos2> {
-                        let hid = ui.id().with(("env_handle", pi, key));
-                        let hrect = egui::Rect::from_center_size(center, egui::vec2(16.0, 16.0));
-                        let hresp = ui.interact(hrect, hid, egui::Sense::drag());
-                        let hot = hresp.hovered() || hresp.dragged();
-                        p.circle_filled(center, if hot { hr + 1.5 } else { hr }, env_col);
-                        p.circle_stroke(
-                            center,
-                            if hot { hr + 1.5 } else { hr },
-                            egui::Stroke::new(1.5, egui::Color32::from_gray(20)),
-                        );
-                        if hresp.dragged() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-                            ui.ctx().request_repaint();
-                            ptr
-                        } else {
-                            None
-                        }
-                    };
-                    // Nodes snap their ABSOLUTE time to the grid so they land on a beat.
-                    if let Some(pp) = do_handle("attack", pa) {
-                        a = snap(t_at(pp.x)).clamp(0.0, dur);
-                    }
-                    if let Some(pp) = do_handle("decay", pd) {
-                        d = (snap(t_at(pp.x)) - a).clamp(0.0, dur);
-                        s = level_at(pp.y);
-                    }
-                    if let Some(pp) = do_handle("relstart", p_rs) {
-                        rel = (end - snap(t_at(pp.x))).clamp(0.0, end); // drag left = longer release
-                    }
-                    // Release END / gate: drag left to finish the envelope before the sample (the
-                    // tail goes silent). Dragged to the far right ⇒ back to "sample end" (rend = 0).
-                    if let Some(pp) = do_handle("relend", p_re) {
-                        let nx = snap(t_at(pp.x)).clamp(t_d + 1e-3, dur);
-                        rend = if nx >= dur - 1e-3 { 0.0 } else { nx };
-                    }
-                    // ---- Curvature handles (diamonds at each segment's midpoint): drag vertically
-                    // to bow the segment. Falling segments invert the sign so "up" always bows up.
-                    let do_curve = |key: &str, center: egui::Pos2| -> f32 {
-                        let hid = ui.id().with(("env_curve", pi, key));
-                        let hrect = egui::Rect::from_center_size(center, egui::vec2(13.0, 13.0));
-                        let hresp = ui.interact(hrect, hid, egui::Sense::drag());
-                        let sz = if hresp.hovered() || hresp.dragged() {
-                            5.0
-                        } else {
-                            4.0
-                        };
-                        p.add(egui::Shape::convex_polygon(
-                            vec![
-                                egui::pos2(center.x, center.y - sz),
-                                egui::pos2(center.x + sz, center.y),
-                                egui::pos2(center.x, center.y + sz),
-                                egui::pos2(center.x - sz, center.y),
-                            ],
-                            curve_col,
-                            egui::Stroke::new(1.0, egui::Color32::from_gray(20)),
+                    // ============ ADSR editor (fixed 4-node), when NOT in MSEG mode ============
+                    if !is_mseg {
+                        // Foreground node positions for the handles.
+                        let end = gate_end(rend);
+                        let t_a = a.clamp(0.0, end);
+                        let t_d = (a + d).clamp(0.0, end);
+                        let t_rs = (end - rel).clamp(t_d, end); // release start
+                        let pa = egui::pos2(x_of(t_a), y_of(1.0));
+                        let pd = egui::pos2(x_of(t_d), y_of(s));
+                        let p_rs = egui::pos2(x_of(t_rs), y_of(s));
+                        let p_re = egui::pos2(x_of(end), y_of(0.0)); // release END / gate
+                        let curve_col = env_col.gamma_multiply(0.8);
+                        // Foreground contour (full opacity, editable).
+                        p.add(egui::Shape::line(
+                            build_contour(&[a, d, s, rel, ca, cd, cr, rend]),
+                            egui::Stroke::new(2.0, env_col),
                         ));
-                        if hresp.dragged() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
-                            ui.ctx().request_repaint();
-                            hresp.drag_delta().y
+                        // ---- Node handles (circles): attack (X), decay+sustain (X·Y), release-start (X),
+                        // release-END/gate (X). Allocated on top of the waveform so a grab claims the
+                        // pointer (the selection drag is gated off). Driven from the global pointer so a
+                        // drag past the rect edge stays clamped.
+                        let hr = 6.0;
+                        let ptr = ui.input(|inp| inp.pointer.latest_pos());
+                        let do_handle = |key: &str, center: egui::Pos2| -> Option<egui::Pos2> {
+                            let hid = ui.id().with(("env_handle", pi, key));
+                            let hrect =
+                                egui::Rect::from_center_size(center, egui::vec2(16.0, 16.0));
+                            let hresp = ui.interact(hrect, hid, egui::Sense::drag());
+                            let hot = hresp.hovered() || hresp.dragged();
+                            p.circle_filled(center, if hot { hr + 1.5 } else { hr }, env_col);
+                            p.circle_stroke(
+                                center,
+                                if hot { hr + 1.5 } else { hr },
+                                egui::Stroke::new(1.5, egui::Color32::from_gray(20)),
+                            );
+                            if hresp.dragged() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                                ui.ctx().request_repaint();
+                                ptr
+                            } else {
+                                None
+                            }
+                        };
+                        // Nodes snap their ABSOLUTE time to the grid so they land on a beat.
+                        if let Some(pp) = do_handle("attack", pa) {
+                            a = snap(t_at(pp.x)).clamp(0.0, dur);
+                        }
+                        if let Some(pp) = do_handle("decay", pd) {
+                            d = (snap(t_at(pp.x)) - a).clamp(0.0, dur);
+                            s = level_at(pp.y);
+                        }
+                        if let Some(pp) = do_handle("relstart", p_rs) {
+                            rel = (end - snap(t_at(pp.x))).clamp(0.0, end); // drag left = longer release
+                        }
+                        // Release END / gate: drag left to finish the envelope before the sample (the
+                        // tail goes silent). Dragged to the far right ⇒ back to "sample end" (rend = 0).
+                        if let Some(pp) = do_handle("relend", p_re) {
+                            let nx = snap(t_at(pp.x)).clamp(t_d + 1e-3, dur);
+                            rend = if nx >= dur - 1e-3 { 0.0 } else { nx };
+                        }
+                        // ---- Curvature handles (diamonds at each segment's midpoint): drag vertically
+                        // to bow the segment. Falling segments invert the sign so "up" always bows up.
+                        let do_curve = |key: &str, center: egui::Pos2| -> f32 {
+                            let hid = ui.id().with(("env_curve", pi, key));
+                            let hrect =
+                                egui::Rect::from_center_size(center, egui::vec2(13.0, 13.0));
+                            let hresp = ui.interact(hrect, hid, egui::Sense::drag());
+                            let sz = if hresp.hovered() || hresp.dragged() {
+                                5.0
+                            } else {
+                                4.0
+                            };
+                            p.add(egui::Shape::convex_polygon(
+                                vec![
+                                    egui::pos2(center.x, center.y - sz),
+                                    egui::pos2(center.x + sz, center.y),
+                                    egui::pos2(center.x, center.y + sz),
+                                    egui::pos2(center.x - sz, center.y),
+                                ],
+                                curve_col,
+                                egui::Stroke::new(1.0, egui::Color32::from_gray(20)),
+                            ));
+                            if hresp.dragged() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                                ui.ctx().request_repaint();
+                                hresp.drag_delta().y
+                            } else {
+                                0.0
+                            }
+                        };
+                        const CSENS: f32 = 0.012;
+                        if t_a > 1e-3 {
+                            let mid = egui::pos2(x_of(t_a * 0.5), y_of(curve_shape(0.5, ca)));
+                            let dy = do_curve("attack", mid);
+                            if dy != 0.0 {
+                                ca = (ca + dy * CSENS).clamp(-1.0, 1.0);
+                            }
+                        }
+                        if t_d - t_a > 1e-3 {
+                            let mid = egui::pos2(
+                                x_of((t_a + t_d) * 0.5),
+                                y_of(1.0 + (s - 1.0) * curve_shape(0.5, cd)),
+                            );
+                            let dy = do_curve("decay", mid);
+                            if dy != 0.0 {
+                                cd = (cd - dy * CSENS).clamp(-1.0, 1.0);
+                            }
+                        }
+                        if end - t_rs > 1e-3 {
+                            let mid = egui::pos2(
+                                x_of((t_rs + end) * 0.5),
+                                y_of(s * (1.0 - curve_shape(0.5, cr))),
+                            );
+                            let dy = do_curve("release", mid);
+                            if dy != 0.0 {
+                                cr = (cr - dy * CSENS).clamp(-1.0, 1.0);
+                            }
+                        }
+                        // Compact label so it's clear which envelope you're shaping (+ the gate if set).
+                        let gate_txt = if gate_end(rend) < dur - 1e-3 {
+                            format!("  gate {:.2}s", gate_end(rend))
                         } else {
-                            0.0
-                        }
-                    };
-                    const CSENS: f32 = 0.012;
-                    if t_a > 1e-3 {
-                        let mid = egui::pos2(x_of(t_a * 0.5), y_of(curve_shape(0.5, ca)));
-                        let dy = do_curve("attack", mid);
-                        if dy != 0.0 {
-                            ca = (ca + dy * CSENS).clamp(-1.0, 1.0);
-                        }
-                    }
-                    if t_d - t_a > 1e-3 {
-                        let mid = egui::pos2(
-                            x_of((t_a + t_d) * 0.5),
-                            y_of(1.0 + (s - 1.0) * curve_shape(0.5, cd)),
+                            String::new()
+                        };
+                        p.text(
+                            egui::pos2(rect.left() + 4.0, rect.top() + 2.0),
+                            egui::Align2::LEFT_TOP,
+                            format!(
+                                "{} ENV  A {a:.2}  D {d:.2}  S {:.0}%  R {rel:.2}{gate_txt}",
+                                target.label(),
+                                s * 100.0
+                            ),
+                            egui::FontId::proportional(11.0),
+                            env_col,
                         );
-                        let dy = do_curve("decay", mid);
-                        if dy != 0.0 {
-                            cd = (cd - dy * CSENS).clamp(-1.0, 1.0);
+                        if (a, d, s, rel, ca, cd, cr, rend) != orig {
+                            want_env = Some((pi, target, [a, d, s, rel, ca, cd, cr, rend]));
                         }
-                    }
-                    if end - t_rs > 1e-3 {
-                        let mid = egui::pos2(
-                            x_of((t_rs + end) * 0.5),
-                            y_of(s * (1.0 - curve_shape(0.5, cr))),
-                        );
-                        let dy = do_curve("release", mid);
-                        if dy != 0.0 {
-                            cr = (cr - dy * CSENS).clamp(-1.0, 1.0);
-                        }
-                    }
-                    // Compact label so it's clear which envelope you're shaping (+ the gate if set).
-                    let gate_txt = if gate_end(rend) < dur - 1e-3 {
-                        format!("  gate {:.2}s", gate_end(rend))
                     } else {
-                        String::new()
-                    };
-                    p.text(
-                        egui::pos2(rect.left() + 4.0, rect.top() + 2.0),
-                        egui::Align2::LEFT_TOP,
-                        format!(
-                            "{} ENV  A {a:.2}  D {d:.2}  S {:.0}%  R {rel:.2}{gate_txt}",
-                            target.label(),
-                            s * 100.0
-                        ),
-                        egui::FontId::proportional(11.0),
-                        env_col,
-                    );
-                    if (a, d, s, rel, ca, cd, cr, rend) != orig {
-                        want_env = Some((pi, target, [a, d, s, rel, ca, cd, cr, rend]));
+                        // ============ MSEG editor (free-form nodes) ============
+                        let pts = self.pads[pi].mseg(target).points.clone();
+                        // Curved contour through the points, then a flat tail (last level held).
+                        let mut contour = Vec::new();
+                        if let Some(first) = pts.first() {
+                            contour
+                                .push(egui::pos2(x_of(first.t.clamp(0.0, dur)), y_of(first.level)));
+                            for w in pts.windows(2) {
+                                let (p0, p1) = (w[0], w[1]);
+                                for k in 1..=NS {
+                                    let u = k as f32 / NS as f32;
+                                    let tt = p0.t + (p1.t - p0.t) * u;
+                                    let lvl =
+                                        p0.level + (p1.level - p0.level) * curve_shape(u, p1.curve);
+                                    contour.push(egui::pos2(x_of(tt.clamp(0.0, dur)), y_of(lvl)));
+                                }
+                            }
+                            if let Some(last) = pts.last() {
+                                if last.t < dur - 1e-4 {
+                                    contour.push(egui::pos2(x_of(dur), y_of(last.level)));
+                                }
+                            }
+                        }
+                        p.add(egui::Shape::line(contour, egui::Stroke::new(2.0, env_col)));
+                        // Node handles (drag to move; right-click deletes, keeping ≥2).
+                        let ptr = ui.input(|inp| inp.pointer.latest_pos());
+                        for (idx, pt) in pts.iter().enumerate() {
+                            let center = egui::pos2(x_of(pt.t.clamp(0.0, dur)), y_of(pt.level));
+                            let hid = ui.id().with(("mseg_pt", pi, idx));
+                            let hrect =
+                                egui::Rect::from_center_size(center, egui::vec2(15.0, 15.0));
+                            let hresp = ui.interact(hrect, hid, egui::Sense::click_and_drag());
+                            let hot = hresp.hovered() || hresp.dragged();
+                            p.circle_filled(center, if hot { 6.5 } else { 5.0 }, env_col);
+                            p.circle_stroke(
+                                center,
+                                if hot { 6.5 } else { 5.0 },
+                                egui::Stroke::new(1.5, egui::Color32::from_gray(20)),
+                            );
+                            if hresp.dragged() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                                ui.ctx().request_repaint();
+                                if let Some(pp) = ptr {
+                                    want_mseg = Some((
+                                        pi,
+                                        target,
+                                        MsegEdit::Move(idx, snap(t_at(pp.x)), level_at(pp.y)),
+                                    ));
+                                }
+                            }
+                            if hresp.secondary_clicked() && pts.len() > 2 {
+                                want_mseg = Some((pi, target, MsegEdit::Del(idx)));
+                            }
+                        }
+                        // Curvature diamonds at each segment midpoint.
+                        for (si, w) in pts.windows(2).enumerate() {
+                            let (p0, p1) = (w[0], w[1]);
+                            if (p1.t - p0.t).abs() < 1e-4 {
+                                continue;
+                            }
+                            let midt = (p0.t + p1.t) * 0.5;
+                            let midl =
+                                p0.level + (p1.level - p0.level) * curve_shape(0.5, p1.curve);
+                            let center = egui::pos2(x_of(midt.clamp(0.0, dur)), y_of(midl));
+                            let hid = ui.id().with(("mseg_curve", pi, si));
+                            let hrect =
+                                egui::Rect::from_center_size(center, egui::vec2(12.0, 12.0));
+                            let hresp = ui.interact(hrect, hid, egui::Sense::drag());
+                            let sz = if hresp.hovered() || hresp.dragged() {
+                                5.0
+                            } else {
+                                4.0
+                            };
+                            p.add(egui::Shape::convex_polygon(
+                                vec![
+                                    egui::pos2(center.x, center.y - sz),
+                                    egui::pos2(center.x + sz, center.y),
+                                    egui::pos2(center.x, center.y + sz),
+                                    egui::pos2(center.x - sz, center.y),
+                                ],
+                                env_col.gamma_multiply(0.7),
+                                egui::Stroke::new(1.0, egui::Color32::from_gray(20)),
+                            ));
+                            if hresp.dragged() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                                ui.ctx().request_repaint();
+                                let sign = if p1.level >= p0.level { 1.0 } else { -1.0 };
+                                want_mseg = Some((
+                                    pi,
+                                    target,
+                                    MsegEdit::Curve(si + 1, hresp.drag_delta().y * 0.012 * sign),
+                                ));
+                            }
+                        }
+                        // Double-click empty → add a node at the pointer.
+                        if resp.double_clicked() {
+                            if let Some(pp) = resp.interact_pointer_pos() {
+                                want_mseg = Some((
+                                    pi,
+                                    target,
+                                    MsegEdit::Add(snap(t_at(pp.x)).clamp(0.0, dur), level_at(pp.y)),
+                                ));
+                            }
+                        }
+                        p.text(
+                            egui::pos2(rect.left() + 4.0, rect.top() + 2.0),
+                            egui::Align2::LEFT_TOP,
+                            format!(
+                                "{} MSEG · {} nodes · dbl-click add · right-click delete",
+                                target.label(),
+                                pts.len()
+                            ),
+                            egui::FontId::proportional(11.0),
+                            env_col,
+                        );
                     }
                     // Visual LFO preview: the current target's LFO waveform drawn centered (shape +
                     // rate + fade visible) in a fainter shade. Editable via the LFO controls row.
@@ -6596,6 +6823,46 @@ impl PixelView {
         if let Some((pi, target, e)) = want_env {
             if pi < self.pads.len() {
                 self.pads[pi].set_env_values(target, e); // also marks that target enabled
+            }
+        }
+        if let Some((pi, target, edit)) = want_mseg {
+            if pi < self.pads.len() {
+                let m = self.pads[pi].mseg_mut(target);
+                match edit {
+                    // Move keeps points ordered by clamping the time between its neighbours (so a
+                    // drag can't reorder indices mid-gesture).
+                    MsegEdit::Move(idx, t, level) => {
+                        let n = m.points.len();
+                        let lo = if idx > 0 { m.points[idx - 1].t } else { 0.0 };
+                        let hi = if idx + 1 < n {
+                            m.points[idx + 1].t
+                        } else {
+                            f32::INFINITY
+                        };
+                        if let Some(p) = m.points.get_mut(idx) {
+                            p.t = t.clamp(lo, hi).max(0.0);
+                            p.level = level.clamp(0.0, 1.0);
+                        }
+                    }
+                    MsegEdit::Curve(idx, delta) => {
+                        if let Some(p) = m.points.get_mut(idx) {
+                            p.curve = (p.curve + delta).clamp(-1.0, 1.0);
+                        }
+                    }
+                    MsegEdit::Add(t, level) => {
+                        m.points.push(EnvPoint {
+                            t: t.max(0.0),
+                            level: level.clamp(0.0, 1.0),
+                            curve: 0.0,
+                        });
+                        m.sort();
+                    }
+                    MsegEdit::Del(idx) => {
+                        if m.points.len() > 2 && idx < m.points.len() {
+                            m.points.remove(idx);
+                        }
+                    }
+                }
             }
         }
         if let Some((lo, hi)) = want_select {
@@ -20634,6 +20901,12 @@ struct Pad {
     pitch_lfo: Lfo,
     cutoff_lfo: Lfo,
     res_lfo: Lfo,
+    // Per-target MSEG (multi-segment envelope). When `on` it REPLACES that target's ADSR envelope
+    // for both baking and export (a free-form arbitrary-node shape).
+    amp_mseg: Mseg,
+    pitch_mseg: Mseg,
+    cutoff_mseg: Mseg,
+    res_mseg: Mseg,
     // Monophonic: a new hit cuts this pad's own previous voice (self-choke). Looping pads are
     // always monophonic; this makes a one-shot pad mono too (hi-hats, 808s). Shown by a tile chip.
     mono: bool,
@@ -20737,6 +21010,119 @@ impl Env {
         } else {
             self.rel_end
         }
+    }
+}
+
+/// One node of an **MSEG** (multi-segment envelope): a point at time `t` (seconds) and `level`
+/// (0..1), plus the `curve` of the segment ENTERING it (−1 concave … 0 linear … +1 convex).
+#[derive(Clone, Copy)]
+struct EnvPoint {
+    t: f32,
+    level: f32,
+    curve: f32,
+}
+
+/// A **multi-segment envelope** — an arbitrary list of points, the free-form alternative to the
+/// fixed ADSR. `on` switches a target to MSEG mode; points are kept sorted by time.
+#[derive(Clone, Default)]
+struct Mseg {
+    on: bool,
+    points: Vec<EnvPoint>,
+}
+
+impl Mseg {
+    /// A gentle default shape (proportional to `dur`) seeded when a target is switched to MSEG.
+    fn seeded(dur: f32) -> Self {
+        let d = dur.max(0.2);
+        Mseg {
+            on: true,
+            points: vec![
+                EnvPoint {
+                    t: 0.0,
+                    level: 0.0,
+                    curve: 0.0,
+                },
+                EnvPoint {
+                    t: d * 0.02,
+                    level: 1.0,
+                    curve: 0.0,
+                },
+                EnvPoint {
+                    t: d * 0.4,
+                    level: 0.5,
+                    curve: 0.0,
+                },
+                EnvPoint {
+                    t: d * 0.95,
+                    level: 0.0,
+                    curve: 0.0,
+                },
+            ],
+        }
+    }
+    /// Serialize to one record field: `on#t,l,c#t,l,c#…`.
+    fn to_field(&self) -> String {
+        let mut s = if self.on {
+            "1".to_string()
+        } else {
+            "0".to_string()
+        };
+        for p in &self.points {
+            s.push_str(&format!("#{},{},{}", p.t, p.level, p.curve));
+        }
+        s
+    }
+    fn from_field(s: &str) -> Self {
+        let mut it = s.split('#');
+        let on = it.next() == Some("1");
+        let points = it
+            .filter_map(|seg| {
+                let mut f = seg.split(',');
+                let t = f.next()?.parse().ok()?;
+                let level = f.next()?.parse().ok()?;
+                let curve = f.next().and_then(|x| x.parse().ok()).unwrap_or(0.0);
+                Some(EnvPoint { t, level, curve })
+            })
+            .collect();
+        Mseg { on, points }
+    }
+    /// Re-sort points by time (call after moving/adding a node).
+    fn sort(&mut self) {
+        self.points.sort_by(|a, b| a.t.total_cmp(&b.t));
+    }
+}
+
+/// Evaluate an MSEG at time `t` (seconds) → 0..1: piecewise between points, each segment shaped by
+/// the destination point's `curve`. Before the first point holds its level; after the last holds
+/// the last level (so a final level of 0 gates the tail silent).
+fn eval_mseg(points: &[EnvPoint], t: f32) -> f32 {
+    let Some(first) = points.first() else {
+        return 1.0;
+    };
+    if t <= first.t {
+        return first.level;
+    }
+    for w in points.windows(2) {
+        let (p0, p1) = (w[0], w[1]);
+        if t <= p1.t {
+            let u = ((t - p0.t) / (p1.t - p0.t).max(1e-6)).clamp(0.0, 1.0);
+            return p0.level + (p1.level - p0.level) * curve_shape(u, p1.curve);
+        }
+    }
+    points.last().map_or(0.0, |p| p.level)
+}
+
+/// A modulation shape source — the fixed ADSR `Env` or a free-form `Mseg`. Both produce a 0..1
+/// value over time via `eval_shape`, so the bakers work with either.
+enum ModShape<'a> {
+    Adsr(&'a Env),
+    Mseg(&'a [EnvPoint]),
+}
+
+fn eval_shape(s: &ModShape, t: f32, dur: f32, one_shot: bool) -> f32 {
+    match s {
+        ModShape::Adsr(e) => eval_env(e, t, dur, one_shot),
+        ModShape::Mseg(p) => eval_mseg(p, t),
     }
 }
 
@@ -21008,6 +21394,29 @@ fn push_flex_eg(sfz: &mut String, idx: u32, target: &str, depth: &str, e: &Env, 
     ));
 }
 
+/// Emit a flex EG from arbitrary **MSEG points** (times are inter-point DELTAS in SFZ, levels 0..1,
+/// each segment's `shape` = its destination point's curve). Reproduces a free-form envelope exactly.
+fn push_flex_eg_points(sfz: &mut String, idx: u32, target: &str, depth: &str, points: &[EnvPoint]) {
+    sfz.push_str(&format!("eg{idx:02}_{target}={depth}\n"));
+    let Some(first) = points.first() else {
+        return;
+    };
+    let shp = |c: f32| format!("{:.2}", c.clamp(-1.0, 1.0) * 8.0);
+    sfz.push_str(&format!(
+        "eg{idx:02}_time1=0\neg{idx:02}_level1={:.3}\n",
+        first.level.clamp(0.0, 1.0)
+    ));
+    for (k, w) in points.windows(2).enumerate() {
+        let n = k + 2;
+        let dt = (w[1].t - w[0].t).max(0.0);
+        sfz.push_str(&format!(
+            "eg{idx:02}_time{n}={dt:.3}\neg{idx:02}_level{n}={:.3}\neg{idx:02}_shape{n}={}\n",
+            w[1].level.clamp(0.0, 1.0),
+            shp(w[1].curve)
+        ));
+    }
+}
+
 /// Human-readable names for `Pad::loop_type` (indexed by the stored value).
 const LOOP_TYPES: [&str; 3] = ["Forward", "Reverse", "Ping-pong"];
 
@@ -21057,6 +21466,15 @@ enum WaveDrag {
     Move { width: f32, grab_off: f32 },
 }
 
+/// A deferred edit to the current target's MSEG (the player is borrowed while the overlay draws).
+#[derive(Clone, Copy)]
+enum MsegEdit {
+    Move(usize, f32, f32), // point index → new (time, level)
+    Curve(usize, f32),     // segment index (the point it enters) → curvature delta
+    Add(f32, f32),         // add a point at (time, level)
+    Del(usize),            // delete point index
+}
+
 /// The editor state stashed while drilled into a pad, restored on Back.
 struct EditorStash {
     buf: SampleBuf,
@@ -21103,6 +21521,10 @@ impl Pad {
             pitch_lfo: Lfo::seeded(),
             cutoff_lfo: Lfo::seeded(),
             res_lfo: Lfo::seeded(),
+            amp_mseg: Mseg::default(),
+            pitch_mseg: Mseg::default(),
+            cutoff_mseg: Mseg::default(),
+            res_mseg: Mseg::default(),
             mono: false,
             color: None,
             source: None,
@@ -21177,6 +21599,11 @@ impl Pad {
             self.pitch_lfo.to_field(),
             self.cutoff_lfo.to_field(),
             self.res_lfo.to_field(),
+            // Indices 38..=41: per-target MSEGs (each one flat field).
+            self.amp_mseg.to_field(),
+            self.pitch_mseg.to_field(),
+            self.cutoff_mseg.to_field(),
+            self.res_mseg.to_field(),
         ]
     }
 
@@ -21256,6 +21683,40 @@ impl Pad {
             EnvTarget::Pitch => &self.pitch_lfo,
             EnvTarget::Cutoff => &self.cutoff_lfo,
             EnvTarget::Res => &self.res_lfo,
+        }
+    }
+    fn mseg(&self, target: EnvTarget) -> &Mseg {
+        match target {
+            EnvTarget::Amp => &self.amp_mseg,
+            EnvTarget::Pitch => &self.pitch_mseg,
+            EnvTarget::Cutoff => &self.cutoff_mseg,
+            EnvTarget::Res => &self.res_mseg,
+        }
+    }
+    fn mseg_mut(&mut self, target: EnvTarget) -> &mut Mseg {
+        match target {
+            EnvTarget::Amp => &mut self.amp_mseg,
+            EnvTarget::Pitch => &mut self.pitch_mseg,
+            EnvTarget::Cutoff => &mut self.cutoff_mseg,
+            EnvTarget::Res => &mut self.res_mseg,
+        }
+    }
+    /// Whether a target has an active shape source (its MSEG or its ADSR envelope is on).
+    fn shape_active(&self, target: EnvTarget) -> bool {
+        self.mseg(target).on || self.env_on(target)
+    }
+    /// Evaluate a target's active shape (MSEG if on, else its ADSR) at time `t` → 0..1. For drawing
+    /// the faded background envelopes generically (works for either mode).
+    fn eval_shape_at(&self, target: EnvTarget, t: f32, dur: f32, one_shot: bool) -> f32 {
+        let m = self.mseg(target);
+        if m.on {
+            return eval_mseg(&m.points, t);
+        }
+        match target {
+            EnvTarget::Amp => eval_env(&self.amp_env(), t, dur, one_shot),
+            EnvTarget::Pitch => eval_env(&self.pitch_env, t, dur, one_shot),
+            EnvTarget::Cutoff => eval_env(&self.cutoff_env, t, dur, one_shot),
+            EnvTarget::Res => eval_env(&self.res_env, t, dur, one_shot),
         }
     }
     /// The LFO for a modulation `target` (mutable — the LFO controls edit it in place).
@@ -21338,6 +21799,10 @@ impl Pad {
             pitch_lfo: Lfo::from_field(&g(35)),
             cutoff_lfo: Lfo::from_field(&g(36)),
             res_lfo: Lfo::from_field(&g(37)),
+            amp_mseg: Mseg::from_field(&g(38)),
+            pitch_mseg: Mseg::from_field(&g(39)),
+            cutoff_mseg: Mseg::from_field(&g(40)),
+            res_mseg: Mseg::from_field(&g(41)),
             flash_t: -1.0,
         };
         (pad, has_audio)
@@ -21545,16 +22010,24 @@ fn curve_shape(t: f32, c: f32) -> f32 {
 /// same shape (curves + `rel_end` gate) as the pitch/cutoff/res bakers. A one-shot's release fades
 /// the tail (never clicks) and past the gate `end` it's silent; a looping pad holds sustain to the
 /// region end (the region is what repeats). A neutral envelope returns the region untouched.
-fn apply_amp_env(mut region: Vec<f32>, ch: usize, sr: f32, env: &Env, one_shot: bool) -> Vec<f32> {
+fn apply_amp_env(
+    mut region: Vec<f32>,
+    ch: usize,
+    sr: f32,
+    shape: &ModShape,
+    one_shot: bool,
+) -> Vec<f32> {
     let ch = ch.max(1);
-    // Nothing to do — no ramps, full sustain, no gate → identity.
-    if env.a < 1e-4
-        && env.d < 1e-4
-        && env.rel < 1e-4
-        && (env.s - 1.0).abs() < 1e-4
-        && env.rel_end <= 1e-4
-    {
-        return region;
+    // Nothing to do — a neutral ADSR (no ramps, full sustain, no gate) → identity.
+    if let ModShape::Adsr(env) = shape {
+        if env.a < 1e-4
+            && env.d < 1e-4
+            && env.rel < 1e-4
+            && (env.s - 1.0).abs() < 1e-4
+            && env.rel_end <= 1e-4
+        {
+            return region;
+        }
     }
     let frames = region.len() / ch;
     if frames == 0 {
@@ -21562,7 +22035,7 @@ fn apply_amp_env(mut region: Vec<f32>, ch: usize, sr: f32, env: &Env, one_shot: 
     }
     let dur = frames as f32 / sr;
     for f in 0..frames {
-        let g = eval_env(env, f as f32 / sr, dur, one_shot);
+        let g = eval_shape(shape, f as f32 / sr, dur, one_shot);
         for c in 0..ch {
             region[f * ch + c] *= g;
         }
@@ -21678,8 +22151,8 @@ fn apply_lowpass_env(
     sr: f32,
     cutoff_max: f32,
     res_static: f32,
-    cutoff_env: Option<&Env>,
-    res_env: Option<&Env>,
+    cutoff_env: Option<ModShape>,
+    res_env: Option<ModShape>,
     cutoff_lfo: Option<&Lfo>,
     res_lfo: Option<&Lfo>,
     bpm: f32,
@@ -21700,16 +22173,16 @@ fn apply_lowpass_env(
     let (mut last_c, mut last_r) = (-1.0f32, -1.0f32);
     for f in 0..frames {
         let t = f as f32 / sr;
-        let mut cutoff = match cutoff_env {
-            Some(e) => cutoff_min * ratio.powf(eval_env(e, t, dur, one_shot).clamp(0.0, 1.0)),
+        let mut cutoff = match cutoff_env.as_ref() {
+            Some(e) => cutoff_min * ratio.powf(eval_shape(e, t, dur, one_shot).clamp(0.0, 1.0)),
             None => cutoff_max,
         };
         if let Some(l) = cutoff_lfo.filter(|l| l.depth.abs() > 1e-3) {
             cutoff *= 2.0f32.powf(l.depth * eval_lfo(l, t, bpm)); // ± octaves
         }
         cutoff = cutoff.clamp(20.0, sr * 0.49);
-        let mut res = match res_env {
-            Some(e) => eval_env(e, t, dur, one_shot).clamp(0.0, 1.0),
+        let mut res = match res_env.as_ref() {
+            Some(e) => eval_shape(e, t, dur, one_shot).clamp(0.0, 1.0),
             None => res_static,
         };
         if let Some(l) = res_lfo.filter(|l| l.depth.abs() > 1e-3) {
@@ -21740,7 +22213,7 @@ fn apply_pitch_mod(
     ch: usize,
     sr: f32,
     env_depth: f32,
-    env: Option<&Env>,
+    env: Option<ModShape>,
     lfo: Option<&Lfo>,
     bpm: f32,
     one_shot: bool,
@@ -21761,8 +22234,8 @@ fn apply_pitch_mod(
     while pos < (frames - 1) as f32 && out.len() < cap {
         let t = pos / sr;
         let mut semis = 0.0;
-        if let Some(e) = env.filter(|_| env_on) {
-            semis += env_depth * eval_env(e, t, dur, one_shot);
+        if let Some(e) = env.as_ref().filter(|_| env_on) {
+            semis += env_depth * eval_shape(e, t, dur, one_shot);
         }
         if let Some(l) = lfo.filter(|_| lfo_on) {
             semis += l.depth * eval_lfo(l, t, bpm);
@@ -24904,31 +25377,58 @@ mod tests {
             cr: 0.0,
             rel_end: 0.0,
         };
+        let run = |e: &Env, one_shot: bool| {
+            apply_amp_env(mono.clone(), 1, sr, &ModShape::Adsr(e), one_shot)
+        };
         // Neutral envelope (no ramps, full sustain) is a cheap identity.
-        let id = apply_amp_env(mono.clone(), 1, sr, &mk(0.0, 0.0, 1.0, 0.0, 0.0), true);
+        let id = run(&mk(0.0, 0.0, 1.0, 0.0, 0.0), true);
         assert_eq!(id, mono);
         // Attack 0.1s (10 frames): frame 0 is silent, ramps up, full by the attack end.
-        let atk = apply_amp_env(mono.clone(), 1, sr, &mk(0.1, 0.0, 1.0, 0.0, 0.0), true);
+        let atk = run(&mk(0.1, 0.0, 1.0, 0.0, 0.0), true);
         assert!(atk[0].abs() < 1e-6); // starts at 0
         assert!(atk[5] > 0.3 && atk[5] < 0.7); // mid-ramp
         assert!((atk[20] - 1.0).abs() < 1e-6); // fully open past the attack
                                                // Sustain 0.5 with an immediate decay pulls the body down to half.
-        let sus = apply_amp_env(mono.clone(), 1, sr, &mk(0.0, 0.05, 0.5, 0.0, 0.0), true);
+        let sus = run(&mk(0.0, 0.05, 0.5, 0.0, 0.0), true);
         assert!((sus[80] - 0.5).abs() < 1e-6);
         // Release (one-shot) fades the very tail to ~0; a looping pad keeps sustain to the end.
-        let rel = apply_amp_env(mono.clone(), 1, sr, &mk(0.0, 0.0, 1.0, 0.1, 0.0), true);
+        let rel = run(&mk(0.0, 0.0, 1.0, 0.1, 0.0), true);
         assert!(rel[99] < 0.2); // tail faded
-        let loop_ = apply_amp_env(mono.clone(), 1, sr, &mk(0.0, 0.0, 1.0, 0.1, 0.0), false);
+        let loop_ = run(&mk(0.0, 0.0, 1.0, 0.1, 0.0), false);
         assert!((loop_[99] - 1.0).abs() < 1e-6); // no release when looping
                                                  // A convex attack curve sits BELOW the linear ramp at its midpoint (slow start).
-        let curved = apply_amp_env(mono.clone(), 1, sr, &mk(0.1, 0.0, 1.0, 0.0, 1.0), true);
+        let curved = run(&mk(0.1, 0.0, 1.0, 0.0, 1.0), true);
         assert!(curved[5] < atk[5]); // convex (c=+1) is lower mid-ramp than linear
                                      // GATE: rel_end at 0.5s silences everything after the gate (one-shot only).
         let mut gated = mk(0.0, 0.0, 1.0, 0.1, 0.0);
         gated.rel_end = 0.5;
-        let g = apply_amp_env(mono.clone(), 1, sr, &gated, true);
+        let g = run(&gated, true);
         assert!((g[40] - 1.0).abs() < 1e-6); // sustain body before the release
         assert!(g[60].abs() < 1e-6); // fully silent past the gate end
+                                     // MSEG shape: piecewise interpolation between arbitrary nodes.
+        let pts = [
+            EnvPoint {
+                t: 0.0,
+                level: 0.0,
+                curve: 0.0,
+            },
+            EnvPoint {
+                t: 0.5,
+                level: 1.0,
+                curve: 0.0,
+            },
+            EnvPoint {
+                t: 1.0,
+                level: 0.0,
+                curve: 0.0,
+            },
+        ];
+        assert!((eval_mseg(&pts, 0.25) - 0.5).abs() < 1e-3); // halfway up the first ramp
+        assert!((eval_mseg(&pts, 0.5) - 1.0).abs() < 1e-6); // the peak node
+        assert!((eval_mseg(&pts, 0.75) - 0.5).abs() < 1e-3); // halfway down
+        assert!(eval_mseg(&pts, 2.0) < 1e-6); // past the last node → holds its level (0)
+        let mseg = apply_amp_env(mono.clone(), 1, sr, &ModShape::Mseg(&pts), true);
+        assert!((mseg[50] - 1.0).abs() < 0.05); // peak at the middle
     }
 
     #[test]
@@ -25007,14 +25507,41 @@ mod tests {
             cr: 0.0,
             rel_end: 0.0,
         };
-        let out = apply_pitch_mod(mono.clone(), 1, sr, -12.0, Some(&down), None, 120.0, false);
+        let out = apply_pitch_mod(
+            mono.clone(),
+            1,
+            sr,
+            -12.0,
+            Some(ModShape::Adsr(&down)),
+            None,
+            120.0,
+            false,
+        );
         assert!(out.len() > mono.len()); // slower playback → more output frames
                                          // An upward pitch reads faster → SHORTER output.
-        let up = apply_pitch_mod(mono.clone(), 1, sr, 12.0, Some(&down), None, 120.0, false);
+        let up = apply_pitch_mod(
+            mono.clone(),
+            1,
+            sr,
+            12.0,
+            Some(ModShape::Adsr(&down)),
+            None,
+            120.0,
+            false,
+        );
         assert!(up.len() < mono.len());
         // Zero depth + no LFO is a no-op.
         assert_eq!(
-            apply_pitch_mod(mono.clone(), 1, sr, 0.0, Some(&down), None, 120.0, false),
+            apply_pitch_mod(
+                mono.clone(),
+                1,
+                sr,
+                0.0,
+                Some(ModShape::Adsr(&down)),
+                None,
+                120.0,
+                false
+            ),
             mono
         );
         // A pitch LFO alone (no env) still resamples (vibrato).
@@ -25058,6 +25585,37 @@ mod tests {
         let out = apply_amp_lfo(mono, 1, 100.0, &tl, 120.0);
         assert!(out.iter().all(|&x| x <= 1.0 + 1e-6 && x >= 0.2 - 1e-6));
         assert!(out.iter().cloned().fold(1.0f32, f32::min) < 0.5); // it dips
+    }
+
+    #[test]
+    fn mseg_field_roundtrip() {
+        let m = Mseg {
+            on: true,
+            points: vec![
+                EnvPoint {
+                    t: 0.0,
+                    level: 0.0,
+                    curve: 0.0,
+                },
+                EnvPoint {
+                    t: 0.3,
+                    level: 1.0,
+                    curve: 0.5,
+                },
+                EnvPoint {
+                    t: 0.9,
+                    level: 0.2,
+                    curve: -0.4,
+                },
+            ],
+        };
+        let r = Mseg::from_field(&m.to_field());
+        assert!(r.on && r.points.len() == 3);
+        assert!((r.points[1].t - 0.3).abs() < 1e-6 && (r.points[1].curve - 0.5).abs() < 1e-6);
+        assert!((r.points[2].level - 0.2).abs() < 1e-6 && (r.points[2].curve + 0.4).abs() < 1e-6);
+        // An off/empty field yields an off MSEG with no points.
+        let off = Mseg::from_field("0");
+        assert!(!off.on && off.points.is_empty());
     }
 
     #[test]

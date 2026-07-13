@@ -1054,7 +1054,22 @@ serializes to ONE record field (`to_field`/`from_field`, `;`-joined) so the Pad 
 (indices 28–31: `pitch_env`, `pitch_depth`, `cutoff_env`, `res_env`; amp keeps its legacy flat fields).
 The overlay reads/writes the selected target generically via `Pad::env_values`/`set_env_values`/
 `env_on`/`set_env_on` (an 8-value `[a,d,s,rel,ca,cd,cr,rel_end]`); `want_env` carries
-`(pad, EnvTarget, [f32;8])`. **Gate / release-end node:** each envelope has a `rel_end` (seconds; 0 =
+`(pad, EnvTarget, [f32;8])`.
+
+**MSEG (free-form multi-segment envelope) — an alternate mode per target.** Each target also has a
+`Mseg { on, points: Vec<EnvPoint{t,level,curve}> }` (records 38–41; `amp_mseg`/`pitch_mseg`/…). When
+`Mseg.on` it **replaces the ADSR** for that target in both baking and export. `eval_mseg` is piecewise
+between points (each segment shaped by its destination point's `curve`, holding the last level after
+the end = gate). `ModShape { Adsr(&Env) | Mseg(&[EnvPoint]) }` + `eval_shape` unify the two, so the
+bakers (`apply_amp_env`, `apply_pitch_mod`, `apply_lowpass_env`) take a `ModShape`; `trigger_pad` picks
+`Mseg` if on else `Adsr`. The **overlay** branches on `is_mseg`: the ADSR editor (fixed 4 nodes) vs. the
+MSEG editor (arbitrary nodes — drag to move, double-click to add, right-click to delete, segment
+midpoint diamonds to curve). MSEG edits defer through `want_mseg: (pad, EnvTarget, MsegEdit)` (Move
+clamps a node's time between its neighbours so a drag can't reorder indices). Background (ghost)
+envelopes now sample `Pad::eval_shape_at` generically so they render in either mode. **Export:**
+`push_flex_eg_points` writes a flex EG from the arbitrary points (inter-point DELTA times) —
+MSEG maps to flex EGs exactly. The waveform's own click/double-click/middle-click handlers are gated
+off (`!env_editing`) so the MSEG editor owns those gestures. **Gate / release-end node:** each envelope has a `rel_end` (seconds; 0 =
 sample end) — a 4th draggable node at the release end lets the envelope finish **before** the sample
 (the tail is silenced; `Env::end(dur)` resolves it, `eval_env` returns 0 past it). Amp is baked
 through the SAME `eval_env` now (`apply_amp_env(&Env)` — no more bespoke frame math), so amp, pitch,

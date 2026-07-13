@@ -494,7 +494,9 @@ The audio player goes further than playback:
   concave/convex). A **live playhead** sweeps across as the pad plays so you can see the modulation
   shape the sound, and an optional **BPM beat grid** snaps nodes to tempo. You can drag the **release
   end** node to gate the envelope (silence the tail), pick **preset shapes** (Pluck / Perc / Saw / Gate
-  / Pad), and **save your own**. Each pad also has a built-in **low-pass filter** (cutoff + resonance)
+  / Pad), and **save your own**. Or switch a target to **MSEG** — a free-form multi-node envelope
+  (double-click to add nodes, drag to move, right-click to delete, drag segment midpoints to curve).
+  Each pad also has a built-in **low-pass filter** (cutoff + resonance)
   and a per-target **LFO** (tremolo / vibrato / filter wobble — sine · triangle · saw · square ·
   sample&hold, free-running or **tempo-synced**, with fade-in). A linear envelope exports as universal
   SFZ (`ampeg_*` / `pitcheg_*` / `fileg_*` + `cutoff`/`resonance`); a curved one exports as an SFZ v2
