@@ -32,7 +32,9 @@ the CP437 font + a lean hand-rolled syntax highlighter, `decode/code.rs`), **PDF
 (`decode/pdf.rs`: the tile is the **real first page** rendered via poppler's `pdftoppm` —
 PDF on stdin, PNG on stdout — falling back to a labeled placeholder if poppler is absent;
 page-count/size/title/author metadata via pure-Rust `lopdf`), and **audio**
-(`decode/audio.rs`: a real waveform tile for mp3/wav/ogg/flac via `symphonia`, else a
+(`decode/audio.rs`: a real waveform tile for mp3/wav/ogg/flac/**aiff** via `symphonia` — AIFF
+needs the `aiff` feature on symphonia + `symphonia-aiff` on rodio, else `.aif` decoded to a flat
+silent buffer — else a
 music-note icon for trackers/voc/au/midi; duration/rate/channels/codec in Details, plus an
 **in-app play/pause/seek preview** via `rodio`). These three are **toggleable plugins**
 (Preferences → "Format plugins" checkboxes; a runtime atomic flag on the `Registry` — off
@@ -1132,7 +1134,13 @@ when off; Global velocity wins). **Drop a sample onto a pad to load it**: the Sa
 rows + the tracker "Samples (N)" rows are drag sources (`PadDrop::File(PathBuf)` / `::Tracker(usize)`
 set via `egui::DragAndDrop::set_payload`); a pad tile highlights while a payload hovers
 (`dnd_hover_payload`) and loads it on release (`dnd_release_payload` → `load_pad_from_file` /
-`load_pad_from_tracker`, both via the shared `set_pad`). **Drag one pad onto another to move/swap
+`load_pad_from_tracker`, both via the shared `set_pad`) — then **drills into that pad** (`focus_pad`)
+so "Editing pad N" + its waveform confirm which pad got the sample and you land in trim/loop editing.
+**Grid-width gotcha:** `draw_pad_grid`'s cells are sized from `right_w` = `avail − left_w − …`, and
+`avail` must be `ui.available_width().min(ui.clip_rect().width())` — bare `available_width()` is
+**inflated** by the wide non-wrapping MIDI-in row inside the vertical `auto_shrink=false` ScrollArea
+(reports the widest child, not the viewport), which blew the cells up so pads 2/3/4 of each row fell
+off the right edge — only column 1 (pads 1/5/9/13) stayed on-screen, so every drop landed on pad 1. **Drag one pad onto another to move/swap
 them** (`PadDrop::Pad(usize)` — the tile is `Sense::click_and_drag`, so a plain click still triggers
 it but a body-drag sets the payload → `move_pad(src, dst)` swaps the two slots). Each pad's firing
 note then either **stays with the pad** (its 🔒 `note_lock` is on → its current absolute note is
