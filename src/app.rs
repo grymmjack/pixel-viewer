@@ -811,12 +811,14 @@ pub struct PixelView {
     env_grid: bool, // draw a BPM beat-division grid in the envelope editor (persisted)
     env_snap: bool, // snap dragged envelope nodes to that grid (persisted)
     env_target: EnvTarget, // which modulation target the overlay edits (Amp/Pitch/Cutoff/Res; transient)
+    env_user_presets: Vec<(String, [f32; 8])>, // user-saved envelope shapes (name → 8 values; persisted)
+    env_preset_name: String,                   // in-progress "save preset as" name (transient)
     sel_undo: Vec<(f32, f32)>, // selection history: previous (start,end)s for undo (transient)
     sel_redo: Vec<(f32, f32)>, // undone selections, for redo (transient)
     sel_undo_pending: Option<(f32, f32)>, // pre-change selection, pushed to sel_undo on commit
     play_from_mark: Option<f32>, // where the last middle-click started playback (neon ▶ marker)
-    zoom_edit_pct: u32,    // "Zoom Edit %": magnification of the edge inset (0 = off); persisted
-    wave_amp: f32,         // waveform vertical magnification (1 = normal); persisted
+    zoom_edit_pct: u32, // "Zoom Edit %": magnification of the edge inset (0 = off); persisted
+    wave_amp: f32,      // waveform vertical magnification (1 = normal); persisted
     // Transient / BPM / musical-grid state (item 10). Marks are detected times (secs), cached for
     // the current buffer and recomputed when the sensitivity or buffer changes.
     transients_on: bool,  // detect + draw transient guideline markers (persisted)
@@ -1256,6 +1258,7 @@ impl PixelView {
     const MUSICAL_DIV_KEY: &'static str = "musical_div";
     const ENV_GRID_KEY: &'static str = "env_grid";
     const ENV_SNAP_KEY: &'static str = "env_snap";
+    const ENV_USER_PRESETS_KEY: &'static str = "env_user_presets";
     const MIDI_FOLLOW_KEY: &'static str = "midi_follow";
     const KIT_MAP_LOCK_KEY: &'static str = "kit_map_lock";
     const RECOLOR_KEY: &'static str = "show_recolor";
@@ -1846,6 +1849,13 @@ impl PixelView {
             env_grid: get_bool(Self::ENV_GRID_KEY).unwrap_or(false),
             env_snap: get_bool(Self::ENV_SNAP_KEY).unwrap_or(false),
             env_target: EnvTarget::Amp,
+            env_user_presets: cc
+                .storage
+                .and_then(|s| {
+                    eframe::get_value::<Vec<(String, [f32; 8])>>(s, Self::ENV_USER_PRESETS_KEY)
+                })
+                .unwrap_or_default(),
+            env_preset_name: String::new(),
             zoom_edit_pct: cc
                 .storage
                 .and_then(|s| eframe::get_value::<u32>(s, Self::ZOOM_EDIT_KEY))
@@ -5054,17 +5064,72 @@ impl PixelView {
                             {
                                 self.pads[i].set_env_on(t, on);
                             }
-                            // Preset starter shapes (duration-proportional; apply to this target).
+                            // Preset shapes: built-ins (duration-proportional) + your saved ones.
+                            // Applied to the CURRENT target; deletes/saves are deferred out of the
+                            // combo closure so it doesn't borrow `self` twice.
+                            let mut apply_preset: Option<[f32; 8]> = None;
+                            let mut delete_preset: Option<usize> = None;
                             egui::ComboBox::from_id_salt("env_preset")
                                 .selected_text("Preset")
                                 .width(64.0)
                                 .show_ui(ui, |ui| {
                                     for name in ENV_PRESETS {
                                         if ui.selectable_label(false, name).clicked() {
-                                            self.pads[i].set_env_values(t, env_preset(name, dur));
+                                            apply_preset = Some(env_preset(name, dur));
+                                        }
+                                    }
+                                    if !self.env_user_presets.is_empty() {
+                                        ui.separator();
+                                        for (ui_idx, (pname, vals)) in
+                                            self.env_user_presets.iter().enumerate()
+                                        {
+                                            ui.horizontal(|ui| {
+                                                if ui.selectable_label(false, pname).clicked() {
+                                                    apply_preset = Some(*vals);
+                                                }
+                                                if ui
+                                                    .small_button("✕")
+                                                    .on_hover_text("Delete this preset")
+                                                    .clicked()
+                                                {
+                                                    delete_preset = Some(ui_idx);
+                                                }
+                                            });
                                         }
                                     }
                                 });
+                            if let Some(v) = apply_preset {
+                                self.pads[i].set_env_values(t, v);
+                            }
+                            if let Some(di) = delete_preset {
+                                if di < self.env_user_presets.len() {
+                                    self.env_user_presets.remove(di);
+                                }
+                            }
+                            // Save the current envelope as a named preset.
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.env_preset_name)
+                                    .desired_width(70.0)
+                                    .hint_text("name"),
+                            );
+                            if ui
+                                .button("Save")
+                                .on_hover_text("Save the current envelope shape as a preset")
+                                .clicked()
+                            {
+                                let name = self.env_preset_name.trim().to_string();
+                                if !name.is_empty() {
+                                    let vals = self.pads[i].env_values(t);
+                                    if let Some(slot) =
+                                        self.env_user_presets.iter_mut().find(|(n, _)| *n == name)
+                                    {
+                                        slot.1 = vals; // overwrite a same-named preset
+                                    } else {
+                                        self.env_user_presets.push((name, vals));
+                                    }
+                                    self.env_preset_name.clear();
+                                }
+                            }
                             // ADSR numeric fine-tune for the selected target.
                             let mut v = self.pads[i].env_values(t);
                             let mut ch = false;
@@ -17884,6 +17949,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::MUSICAL_DIV_KEY, &self.musical_div);
         eframe::set_value(storage, Self::ENV_GRID_KEY, &self.env_grid);
         eframe::set_value(storage, Self::ENV_SNAP_KEY, &self.env_snap);
+        eframe::set_value(storage, Self::ENV_USER_PRESETS_KEY, &self.env_user_presets);
         eframe::set_value(storage, Self::MIDI_FOLLOW_KEY, &self.midi_follow);
         eframe::set_value(storage, Self::KIT_MAP_LOCK_KEY, &self.kit_map_lock);
         eframe::set_value(storage, Self::ZOOM_KEY, &self.ui_zoom);

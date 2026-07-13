@@ -1038,7 +1038,10 @@ drag-start is gated off while `env_editing`; edits defer through `want_env: (usi
 seeds a **duration-proportional** starter shape (`seed_pad_env_if_flat(i, dur)`: no attack, ~12%
 decay, ~30% release) so the nodes spread across the width on any sample length instead of clustering
 at the top-left; a **Preset** combo (`env_preset`/`ENV_PRESETS` — Reset / Pluck / Perc / Saw down /
-Saw up / Gate / Pad, all duration-proportional) applies a named shape to the current target. `env_edit` is
+Saw up / Gate / Pad, all duration-proportional) applies a named shape to the current target, and
+**user presets** (`env_user_presets: Vec<(String,[f32;8])>`, persisted `ENV_USER_PRESETS_KEY`) save
+the current envelope's 8 values under a name (the combo lists them with a ✕ delete; a `name` field +
+Save button captures/overwrites; apply/delete are deferred out of the combo closure). `env_edit` is
 transient (reset on `focus_back` / navigation). A **live pad-voice playhead** (`pad_voice_pos`) sweeps
 across while the pad sounds. **BPM grid + snap** (`env_grid`/`env_snap`, persisted; share `self.bpm`
 + `musical_div` with the waveform's Musical grid via `env_grid_step`): draw beat-division lines in the
