@@ -3649,13 +3649,9 @@ impl PixelView {
             self.status = format!("SFZ export failed: {e}");
             return;
         }
-        let mut sfz = format!(
-            "// {name} — exported from pixelview\n// {} pads\n\n",
-            pads.len()
-        );
-        // Dedupe filenames (two pads could share a base name) so each WAV is distinct.
+        // Dedupe filenames + write each WAV; collect per-region metadata for the pure text builder.
         let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let bpm = self.bpm; // for resolving tempo-synced LFO rates
+        let mut entries: Vec<(i32, String, Pad, f32, u32)> = Vec::with_capacity(pads.len());
         for (note, fname, wav, pad, dur, rate) in &pads {
             let mut fname = fname.clone();
             let mut n = 2;
@@ -3667,255 +3663,9 @@ impl PixelView {
                 self.status = format!("SFZ export failed: {e}");
                 return;
             }
-            sfz.push_str("<region>\n");
-            sfz.push_str(&format!("sample={stem}_samples/{fname}\n"));
-            sfz.push_str(&format!("key={note}\n")); // lokey=hikey=pitch_keycenter=note
-            if pad.pitch != 0 {
-                sfz.push_str(&format!("transpose={}\n", pad.pitch));
-            }
-            let db = if pad.volume <= 0.0001 {
-                -144.0
-            } else {
-                20.0 * pad.volume.log10()
-            };
-            sfz.push_str(&format!("volume={db:.2}\n"));
-            // Velocity → amplitude: full when the pad tracks velocity, off when it plays
-            // fixed (its V toggle off) or the kit forces one global velocity.
-            let veltrack = if self.kit_global_vel || !pad.vel_track {
-                0
-            } else {
-                100
-            };
-            sfz.push_str(&format!("amp_veltrack={veltrack}\n"));
-            // Pan (SFZ pan is −100..100).
-            if pad.pan.abs() > 1e-3 {
-                sfz.push_str(&format!("pan={:.1}\n", pad.pan.clamp(-1.0, 1.0) * 100.0));
-            }
-            // Choke group: `group=N off_by=N` makes every pad in group N cut the others (hi-hats).
-            if pad.choke_group != 0 {
-                let g = pad.choke_group;
-                sfz.push_str(&format!("group={g}\noff_by={g}\noff_mode=fast\n"));
-            }
-            // Amplitude envelope. Only when the pad's envelope is enabled — off ⇒ omit it entirely
-            // (the sample plays raw). HYBRID export: a linear envelope stays plain **v1 `ampeg_*`**
-            // (loads in every SFZ player); a **curved** one (any segment bowed) is written as an
-            // **SFZ v2 flex EG** bound to amplitude (`egN_shapeX` carries the curvature) — ARIA-based
-            // players (sforzando, Bitwig, …) read it, and the curve is a close translation of the
-            // in-app `curve_shape` (exact rendering is player-dependent).
-            if pad.amp_mseg.on {
-                push_flex_eg_points(&mut sfz, 1, "amplitude", "100", &pad.amp_mseg.points);
-            } else if pad.amp_env_on {
-                // A curved OR gated (ends before the sample) envelope needs the flex EG.
-                let curved = pad.amp_attack_curve.abs() > 1e-3
-                    || pad.amp_decay_curve.abs() > 1e-3
-                    || pad.amp_release_curve.abs() > 1e-3
-                    || pad.amp_env().end(*dur) < *dur - 1e-3;
-                let sustain_pct = pad.amp_sustain.clamp(0.0, 1.0) * 100.0;
-                if !curved {
-                    // v1 ADSR — emit only non-default stages so a plain pad stays terse.
-                    if pad.amp_attack > 1e-4 {
-                        sfz.push_str(&format!("ampeg_attack={:.3}\n", pad.amp_attack));
-                    }
-                    if pad.amp_decay > 1e-4 {
-                        sfz.push_str(&format!("ampeg_decay={:.3}\n", pad.amp_decay));
-                    }
-                    if (pad.amp_sustain - 1.0).abs() > 1e-4 {
-                        sfz.push_str(&format!("ampeg_sustain={sustain_pct:.1}\n"));
-                    }
-                    if pad.amp_release > 1e-4 {
-                        sfz.push_str(&format!("ampeg_release={:.3}\n", pad.amp_release));
-                    }
-                } else {
-                    // v2 flex EG on amplitude (eg01): `egN_shapeX` bows each segment.
-                    push_flex_eg(&mut sfz, 1, "amplitude", "100", &pad.amp_env(), *dur);
-                }
-            }
-            // Pitch MSEG → flex EG points; else pitch envelope → v1 `pitcheg_*` (linear) / flex EG.
-            if pad.pitch_mseg.on && pad.pitch_depth.abs() > 1e-3 {
-                let cents = (pad.pitch_depth * 100.0).round() as i32;
-                push_flex_eg_points(
-                    &mut sfz,
-                    2,
-                    "pitch",
-                    &cents.to_string(),
-                    &pad.pitch_mseg.points,
-                );
-            } else if pad.pitch_env.on && pad.pitch_depth.abs() > 1e-3 {
-                let e = &pad.pitch_env;
-                let cents = (pad.pitch_depth * 100.0).round() as i32;
-                // A curved OR gated (ends before the sample) envelope needs the flex EG; the plain
-                // v1 `pitcheg_*` can't express curvature or an early gate.
-                let flex = e.ca.abs() > 1e-3
-                    || e.cd.abs() > 1e-3
-                    || e.cr.abs() > 1e-3
-                    || e.end(*dur) < *dur - 1e-3;
-                if !flex {
-                    sfz.push_str(&format!("pitcheg_depth={cents}\n"));
-                    if e.a > 1e-4 {
-                        sfz.push_str(&format!("pitcheg_attack={:.3}\n", e.a));
-                    }
-                    if e.d > 1e-4 {
-                        sfz.push_str(&format!("pitcheg_decay={:.3}\n", e.d));
-                    }
-                    if (e.s - 1.0).abs() > 1e-4 {
-                        sfz.push_str(&format!(
-                            "pitcheg_sustain={:.1}\n",
-                            e.s.clamp(0.0, 1.0) * 100.0
-                        ));
-                    }
-                    if e.rel > 1e-4 {
-                        sfz.push_str(&format!("pitcheg_release={:.3}\n", e.rel));
-                    }
-                } else {
-                    push_flex_eg(&mut sfz, 2, "pitch", &cents.to_string(), e, *dur);
-                }
-            }
-            // Cutoff MSEG / envelope → a low-pass (base 30 Hz) swept up to cutoff_hz. MSEG → flex EG
-            // points; env → v1 `fileg_*` (linear) or a v2 flex EG (eg03).
-            if pad.cutoff_mseg.on || pad.cutoff_env.on {
-                let base = 30.0f32;
-                let depth_cents =
-                    (1200.0 * (pad.cutoff_hz.max(base + 1.0) / base).log2()).round() as i32;
-                sfz.push_str(&format!("fil_type=lpf_2p\ncutoff={base:.0}\n"));
-                if pad.resonance > 1e-3 {
-                    sfz.push_str(&format!("resonance={:.2}\n", pad.resonance * 24.0));
-                }
-                if pad.cutoff_mseg.on {
-                    push_flex_eg_points(
-                        &mut sfz,
-                        3,
-                        "cutoff",
-                        &depth_cents.to_string(),
-                        &pad.cutoff_mseg.points,
-                    );
-                } else {
-                    let e = &pad.cutoff_env;
-                    let flex = e.ca.abs() > 1e-3
-                        || e.cd.abs() > 1e-3
-                        || e.cr.abs() > 1e-3
-                        || e.end(*dur) < *dur - 1e-3;
-                    if !flex {
-                        sfz.push_str(&format!("fileg_depth={depth_cents}\n"));
-                        if e.a > 1e-4 {
-                            sfz.push_str(&format!("fileg_attack={:.3}\n", e.a));
-                        }
-                        if e.d > 1e-4 {
-                            sfz.push_str(&format!("fileg_decay={:.3}\n", e.d));
-                        }
-                        if (e.s - 1.0).abs() > 1e-4 {
-                            sfz.push_str(&format!(
-                                "fileg_sustain={:.1}\n",
-                                e.s.clamp(0.0, 1.0) * 100.0
-                            ));
-                        }
-                        if e.rel > 1e-4 {
-                            sfz.push_str(&format!("fileg_release={:.3}\n", e.rel));
-                        }
-                    } else {
-                        push_flex_eg(&mut sfz, 3, "cutoff", &depth_cents.to_string(), e, *dur);
-                    }
-                }
-            }
-            // Resonance MSEG / envelope → a v2 flex EG (eg04; SFZ v1 has no resonance envelope).
-            let filt_here = pad.cutoff_env.on || pad.cutoff_mseg.on;
-            if pad.res_mseg.on {
-                if !filt_here {
-                    sfz.push_str("fil_type=lpf_2p\n");
-                }
-                push_flex_eg_points(&mut sfz, 4, "resonance", "12", &pad.res_mseg.points);
-            } else if pad.res_env.on {
-                if !filt_here {
-                    sfz.push_str("fil_type=lpf_2p\n");
-                }
-                push_flex_eg(&mut sfz, 4, "resonance", "12", &pad.res_env, *dur);
-            }
-            // Low-pass filter → native SFZ `cutoff` / `resonance` (dB) / `fil_type`. resonance 0..1
-            // maps to ~0..24 dB (matching the biquad's Q = 0.707·2^(4·res)).
-            if pad.filter_on && pad.cutoff_hz < 20000.0 {
-                let res_db = pad.resonance.clamp(0.0, 1.0) * 24.0;
-                sfz.push_str(&format!(
-                    "fil_type=lpf_2p\ncutoff={:.1}\nresonance={res_db:.2}\n",
-                    pad.cutoff_hz
-                ));
-            }
-            // LFOs → the native v1 dedicated LFOs (amplfo/pitchlfo/fillfo) — SINE, universally
-            // supported — carrying the resolved rate (Hz, incl. tempo-sync), depth and fade. A
-            // resonance LFO uses a v2 flex LFO (v1 has none). Non-sine waves + S&H are baked into the
-            // audio in-app but export as a sine approximation (SFZ v1 LFOs are sine).
-            if pad.amp_lfo.on && pad.amp_lfo.depth > 1e-3 {
-                let l = &pad.amp_lfo;
-                sfz.push_str(&format!(
-                    "amplfo_freq={:.3}\namplfo_depth={:.2}\n",
-                    l.freq(bpm),
-                    l.depth.clamp(0.0, 1.0) * 12.0
-                ));
-                if l.fade > 1e-3 {
-                    sfz.push_str(&format!("amplfo_fade={:.3}\n", l.fade));
-                }
-            }
-            if pad.pitch_lfo.on && pad.pitch_lfo.depth.abs() > 1e-3 {
-                let l = &pad.pitch_lfo;
-                sfz.push_str(&format!(
-                    "pitchlfo_freq={:.3}\npitchlfo_depth={}\n",
-                    l.freq(bpm),
-                    (l.depth * 100.0).round() as i32
-                ));
-                if l.fade > 1e-3 {
-                    sfz.push_str(&format!("pitchlfo_fade={:.3}\n", l.fade));
-                }
-            }
-            let filt_present = pad.filter_on || pad.cutoff_env.on || pad.cutoff_lfo.on;
-            if pad.cutoff_lfo.on && pad.cutoff_lfo.depth.abs() > 1e-3 {
-                let l = &pad.cutoff_lfo;
-                if !filt_present {
-                    sfz.push_str("fil_type=lpf_2p\n");
-                }
-                sfz.push_str(&format!(
-                    "fillfo_freq={:.3}\nfillfo_depth={}\n",
-                    l.freq(bpm),
-                    (l.depth * 1200.0).round() as i32
-                ));
-                if l.fade > 1e-3 {
-                    sfz.push_str(&format!("fillfo_fade={:.3}\n", l.fade));
-                }
-            }
-            if pad.res_lfo.on && pad.res_lfo.depth.abs() > 1e-3 {
-                let l = &pad.res_lfo;
-                if !filt_present {
-                    sfz.push_str("fil_type=lpf_2p\n");
-                }
-                // v1 has no resonance LFO → a v2 flex LFO (sine) on resonance.
-                sfz.push_str(&format!(
-                    "lfo04_wave=1\nlfo04_freq={:.3}\nlfo04_resonance={:.2}\n",
-                    l.freq(bpm),
-                    l.depth.clamp(0.0, 1.0) * 12.0
-                ));
-            }
-            if pad.loop_on {
-                let (ls, le) = pad.loop_region(*dur);
-                // SFZ `loop_end` is the last sample INDEX of the loop, so it must be ≤ samples−1.
-                // For a full-sample loop `le·rate` = the sample COUNT, which strict players
-                // (sforzando) reject as out of range — clamp it to the last valid index.
-                let total = (*dur * *rate as f32).round() as u64;
-                let sf = ((ls * *rate as f32).round() as u64).min(total.saturating_sub(1));
-                let ef = ((le * *rate as f32).round() as u64)
-                    .min(total.saturating_sub(1))
-                    .max(sf);
-                sfz.push_str(&format!(
-                    "loop_mode=loop_continuous\nloop_start={sf}\nloop_end={ef}\n"
-                ));
-                if pad.loop_type == 1 {
-                    sfz.push_str("direction=reverse\n");
-                } else if pad.loop_type == 2 {
-                    sfz.push_str(
-                        "// ping-pong loop approximated as forward (SFZ has no bidi loop)\n",
-                    );
-                }
-            } else {
-                sfz.push_str("loop_mode=one_shot\n"); // a drum hit plays fully, ignores note-off
-            }
-            sfz.push('\n');
+            entries.push((*note, fname, pad.clone(), *dur, *rate));
         }
+        let sfz = build_sfz_text(&name, &stem, &entries, self.kit_global_vel, self.bpm);
         self.status = match std::fs::write(&path, sfz) {
             Ok(()) => format!("Exported SFZ: {} ({} pads)", short_name(&path), pads.len()),
             Err(e) => format!("SFZ export failed: {e}"),
@@ -21444,6 +21194,251 @@ fn push_flex_eg_points(sfz: &mut String, idx: u32, target: &str, depth: &str, po
     }
 }
 
+/// Build the whole SFZ text for a kit — one `<region>` per entry. **Pure** (no I/O), so it's unit-
+/// testable + lint-verifiable independently of the file dialog + WAV writing. `entries` =
+/// `(MIDI note, sample filename, Pad, duration seconds, sample rate)`; `global_vel` = the kit-wide
+/// fixed-velocity mode; `bpm` resolves tempo-synced LFO rates.
+fn build_sfz_text(
+    name: &str,
+    stem: &str,
+    entries: &[(i32, String, Pad, f32, u32)],
+    global_vel: bool,
+    bpm: f32,
+) -> String {
+    let mut sfz = format!(
+        "// {name} — exported from pixelview\n// {} pads\n\n",
+        entries.len()
+    );
+    for (note, fname, pad, dur, rate) in entries {
+        sfz.push_str("<region>\n");
+        sfz.push_str(&format!("sample={stem}_samples/{fname}\n"));
+        sfz.push_str(&format!("key={note}\n")); // lokey=hikey=pitch_keycenter=note
+        if pad.pitch != 0 {
+            sfz.push_str(&format!("transpose={}\n", pad.pitch));
+        }
+        let db = if pad.volume <= 0.0001 {
+            -144.0
+        } else {
+            20.0 * pad.volume.log10()
+        };
+        sfz.push_str(&format!("volume={db:.2}\n"));
+        // Velocity → amplitude: full when the pad tracks velocity, off when it plays fixed (its V
+        // toggle off) or the kit forces one global velocity.
+        let veltrack = if global_vel || !pad.vel_track { 0 } else { 100 };
+        sfz.push_str(&format!("amp_veltrack={veltrack}\n"));
+        // Pan (SFZ pan is −100..100).
+        if pad.pan.abs() > 1e-3 {
+            sfz.push_str(&format!("pan={:.1}\n", pad.pan.clamp(-1.0, 1.0) * 100.0));
+        }
+        // Choke group: `group=N off_by=N` makes every pad in group N cut the others (hi-hats).
+        if pad.choke_group != 0 {
+            let g = pad.choke_group;
+            sfz.push_str(&format!("group={g}\noff_by={g}\noff_mode=fast\n"));
+        }
+        // Amplitude envelope (MSEG → flex EG points; curved/gated → flex EG; else v1 ampeg).
+        if pad.amp_mseg.on {
+            push_flex_eg_points(&mut sfz, 1, "amplitude", "100", &pad.amp_mseg.points);
+        } else if pad.amp_env_on {
+            let curved = pad.amp_attack_curve.abs() > 1e-3
+                || pad.amp_decay_curve.abs() > 1e-3
+                || pad.amp_release_curve.abs() > 1e-3
+                || pad.amp_env().end(*dur) < *dur - 1e-3;
+            let sustain_pct = pad.amp_sustain.clamp(0.0, 1.0) * 100.0;
+            if !curved {
+                if pad.amp_attack > 1e-4 {
+                    sfz.push_str(&format!("ampeg_attack={:.3}\n", pad.amp_attack));
+                }
+                if pad.amp_decay > 1e-4 {
+                    sfz.push_str(&format!("ampeg_decay={:.3}\n", pad.amp_decay));
+                }
+                if (pad.amp_sustain - 1.0).abs() > 1e-4 {
+                    sfz.push_str(&format!("ampeg_sustain={sustain_pct:.1}\n"));
+                }
+                if pad.amp_release > 1e-4 {
+                    sfz.push_str(&format!("ampeg_release={:.3}\n", pad.amp_release));
+                }
+            } else {
+                push_flex_eg(&mut sfz, 1, "amplitude", "100", &pad.amp_env(), *dur);
+            }
+        }
+        // Pitch MSEG → flex EG points; else pitch envelope → v1 `pitcheg_*` (linear) / flex EG.
+        if pad.pitch_mseg.on && pad.pitch_depth.abs() > 1e-3 {
+            let cents = (pad.pitch_depth * 100.0).round() as i32;
+            push_flex_eg_points(
+                &mut sfz,
+                2,
+                "pitch",
+                &cents.to_string(),
+                &pad.pitch_mseg.points,
+            );
+        } else if pad.pitch_env.on && pad.pitch_depth.abs() > 1e-3 {
+            let e = &pad.pitch_env;
+            let cents = (pad.pitch_depth * 100.0).round() as i32;
+            let flex = e.ca.abs() > 1e-3
+                || e.cd.abs() > 1e-3
+                || e.cr.abs() > 1e-3
+                || e.end(*dur) < *dur - 1e-3;
+            if !flex {
+                sfz.push_str(&format!("pitcheg_depth={cents}\n"));
+                if e.a > 1e-4 {
+                    sfz.push_str(&format!("pitcheg_attack={:.3}\n", e.a));
+                }
+                if e.d > 1e-4 {
+                    sfz.push_str(&format!("pitcheg_decay={:.3}\n", e.d));
+                }
+                if (e.s - 1.0).abs() > 1e-4 {
+                    sfz.push_str(&format!(
+                        "pitcheg_sustain={:.1}\n",
+                        e.s.clamp(0.0, 1.0) * 100.0
+                    ));
+                }
+                if e.rel > 1e-4 {
+                    sfz.push_str(&format!("pitcheg_release={:.3}\n", e.rel));
+                }
+            } else {
+                push_flex_eg(&mut sfz, 2, "pitch", &cents.to_string(), e, *dur);
+            }
+        }
+        // Cutoff MSEG / envelope → a low-pass (base 30 Hz) swept up to cutoff_hz.
+        if pad.cutoff_mseg.on || pad.cutoff_env.on {
+            let base = 30.0f32;
+            let depth_cents =
+                (1200.0 * (pad.cutoff_hz.max(base + 1.0) / base).log2()).round() as i32;
+            sfz.push_str(&format!("fil_type=lpf_2p\ncutoff={base:.0}\n"));
+            if pad.resonance > 1e-3 {
+                sfz.push_str(&format!("resonance={:.2}\n", pad.resonance * 24.0));
+            }
+            if pad.cutoff_mseg.on {
+                push_flex_eg_points(
+                    &mut sfz,
+                    3,
+                    "cutoff",
+                    &depth_cents.to_string(),
+                    &pad.cutoff_mseg.points,
+                );
+            } else {
+                let e = &pad.cutoff_env;
+                let flex = e.ca.abs() > 1e-3
+                    || e.cd.abs() > 1e-3
+                    || e.cr.abs() > 1e-3
+                    || e.end(*dur) < *dur - 1e-3;
+                if !flex {
+                    sfz.push_str(&format!("fileg_depth={depth_cents}\n"));
+                    if e.a > 1e-4 {
+                        sfz.push_str(&format!("fileg_attack={:.3}\n", e.a));
+                    }
+                    if e.d > 1e-4 {
+                        sfz.push_str(&format!("fileg_decay={:.3}\n", e.d));
+                    }
+                    if (e.s - 1.0).abs() > 1e-4 {
+                        sfz.push_str(&format!(
+                            "fileg_sustain={:.1}\n",
+                            e.s.clamp(0.0, 1.0) * 100.0
+                        ));
+                    }
+                    if e.rel > 1e-4 {
+                        sfz.push_str(&format!("fileg_release={:.3}\n", e.rel));
+                    }
+                } else {
+                    push_flex_eg(&mut sfz, 3, "cutoff", &depth_cents.to_string(), e, *dur);
+                }
+            }
+        }
+        // Resonance MSEG / envelope → a v2 flex EG (eg04; SFZ v1 has no resonance envelope).
+        let filt_here = pad.cutoff_env.on || pad.cutoff_mseg.on;
+        if pad.res_mseg.on {
+            if !filt_here {
+                sfz.push_str("fil_type=lpf_2p\n");
+            }
+            push_flex_eg_points(&mut sfz, 4, "resonance", "12", &pad.res_mseg.points);
+        } else if pad.res_env.on {
+            if !filt_here {
+                sfz.push_str("fil_type=lpf_2p\n");
+            }
+            push_flex_eg(&mut sfz, 4, "resonance", "12", &pad.res_env, *dur);
+        }
+        // Static low-pass filter → native SFZ `cutoff` / `resonance` (dB) / `fil_type`.
+        if pad.filter_on && pad.cutoff_hz < 20000.0 {
+            let res_db = pad.resonance.clamp(0.0, 1.0) * 24.0;
+            sfz.push_str(&format!(
+                "fil_type=lpf_2p\ncutoff={:.1}\nresonance={res_db:.2}\n",
+                pad.cutoff_hz
+            ));
+        }
+        // LFOs → native v1 dedicated LFOs (amplfo/pitchlfo/fillfo, SINE) + a v2 flex resonance LFO.
+        if pad.amp_lfo.on && pad.amp_lfo.depth > 1e-3 {
+            let l = &pad.amp_lfo;
+            sfz.push_str(&format!(
+                "amplfo_freq={:.3}\namplfo_depth={:.2}\n",
+                l.freq(bpm),
+                l.depth.clamp(0.0, 1.0) * 12.0
+            ));
+            if l.fade > 1e-3 {
+                sfz.push_str(&format!("amplfo_fade={:.3}\n", l.fade));
+            }
+        }
+        if pad.pitch_lfo.on && pad.pitch_lfo.depth.abs() > 1e-3 {
+            let l = &pad.pitch_lfo;
+            sfz.push_str(&format!(
+                "pitchlfo_freq={:.3}\npitchlfo_depth={}\n",
+                l.freq(bpm),
+                (l.depth * 100.0).round() as i32
+            ));
+            if l.fade > 1e-3 {
+                sfz.push_str(&format!("pitchlfo_fade={:.3}\n", l.fade));
+            }
+        }
+        let filt_present = pad.filter_on || pad.cutoff_env.on || pad.cutoff_lfo.on;
+        if pad.cutoff_lfo.on && pad.cutoff_lfo.depth.abs() > 1e-3 {
+            let l = &pad.cutoff_lfo;
+            if !filt_present {
+                sfz.push_str("fil_type=lpf_2p\n");
+            }
+            sfz.push_str(&format!(
+                "fillfo_freq={:.3}\nfillfo_depth={}\n",
+                l.freq(bpm),
+                (l.depth * 1200.0).round() as i32
+            ));
+            if l.fade > 1e-3 {
+                sfz.push_str(&format!("fillfo_fade={:.3}\n", l.fade));
+            }
+        }
+        if pad.res_lfo.on && pad.res_lfo.depth.abs() > 1e-3 {
+            let l = &pad.res_lfo;
+            if !filt_present {
+                sfz.push_str("fil_type=lpf_2p\n");
+            }
+            sfz.push_str(&format!(
+                "lfo04_wave=1\nlfo04_freq={:.3}\nlfo04_resonance={:.2}\n",
+                l.freq(bpm),
+                l.depth.clamp(0.0, 1.0) * 12.0
+            ));
+        }
+        // Loop / one-shot. `loop_end` is the last sample INDEX, so it must be ≤ samples−1 — clamp it
+        // (a full-sample loop's `le·rate` = the sample COUNT, which strict players reject).
+        if pad.loop_on {
+            let (ls, le) = pad.loop_region(*dur);
+            let total = (*dur * *rate as f32).round() as u64;
+            let sf = ((ls * *rate as f32).round() as u64).min(total.saturating_sub(1));
+            let ef = ((le * *rate as f32).round() as u64)
+                .min(total.saturating_sub(1))
+                .max(sf);
+            sfz.push_str(&format!(
+                "loop_mode=loop_continuous\nloop_start={sf}\nloop_end={ef}\n"
+            ));
+            if pad.loop_type == 1 {
+                sfz.push_str("direction=reverse\n");
+            } else if pad.loop_type == 2 {
+                sfz.push_str("// ping-pong loop approximated as forward (SFZ has no bidi loop)\n");
+            }
+        } else {
+            sfz.push_str("loop_mode=one_shot\n"); // a drum hit plays fully, ignores note-off
+        }
+        sfz.push('\n');
+    }
+    sfz
+}
+
 /// Human-readable names for `Pad::loop_type` (indexed by the stored value).
 const LOOP_TYPES: [&str; 3] = ["Forward", "Reverse", "Ping-pong"];
 
@@ -25612,6 +25607,104 @@ mod tests {
         let out = apply_amp_lfo(mono, 1, 100.0, &tl, 120.0);
         assert!(out.iter().all(|&x| x <= 1.0 + 1e-6 && x >= 0.2 - 1e-6));
         assert!(out.iter().cloned().fold(1.0f32, f32::min) < 0.5); // it dips
+    }
+
+    /// Build a representative 3-region kit exercising loop / envelopes / LFOs / filter / MSEG.
+    #[cfg(test)]
+    fn sample_sfz_entries() -> (Vec<(i32, String, Pad, f32, u32)>, u64, u32) {
+        let rate = 48000u32;
+        let total = 5453u64;
+        let dur = total as f32 / rate as f32;
+        // 1: a full-sample loop — the sforzando "loop_end == sample_count" bug case.
+        let mut p1 = Pad::empty();
+        p1.loop_on = true;
+        p1.volume = 0.7;
+        // 2: curved amp env + gate + pitch LFO + static filter + pan + choke + reverse loop.
+        let mut p2 = Pad::empty();
+        p2.amp_env_on = true;
+        p2.amp_attack = 0.01;
+        p2.amp_attack_curve = 0.5;
+        p2.amp_release = 0.2;
+        p2.amp_rel_end = dur * 0.8; // gated
+        p2.filter_on = true;
+        p2.cutoff_hz = 1200.0;
+        p2.resonance = 0.5;
+        p2.pitch_lfo.on = true;
+        p2.pitch_lfo.depth = 2.0;
+        p2.pitch_lfo.sync = true;
+        p2.pan = -0.5;
+        p2.choke_group = 1;
+        p2.loop_on = true;
+        p2.loop_type = 1;
+        p2.pitch = -12;
+        // 3: one-shot with an MSEG amp envelope + a cutoff envelope.
+        let mut p3 = Pad::empty();
+        p3.amp_mseg = Mseg::seeded(dur);
+        p3.cutoff_env.on = true;
+        p3.cutoff_hz = 8000.0;
+        (
+            vec![
+                (48, "kick.wav".to_string(), p1, dur, rate),
+                (49, "snare.wav".to_string(), p2, dur, rate),
+                (50, "hat.wav".to_string(), p3, dur, rate),
+            ],
+            total,
+            rate,
+        )
+    }
+
+    #[test]
+    fn sfz_export_structural_invariants() {
+        let (entries, total, _rate) = sample_sfz_entries();
+        let sfz = build_sfz_text("kit", "kit", &entries, false, 120.0);
+        let regions: Vec<&str> = sfz.split("<region>").skip(1).collect();
+        assert_eq!(regions.len(), 3);
+        for region in &regions {
+            assert!(region.contains("sample="), "every region needs a sample");
+            let mut loop_start = None;
+            for line in region.lines() {
+                if let Some(v) = line.strip_prefix("loop_start=") {
+                    loop_start = v.trim().parse::<u64>().ok();
+                }
+                if let Some(v) = line.strip_prefix("loop_end=") {
+                    let ef: u64 = v.trim().parse().unwrap();
+                    // THE sforzando bug: loop_end is a sample INDEX, must be < the sample count.
+                    assert!(ef < total, "loop_end {ef} must be < sample count {total}");
+                    assert!(
+                        loop_start.unwrap_or(0) <= ef,
+                        "loop_start must be ≤ loop_end"
+                    );
+                }
+                if let Some(v) = line.strip_prefix("resonance=") {
+                    let db: f32 = v.trim().parse().unwrap();
+                    assert!(
+                        (0.0..=40.0).contains(&db),
+                        "resonance {db} out of SFZ dB range"
+                    );
+                }
+                if let Some(v) = line.strip_prefix("pan=") {
+                    let pan: f32 = v.trim().parse().unwrap();
+                    assert!((-100.0..=100.0).contains(&pan), "pan {pan} out of range");
+                }
+            }
+        }
+        // The full-sample loop must clamp its end to the last index (not the sample count).
+        assert!(sfz.contains(&format!("loop_end={}", total - 1)));
+        // The MSEG amp pad emits a flex EG; the reverse loop emits direction=reverse.
+        assert!(sfz.contains("eg01_amplitude=100"));
+        assert!(sfz.contains("direction=reverse"));
+    }
+
+    /// Dump the sample kit's SFZ to /tmp so it can be run through `sfzlint` by hand (not a CI check —
+    /// sfzlint is a Python tool). Run: `cargo test dump_sfz_for_lint -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dump_sfz_for_lint() {
+        let (entries, _t, _r) = sample_sfz_entries();
+        let sfz = build_sfz_text("kit", "kit", &entries, false, 120.0);
+        let path = std::env::temp_dir().join("pv_export_lint.sfz");
+        std::fs::write(&path, &sfz).unwrap();
+        eprintln!("wrote {}", path.display());
     }
 
     #[test]

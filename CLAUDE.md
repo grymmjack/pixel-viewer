@@ -1092,7 +1092,14 @@ LFO); **non-sine waves are baked in-app but export as a sine approximation** (SF
 is hybrid per target**: linear amp→`ampeg_*`, pitch→`pitcheg_*`+`pitcheg_depth`(cents),
 cutoff→`fil_type`+`cutoff`+`fileg_*`+`fileg_depth`; a **curved** one uses a v2 flex EG via `push_flex_eg`
 (eg01 amp / eg02 pitch / eg03 cutoff / eg04 resonance — SFZ v1 has no res EG, so resonance is always
-flex; ARIA/sforzando/Bitwig read flex EGs). Pads **auto-map chromatically from a base note** (`pad_base_note`,
+flex; ARIA/sforzando/Bitwig read flex EGs). **The SFZ text is built by the PURE free fn
+`build_sfz_text(name, stem, entries, global_vel, bpm)`** (no I/O); `export_sfz` only gathers pads,
+runs the dialog, writes the WAVs, then calls it — so the whole opcode-generation path is unit-testable
+(`sfz_export_structural_invariants` checks the invariants the linter can't, e.g. **`loop_end` < sample
+count** — SFZ `loop_end` is the last sample INDEX, so a full-sample loop must clamp to `samples−1` or
+strict players like sforzando disable the region; `dump_sfz_for_lint` is an `#[ignore]` dumper for a
+`sfzlint` pass). Every opcode we emit validates clean against `sfzlint` (v1/v2/aria). Pads **auto-map
+chromatically from a base note** (`pad_base_note`,
 default 48 = C3, a header dropdown); `pad_note(i)` = the individual override (MIDI-learn / a pinned
 key-lock) or `base + i`. Per pad: ⟲ load (captures the current editor
 selection → `load_pad`, WAV write-through to `<data>/pads/pad_NN.wav`), **e** drill-in editor
