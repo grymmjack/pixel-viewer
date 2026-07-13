@@ -810,12 +810,13 @@ pub struct PixelView {
     // waveform while drilled into a pad (transient; reset on Back / navigation)
     env_grid: bool, // draw a BPM beat-division grid in the envelope editor (persisted)
     env_snap: bool, // snap dragged envelope nodes to that grid (persisted)
+    env_target: EnvTarget, // which modulation target the overlay edits (Amp/Pitch/Cutoff/Res; transient)
     sel_undo: Vec<(f32, f32)>, // selection history: previous (start,end)s for undo (transient)
     sel_redo: Vec<(f32, f32)>, // undone selections, for redo (transient)
     sel_undo_pending: Option<(f32, f32)>, // pre-change selection, pushed to sel_undo on commit
     play_from_mark: Option<f32>, // where the last middle-click started playback (neon ▶ marker)
-    zoom_edit_pct: u32, // "Zoom Edit %": magnification of the edge inset (0 = off); persisted
-    wave_amp: f32,  // waveform vertical magnification (1 = normal); persisted
+    zoom_edit_pct: u32,    // "Zoom Edit %": magnification of the edge inset (0 = off); persisted
+    wave_amp: f32,         // waveform vertical magnification (1 = normal); persisted
     // Transient / BPM / musical-grid state (item 10). Marks are detected times (secs), cached for
     // the current buffer and recomputed when the sensitivity or buffer changes.
     transients_on: bool,  // detect + draw transient guideline markers (persisted)
@@ -1844,6 +1845,7 @@ impl PixelView {
             env_edit: false,
             env_grid: get_bool(Self::ENV_GRID_KEY).unwrap_or(false),
             env_snap: get_bool(Self::ENV_SNAP_KEY).unwrap_or(false),
+            env_target: EnvTarget::Amp,
             zoom_edit_pct: cc
                 .storage
                 .and_then(|s| eframe::get_value::<u32>(s, Self::ZOOM_EDIT_KEY))
@@ -3017,10 +3019,24 @@ impl PixelView {
         let pad = &self.pads[i];
         let (ls, le) = pad.loop_region(buf.duration);
         let region = build_pad_region(&buf, ls, le, pad.loop_type);
-        // Bake the per-pad amplitude ADSR (release only shapes a one-shot's tail), then the pan
-        // (which may turn a mono region stereo — carry its channel count to the voice).
+        // Bake the modulation chain: pitch env → amp ADSR → filter (sweep or static) → pan (which
+        // may turn a mono region stereo — carry its channel count to the voice).
         let ch = buf.channels.get() as usize;
         let sr = buf.sample_rate.get() as f32;
+        // 1. Pitch envelope FIRST (variable-rate resample changes the frame count).
+        let region = if pad.pitch_env.on {
+            apply_pitch_env(
+                region,
+                ch,
+                sr,
+                pad.pitch_depth,
+                &pad.pitch_env,
+                !pad.loop_on,
+            )
+        } else {
+            region
+        };
+        // 2. Amplitude ADSR (release only shapes a one-shot's tail).
         let region = if pad.amp_env_on {
             apply_amp_env(
                 region,
@@ -3040,12 +3056,25 @@ impl PixelView {
         } else {
             region
         };
-        // Low-pass filter (static cutoff/resonance) after the amp shaping, before pan.
-        let region = if pad.filter_on {
+        // 3. Low-pass filter: a cutoff/resonance ENVELOPE sweep if either is on, else the static
+        // filter (if enabled).
+        let region = if pad.cutoff_env.on || pad.res_env.on {
+            apply_lowpass_env(
+                region,
+                ch,
+                sr,
+                pad.cutoff_hz,
+                pad.resonance,
+                pad.cutoff_env.on.then_some(&pad.cutoff_env),
+                pad.res_env.on.then_some(&pad.res_env),
+                !pad.loop_on,
+            )
+        } else if pad.filter_on {
             apply_lowpass(region, ch, sr, pad.cutoff_hz, pad.resonance)
         } else {
             region
         };
+        // 4. Pan.
         let (region, eff_ch) = apply_pan(region, ch, pad.pan);
         let channels = std::num::NonZeroU16::new(eff_ch as u16).unwrap_or(buf.channels);
         let (pitch, loop_it) = (pad.pitch, pad.loop_on);
@@ -3100,22 +3129,18 @@ impl PixelView {
         (step > 1e-4).then_some(step)
     }
 
-    /// When the amp envelope is switched on with an all-neutral ADSR, seed a gentle, visibly
-    /// editable starter shape — otherwise the overlay's attack/decay/release handles stack at the
-    /// top-left (a≈0, d≈0, s≈1) and can't be grabbed individually.
+    /// When the CURRENT target's envelope is switched on with an all-neutral ADSR, seed a gentle,
+    /// visibly editable starter shape — otherwise the overlay's handles stack at the top-left
+    /// (a≈0, d≈0, s≈1) and can't be grabbed individually.
     fn seed_pad_env_if_flat(&mut self, i: usize) {
+        let target = self.env_target;
         let Some(p) = self.pads.get_mut(i) else {
             return;
         };
-        let flat = p.amp_attack < 1e-4
-            && p.amp_decay < 1e-4
-            && (p.amp_sustain - 1.0).abs() < 1e-4
-            && p.amp_release < 1e-4;
+        let v = p.env_values(target); // [a, d, s, rel, ca, cd, cr]
+        let flat = v[0] < 1e-4 && v[1] < 1e-4 && (v[2] - 1.0).abs() < 1e-4 && v[3] < 1e-4;
         if flat {
-            p.amp_attack = 0.01;
-            p.amp_decay = 0.10;
-            p.amp_sustain = 0.75;
-            p.amp_release = 0.15;
+            p.set_env_values(target, [0.01, 0.10, 0.75, 0.15, v[4], v[5], v[6]]);
         }
     }
 
@@ -3221,6 +3246,26 @@ impl PixelView {
                 old.cutoff_hz
             },
             resonance: if old.is_empty() { 0.0 } else { old.resonance },
+            pitch_env: if old.is_empty() {
+                Env::seeded()
+            } else {
+                old.pitch_env
+            },
+            pitch_depth: if old.is_empty() {
+                -12.0
+            } else {
+                old.pitch_depth
+            },
+            cutoff_env: if old.is_empty() {
+                Env::seeded()
+            } else {
+                old.cutoff_env
+            },
+            res_env: if old.is_empty() {
+                Env::seeded()
+            } else {
+                old.res_env
+            },
             amp_attack: if old.is_empty() { 0.0 } else { old.amp_attack },
             amp_decay: if old.is_empty() { 0.0 } else { old.amp_decay },
             amp_sustain: if old.is_empty() { 1.0 } else { old.amp_sustain },
@@ -3586,30 +3631,85 @@ impl PixelView {
                         sfz.push_str(&format!("ampeg_release={:.3}\n", pad.amp_release));
                     }
                 } else {
-                    // v2 flex EG on amplitude. Points: 0 (silence) → attack (peak) → decay (sustain,
-                    // held) → release (silence); `egN_shapeX` bows each segment. Curvature −1..1 maps
-                    // to the ARIA shape scale (±8 ≈ a strong curve).
-                    let shp = |c: f32| c.clamp(-1.0, 1.0) * 8.0;
-                    sfz.push_str("eg01_amplitude=100\n");
-                    sfz.push_str("eg01_time1=0\neg01_level1=0\n");
-                    sfz.push_str(&format!(
-                        "eg01_time2={:.3}\neg01_level2=1\neg01_shape2={:.2}\n",
-                        pad.amp_attack,
-                        shp(pad.amp_attack_curve)
-                    ));
-                    sfz.push_str(&format!(
-                        "eg01_time3={:.3}\neg01_level3={:.3}\neg01_shape3={:.2}\n",
-                        pad.amp_decay,
-                        pad.amp_sustain.clamp(0.0, 1.0),
-                        shp(pad.amp_decay_curve)
-                    ));
-                    sfz.push_str("eg01_sustain=3\n"); // hold at point 3 (the sustain level)
-                    sfz.push_str(&format!(
-                        "eg01_time4={:.3}\neg01_level4=0\neg01_shape4={:.2}\n",
-                        pad.amp_release,
-                        shp(pad.amp_release_curve)
-                    ));
+                    // v2 flex EG on amplitude (eg01): `egN_shapeX` bows each segment.
+                    let amp = Env {
+                        on: true,
+                        a: pad.amp_attack,
+                        d: pad.amp_decay,
+                        s: pad.amp_sustain,
+                        rel: pad.amp_release,
+                        ca: pad.amp_attack_curve,
+                        cd: pad.amp_decay_curve,
+                        cr: pad.amp_release_curve,
+                    };
+                    push_flex_eg(&mut sfz, 1, "amplitude", "100", &amp);
                 }
+            }
+            // Pitch envelope → v1 `pitcheg_*` (+ depth in cents) if linear, else a v2 flex EG (eg02).
+            if pad.pitch_env.on && pad.pitch_depth.abs() > 1e-3 {
+                let e = &pad.pitch_env;
+                let cents = (pad.pitch_depth * 100.0).round() as i32;
+                let curved = e.ca.abs() > 1e-3 || e.cd.abs() > 1e-3 || e.cr.abs() > 1e-3;
+                if !curved {
+                    sfz.push_str(&format!("pitcheg_depth={cents}\n"));
+                    if e.a > 1e-4 {
+                        sfz.push_str(&format!("pitcheg_attack={:.3}\n", e.a));
+                    }
+                    if e.d > 1e-4 {
+                        sfz.push_str(&format!("pitcheg_decay={:.3}\n", e.d));
+                    }
+                    if (e.s - 1.0).abs() > 1e-4 {
+                        sfz.push_str(&format!(
+                            "pitcheg_sustain={:.1}\n",
+                            e.s.clamp(0.0, 1.0) * 100.0
+                        ));
+                    }
+                    if e.rel > 1e-4 {
+                        sfz.push_str(&format!("pitcheg_release={:.3}\n", e.rel));
+                    }
+                } else {
+                    push_flex_eg(&mut sfz, 2, "pitch", &cents.to_string(), e);
+                }
+            }
+            // Cutoff envelope → a low-pass (base 30 Hz) swept up to cutoff_hz. v1 `fileg_*` (depth in
+            // cents) if linear, else a v2 flex EG (eg03).
+            if pad.cutoff_env.on {
+                let e = &pad.cutoff_env;
+                let base = 30.0f32;
+                let depth_cents =
+                    (1200.0 * (pad.cutoff_hz.max(base + 1.0) / base).log2()).round() as i32;
+                sfz.push_str(&format!("fil_type=lpf_2p\ncutoff={base:.0}\n"));
+                if pad.resonance > 1e-3 {
+                    sfz.push_str(&format!("resonance={:.2}\n", pad.resonance * 24.0));
+                }
+                let curved = e.ca.abs() > 1e-3 || e.cd.abs() > 1e-3 || e.cr.abs() > 1e-3;
+                if !curved {
+                    sfz.push_str(&format!("fileg_depth={depth_cents}\n"));
+                    if e.a > 1e-4 {
+                        sfz.push_str(&format!("fileg_attack={:.3}\n", e.a));
+                    }
+                    if e.d > 1e-4 {
+                        sfz.push_str(&format!("fileg_decay={:.3}\n", e.d));
+                    }
+                    if (e.s - 1.0).abs() > 1e-4 {
+                        sfz.push_str(&format!(
+                            "fileg_sustain={:.1}\n",
+                            e.s.clamp(0.0, 1.0) * 100.0
+                        ));
+                    }
+                    if e.rel > 1e-4 {
+                        sfz.push_str(&format!("fileg_release={:.3}\n", e.rel));
+                    }
+                } else {
+                    push_flex_eg(&mut sfz, 3, "cutoff", &depth_cents.to_string(), e);
+                }
+            }
+            // Resonance envelope → a v2 flex EG (eg04; SFZ v1 has no resonance envelope).
+            if pad.res_env.on {
+                if !pad.cutoff_env.on {
+                    sfz.push_str("fil_type=lpf_2p\n");
+                }
+                push_flex_eg(&mut sfz, 4, "resonance", "12", &pad.res_env);
             }
             // Low-pass filter → native SFZ `cutoff` / `resonance` (dB) / `fil_type`. resonance 0..1
             // maps to ~0..24 dB (matching the biquad's Q = 0.707·2^(4·res)).
@@ -4707,10 +4807,10 @@ impl PixelView {
         let mut want_select: Option<(f32, f32)> = None;
         let mut want_commit = false;
         let mut want_seek: Option<f32> = None;
-        // Amp-envelope overlay edit → deferred (pad, [attack, decay, sustain, release, attack_curve,
-        // decay_curve, release_curve]), applied after the `ap` borrow ends (the handles are drawn
-        // while the player is borrowed immutably).
-        let mut want_env: Option<(usize, [f32; 7])> = None;
+        // Envelope overlay edit → deferred (pad, target, [a, d, s, rel, curve_a, curve_d, curve_r]),
+        // applied after the `ap` borrow ends (the handles are drawn while the player is borrowed
+        // immutably).
+        let mut want_env: Option<(usize, EnvTarget, [f32; 7])> = None;
         let mut want_play_at: Option<f32> = None; // middle-click the waveform → play from here
         let mut want_play_region = false; // play the current selection now (middle-click transient slice)
         let mut want_sel_undo = false; // restore the previous selection from the undo stack
@@ -4897,107 +4997,146 @@ impl PixelView {
                                 }
                             });
                         ui.separator();
-                        // Amp envelope: [x] enable + an (AMP ENVELOPE) button that toggles the
-                        // on-waveform ADSR editor overlay. Off ⇒ raw sample (no ampeg_* in SFZ).
-                        let mut env_on = self.pads[i].amp_env_on;
-                        if ui
-                            .checkbox(&mut env_on, "")
-                            .on_hover_text(
-                                "Enable the amplitude envelope. Off = the sample plays raw (and \
-                                 no ampeg_* is written to the SFZ export).",
-                            )
-                            .changed()
-                        {
-                            self.pads[i].amp_env_on = env_on;
-                            if env_on {
-                                self.seed_pad_env_if_flat(i); // give the overlay a grabbable shape
+                        // Envelope target selector — the on-waveform editor shapes whichever target
+                        // is selected (Amp / Pitch / Cutoff / Res). Each carries its own ADSR+curves.
+                        ui.weak("Env:");
+                        for t in EnvTarget::ALL {
+                            let on = self.pads[i].env_on(t);
+                            let sel = self.env_edit && self.env_target == t;
+                            let txt = egui::RichText::new(t.label()).strong().color(if on || sel {
+                                t.color()
                             } else {
-                                self.env_edit = false; // disabling also closes the overlay
-                            }
-                        }
-                        let editing = self.env_edit;
-                        if ui
-                            .add(
-                                egui::Button::new(egui::RichText::new("AMP ENVELOPE").strong())
-                                    .selected(editing),
-                            )
-                            .on_hover_text(
-                                "Edit the ADSR curve directly on the waveform — drag the handles \
-                                 (attack · decay/sustain · release). Click to toggle the overlay.",
-                            )
-                            .clicked()
-                        {
-                            self.env_edit = !self.env_edit;
-                            if self.env_edit {
-                                self.pads[i].amp_env_on = true; // editing implies enabled
+                                egui::Color32::from_gray(140)
+                            });
+                            if ui
+                                .add(egui::Button::new(txt).selected(sel))
+                                .on_hover_text(format!(
+                                    "Shape the {} envelope on the waveform{}",
+                                    t.label(),
+                                    if on { " (enabled)" } else { "" }
+                                ))
+                                .clicked()
+                            {
+                                self.env_target = t;
+                                self.env_edit = true;
+                                self.pads[i].set_env_on(t, true);
                                 self.seed_pad_env_if_flat(i);
                             }
                         }
-                        // Numeric fine-tune (shown while the envelope is enabled).
-                        if self.pads[i].amp_env_on {
-                            ui.weak("A");
-                            ui.add(
-                                egui::DragValue::new(&mut self.pads[i].amp_attack)
-                                    .range(0.0..=4.0)
-                                    .speed(0.005)
-                                    .suffix(" s")
-                                    .max_decimals(3),
-                            );
-                            ui.weak("D");
-                            ui.add(
-                                egui::DragValue::new(&mut self.pads[i].amp_decay)
-                                    .range(0.0..=4.0)
-                                    .speed(0.005)
-                                    .suffix(" s")
-                                    .max_decimals(3),
-                            );
-                            ui.weak("S");
-                            ui.add(
-                                egui::DragValue::new(&mut self.pads[i].amp_sustain)
-                                    .range(0.0..=1.0)
-                                    .speed(0.01)
-                                    .max_decimals(2),
-                            );
-                            ui.weak("R");
-                            ui.add(
-                                egui::DragValue::new(&mut self.pads[i].amp_release)
-                                    .range(0.0..=4.0)
-                                    .speed(0.005)
-                                    .suffix(" s")
-                                    .max_decimals(3),
-                            );
-                            // BPM grid + node snapping for the on-waveform editor (while it's open).
-                            // BPM + division are shared with the waveform's Musical grid.
-                            if self.env_edit {
-                                ui.separator();
-                                ui.checkbox(&mut self.env_grid, "Grid").on_hover_text(
-                                    "Draw a BPM beat-division grid in the envelope editor",
-                                );
-                                ui.checkbox(&mut self.env_snap, "Snap").on_hover_text(
-                                    "Snap dragged envelope nodes to the grid (attack/decay/release \
-                                     land on a beat)",
-                                );
-                                ui.weak("BPM");
-                                ui.add(
-                                    egui::DragValue::new(&mut self.bpm)
-                                        .range(20.0..=300.0)
-                                        .speed(0.5)
-                                        .max_decimals(1),
-                                );
-                                const DIVS: [&str; 6] =
-                                    ["whole", "half", "quarter", "eighth", "sixteenth", "32nd"];
-                                egui::ComboBox::from_id_salt("env_grid_div")
-                                    .selected_text(DIVS[self.musical_div.min(5) as usize])
-                                    .show_ui(ui, |ui| {
-                                        for (di, name) in DIVS.iter().enumerate() {
-                                            ui.selectable_value(
-                                                &mut self.musical_div,
-                                                di as u8,
-                                                *name,
-                                            );
-                                        }
-                                    });
+                        if self.env_edit
+                            && ui
+                                .button("✕")
+                                .on_hover_text("Close the envelope editor")
+                                .clicked()
+                        {
+                            self.env_edit = false;
+                        }
+                        // Controls for the SELECTED target (while the editor is open).
+                        if self.env_edit {
+                            let t = self.env_target;
+                            let mut on = self.pads[i].env_on(t);
+                            if ui
+                                .checkbox(&mut on, "On")
+                                .on_hover_text("Enable this envelope (off = target unmodulated)")
+                                .changed()
+                            {
+                                self.pads[i].set_env_on(t, on);
                             }
+                            // ADSR numeric fine-tune for the selected target.
+                            let mut v = self.pads[i].env_values(t);
+                            let mut ch = false;
+                            ui.weak("A");
+                            ch |= ui
+                                .add(
+                                    egui::DragValue::new(&mut v[0])
+                                        .range(0.0..=4.0)
+                                        .speed(0.005)
+                                        .suffix(" s")
+                                        .max_decimals(3),
+                                )
+                                .changed();
+                            ui.weak("D");
+                            ch |= ui
+                                .add(
+                                    egui::DragValue::new(&mut v[1])
+                                        .range(0.0..=4.0)
+                                        .speed(0.005)
+                                        .suffix(" s")
+                                        .max_decimals(3),
+                                )
+                                .changed();
+                            ui.weak("S");
+                            ch |= ui
+                                .add(
+                                    egui::DragValue::new(&mut v[2])
+                                        .range(0.0..=1.0)
+                                        .speed(0.01)
+                                        .max_decimals(2),
+                                )
+                                .changed();
+                            ui.weak("R");
+                            ch |= ui
+                                .add(
+                                    egui::DragValue::new(&mut v[3])
+                                        .range(0.0..=4.0)
+                                        .speed(0.005)
+                                        .suffix(" s")
+                                        .max_decimals(3),
+                                )
+                                .changed();
+                            if ch {
+                                self.pads[i].set_env_values(t, v);
+                            }
+                            // Target-specific depth / range.
+                            match t {
+                                EnvTarget::Pitch => {
+                                    ui.weak("Depth");
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.pads[i].pitch_depth)
+                                            .range(-48.0..=48.0)
+                                            .speed(0.2)
+                                            .suffix(" st")
+                                            .max_decimals(1),
+                                    )
+                                    .on_hover_text(
+                                        "Pitch swing at full envelope (semitones; negative = drop)",
+                                    );
+                                }
+                                EnvTarget::Cutoff => {
+                                    ui.weak("Top");
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.pads[i].cutoff_hz)
+                                            .range(20.0..=20000.0)
+                                            .speed(50.0)
+                                            .suffix(" Hz")
+                                            .max_decimals(0),
+                                    )
+                                    .on_hover_text("The sweep peaks at this cutoff (30 Hz → here)");
+                                }
+                                _ => {}
+                            }
+                            // BPM grid + snap (shared with the waveform's Musical grid).
+                            ui.separator();
+                            ui.checkbox(&mut self.env_grid, "Grid")
+                                .on_hover_text("Draw a BPM beat-division grid in the editor");
+                            ui.checkbox(&mut self.env_snap, "Snap")
+                                .on_hover_text("Snap dragged nodes to the grid");
+                            ui.weak("BPM");
+                            ui.add(
+                                egui::DragValue::new(&mut self.bpm)
+                                    .range(20.0..=300.0)
+                                    .speed(0.5)
+                                    .max_decimals(1),
+                            );
+                            const DIVS: [&str; 6] =
+                                ["whole", "half", "quarter", "eighth", "sixteenth", "32nd"];
+                            egui::ComboBox::from_id_salt("env_grid_div")
+                                .selected_text(DIVS[self.musical_div.min(5) as usize])
+                                .show_ui(ui, |ui| {
+                                    for (di, name) in DIVS.iter().enumerate() {
+                                        ui.selectable_value(&mut self.musical_div, di as u8, *name);
+                                    }
+                                });
                         }
                     });
                     // Low-pass filter (static cutoff/resonance; baked + exported as SFZ
@@ -5603,15 +5742,12 @@ impl PixelView {
                         Some(step) => (t / step).round() * step,
                         None => t,
                     };
-                    // Read the pad's ADSR + per-segment curves (immutable — the player is borrowed);
+                    // Read the SELECTED target's ADSR + curves (immutable — the player is borrowed);
                     // edits are deferred into `want_env` and applied after this block.
-                    let mut a = self.pads[pi].amp_attack;
-                    let mut d = self.pads[pi].amp_decay;
-                    let mut s = self.pads[pi].amp_sustain;
-                    let mut rel = self.pads[pi].amp_release;
-                    let mut ca = self.pads[pi].amp_attack_curve;
-                    let mut cd = self.pads[pi].amp_decay_curve;
-                    let mut cr = self.pads[pi].amp_release_curve;
+                    let target = self.env_target;
+                    let vals = self.pads[pi].env_values(target);
+                    let (mut a, mut d, mut s, mut rel) = (vals[0], vals[1], vals[2], vals[3]);
+                    let (mut ca, mut cd, mut cr) = (vals[4], vals[5], vals[6]);
                     let orig = (a, d, s, rel, ca, cd, cr);
                     let pad_y = 6.0;
                     let span_y = (rect.height() - 2.0 * pad_y).max(1.0);
@@ -5624,8 +5760,8 @@ impl PixelView {
                     let pa = egui::pos2(x_of(t_a), y_of(1.0));
                     let pd = egui::pos2(x_of(t_d), y_of(s));
                     let pr = egui::pos2(x_of(t_r), y_of(s));
-                    let env_col = egui::Color32::from_rgb(255, 210, 90);
-                    let curve_col = egui::Color32::from_rgb(255, 170, 70);
+                    let env_col = target.color();
+                    let curve_col = env_col.gamma_multiply(0.8);
                     // CURVED contour: each ramp sampled through `curve_shape`, the sustain flat.
                     const NS: usize = 28;
                     let mut contour: Vec<egui::Pos2> = Vec::with_capacity(NS * 3 + 3);
@@ -5739,19 +5875,20 @@ impl PixelView {
                             cr = (cr - dy * CSENS).clamp(-1.0, 1.0);
                         }
                     }
-                    // Compact label so it's clear you're in envelope-edit mode.
+                    // Compact label so it's clear which envelope you're shaping.
                     p.text(
                         egui::pos2(rect.left() + 4.0, rect.top() + 2.0),
                         egui::Align2::LEFT_TOP,
                         format!(
-                            "AMP ENV  A {a:.2}  D {d:.2}  S {:.0}%  R {rel:.2}",
+                            "{} ENV  A {a:.2}  D {d:.2}  S {:.0}%  R {rel:.2}",
+                            target.label(),
                             s * 100.0
                         ),
                         egui::FontId::proportional(11.0),
                         env_col,
                     );
                     if (a, d, s, rel, ca, cd, cr) != orig {
-                        want_env = Some((pi, [a, d, s, rel, ca, cd, cr]));
+                        want_env = Some((pi, target, [a, d, s, rel, ca, cd, cr]));
                     }
                 }
             }
@@ -6140,17 +6277,9 @@ impl PixelView {
         if let Some(b) = want_autoplay {
             self.audio_autoplay = b;
         }
-        if let Some((pi, e)) = want_env {
+        if let Some((pi, target, e)) = want_env {
             if pi < self.pads.len() {
-                let p = &mut self.pads[pi];
-                p.amp_attack = e[0];
-                p.amp_decay = e[1];
-                p.amp_sustain = e[2];
-                p.amp_release = e[3];
-                p.amp_attack_curve = e[4];
-                p.amp_decay_curve = e[5];
-                p.amp_release_curve = e[6];
-                p.amp_env_on = true;
+                self.pads[pi].set_env_values(target, e); // also marks that target enabled
             }
         }
         if let Some((lo, hi)) = want_select {
@@ -20123,11 +20252,172 @@ struct Pad {
     filter_on: bool,
     cutoff_hz: f32,
     resonance: f32,
+    // Modulation envelopes shaped in the same editor as amp (via the target selector). Pitch
+    // sweeps ±`pitch_depth` semitones (variable-rate resample); cutoff sweeps 30 Hz…`cutoff_hz`
+    // (log); resonance sweeps 0…1. Each `Env.on` gates its target.
+    pitch_env: Env,
+    pitch_depth: f32,
+    cutoff_env: Env,
+    res_env: Env,
     color: Option<[u8; 3]>, // optional tile color tag (right-click → colorize)
     source: Option<String>, // original sample path (for the sample-list hover); "" if unknown
     note_lock: bool, // key-lock: keep this pad firing on the same note when it's dragged to a new
     // slot (its override is pinned to the absolute note); off ⇒ note follows slot
     flash_t: f32, // ctx time of the last trigger (green flash); transient
+}
+
+/// A reusable **ADSR + per-segment curvature** envelope (0..1 output), shaped by the on-waveform
+/// editor for any modulation target. `on` gates it; the curves are `curve_shape` bows.
+#[derive(Clone, Copy)]
+struct Env {
+    on: bool,
+    a: f32,
+    d: f32,
+    s: f32,
+    rel: f32,
+    ca: f32,
+    cd: f32,
+    cr: f32,
+}
+
+impl Env {
+    /// A gentle default shape (used when a target is first enabled so the overlay handles aren't
+    /// stacked). Off by default.
+    fn seeded() -> Self {
+        Env {
+            on: false,
+            a: 0.0,
+            d: 0.10,
+            s: 0.75,
+            rel: 0.15,
+            ca: 0.0,
+            cd: 0.0,
+            cr: 0.0,
+        }
+    }
+    /// Serialize to one record field (`on;a;d;s;rel;ca;cd;cr`) so a Pad record stays flat.
+    fn to_field(self) -> String {
+        format!(
+            "{};{};{};{};{};{};{};{}",
+            if self.on { 1 } else { 0 },
+            self.a,
+            self.d,
+            self.s,
+            self.rel,
+            self.ca,
+            self.cd,
+            self.cr
+        )
+    }
+    fn from_field(s: &str) -> Self {
+        let p: Vec<&str> = s.split(';').collect();
+        let g = |i: usize, dflt: f32| p.get(i).and_then(|x| x.parse().ok()).unwrap_or(dflt);
+        let base = Self::seeded();
+        Env {
+            on: p.first() == Some(&"1"),
+            a: g(1, base.a),
+            d: g(2, base.d),
+            s: g(3, base.s),
+            rel: g(4, base.rel),
+            ca: g(5, 0.0),
+            cd: g(6, 0.0),
+            cr: g(7, 0.0),
+        }
+    }
+    fn values(&self) -> [f32; 7] {
+        [self.a, self.d, self.s, self.rel, self.ca, self.cd, self.cr]
+    }
+    fn set_values(&mut self, v: [f32; 7]) {
+        self.a = v[0];
+        self.d = v[1];
+        self.s = v[2];
+        self.rel = v[3];
+        self.ca = v[4];
+        self.cd = v[5];
+        self.cr = v[6];
+    }
+}
+
+/// Which modulation target the on-waveform envelope editor is shaping.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnvTarget {
+    Amp,
+    Pitch,
+    Cutoff,
+    Res,
+}
+
+impl EnvTarget {
+    const ALL: [EnvTarget; 4] = [
+        EnvTarget::Amp,
+        EnvTarget::Pitch,
+        EnvTarget::Cutoff,
+        EnvTarget::Res,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            EnvTarget::Amp => "AMP",
+            EnvTarget::Pitch => "PITCH",
+            EnvTarget::Cutoff => "CUTOFF",
+            EnvTarget::Res => "RES",
+        }
+    }
+    /// The overlay contour/handle color for this target.
+    fn color(self) -> egui::Color32 {
+        match self {
+            EnvTarget::Amp => egui::Color32::from_rgb(255, 210, 90),
+            EnvTarget::Pitch => egui::Color32::from_rgb(120, 220, 255),
+            EnvTarget::Cutoff => egui::Color32::from_rgb(230, 130, 255),
+            EnvTarget::Res => egui::Color32::from_rgb(140, 255, 170),
+        }
+    }
+}
+
+/// Evaluate an ADSR+curve `Env` at time `t` seconds (over `dur`), returning 0..1. Mirrors the
+/// per-frame shape `apply_amp_env` bakes; used by the pitch / cutoff / resonance modulation bakers.
+fn eval_env(e: &Env, t: f32, dur: f32, one_shot: bool) -> f32 {
+    let (a, d) = (e.a.max(0.0), e.d.max(0.0));
+    let s = e.s.clamp(0.0, 1.0);
+    let r = if one_shot { e.rel.max(0.0) } else { 0.0 };
+    let rel_start = (dur - r).max(0.0);
+    let ad = if t < a {
+        curve_shape((t / a.max(1e-6)).clamp(0.0, 1.0), e.ca)
+    } else if t < a + d {
+        1.0 + (s - 1.0) * curve_shape(((t - a) / d.max(1e-6)).clamp(0.0, 1.0), e.cd)
+    } else {
+        s
+    };
+    if r > 1e-6 && t >= rel_start {
+        ad * (1.0 - curve_shape(((t - rel_start) / r.max(1e-6)).clamp(0.0, 1.0), e.cr))
+    } else {
+        ad
+    }
+}
+
+/// Emit an SFZ **v2 flex EG** (`egN_*`) driving `target` (e.g. `amplitude`/`pitch`/`cutoff`/
+/// `resonance`) by `depth`, with the `Env`'s ADSR + per-segment `shape` curvature. Points:
+/// 0 (no mod) → attack (full) → decay (sustain, held) → release (no mod).
+fn push_flex_eg(sfz: &mut String, idx: u32, target: &str, depth: &str, e: &Env) {
+    let shp = |c: f32| format!("{:.2}", c.clamp(-1.0, 1.0) * 8.0);
+    sfz.push_str(&format!("eg{idx:02}_{target}={depth}\n"));
+    sfz.push_str(&format!("eg{idx:02}_time1=0\neg{idx:02}_level1=0\n"));
+    sfz.push_str(&format!(
+        "eg{idx:02}_time2={:.3}\neg{idx:02}_level2=1\neg{idx:02}_shape2={}\n",
+        e.a,
+        shp(e.ca)
+    ));
+    sfz.push_str(&format!(
+        "eg{idx:02}_time3={:.3}\neg{idx:02}_level3={:.3}\neg{idx:02}_shape3={}\n",
+        e.d,
+        e.s.clamp(0.0, 1.0),
+        shp(e.cd)
+    ));
+    sfz.push_str(&format!("eg{idx:02}_sustain=3\n"));
+    sfz.push_str(&format!(
+        "eg{idx:02}_time4={:.3}\neg{idx:02}_level4=0\neg{idx:02}_shape4={}\n",
+        e.rel,
+        shp(e.cr)
+    ));
 }
 
 /// Human-readable names for `Pad::loop_type` (indexed by the stored value).
@@ -20216,6 +20506,10 @@ impl Pad {
             filter_on: false,
             cutoff_hz: 20000.0,
             resonance: 0.0,
+            pitch_env: Env::seeded(),
+            pitch_depth: -12.0,
+            cutoff_env: Env::seeded(),
+            res_env: Env::seeded(),
             color: None,
             source: None,
             note_lock: false,
@@ -20275,7 +20569,73 @@ impl Pad {
             if self.filter_on { "1" } else { "0" }.to_string(),
             format!("{}", self.cutoff_hz),
             format!("{}", self.resonance),
+            // Indices 28..=31: modulation envelopes (each one flat field) + pitch depth.
+            self.pitch_env.to_field(),
+            format!("{}", self.pitch_depth),
+            self.cutoff_env.to_field(),
+            self.res_env.to_field(),
         ]
+    }
+
+    /// The 7 editable envelope values (a,d,s,rel + 3 curves) for a modulation `target`.
+    fn env_values(&self, target: EnvTarget) -> [f32; 7] {
+        match target {
+            EnvTarget::Amp => [
+                self.amp_attack,
+                self.amp_decay,
+                self.amp_sustain,
+                self.amp_release,
+                self.amp_attack_curve,
+                self.amp_decay_curve,
+                self.amp_release_curve,
+            ],
+            EnvTarget::Pitch => self.pitch_env.values(),
+            EnvTarget::Cutoff => self.cutoff_env.values(),
+            EnvTarget::Res => self.res_env.values(),
+        }
+    }
+    /// Write the 7 envelope values back for `target` and mark that target's envelope enabled.
+    fn set_env_values(&mut self, target: EnvTarget, v: [f32; 7]) {
+        match target {
+            EnvTarget::Amp => {
+                self.amp_attack = v[0];
+                self.amp_decay = v[1];
+                self.amp_sustain = v[2];
+                self.amp_release = v[3];
+                self.amp_attack_curve = v[4];
+                self.amp_decay_curve = v[5];
+                self.amp_release_curve = v[6];
+                self.amp_env_on = true;
+            }
+            EnvTarget::Pitch => {
+                self.pitch_env.set_values(v);
+                self.pitch_env.on = true;
+            }
+            EnvTarget::Cutoff => {
+                self.cutoff_env.set_values(v);
+                self.cutoff_env.on = true;
+            }
+            EnvTarget::Res => {
+                self.res_env.set_values(v);
+                self.res_env.on = true;
+            }
+        }
+    }
+    fn env_on(&self, target: EnvTarget) -> bool {
+        match target {
+            EnvTarget::Amp => self.amp_env_on,
+            EnvTarget::Pitch => self.pitch_env.on,
+            EnvTarget::Cutoff => self.cutoff_env.on,
+            EnvTarget::Res => self.res_env.on,
+        }
+    }
+    fn set_env_on(&mut self, target: EnvTarget, on: bool) {
+        match target {
+            EnvTarget::Amp => self.amp_env_on = on,
+            EnvTarget::Pitch => self.pitch_env.on = on,
+            EnvTarget::Cutoff => self.cutoff_env.on = on,
+            EnvTarget::Res => self.res_env.on = on,
+        }
     }
 
     /// Rebuild a pad's metadata from a record row (`buf` stays `None`; the caller reloads the
@@ -20330,6 +20690,10 @@ impl Pad {
             filter_on: g(25) == "1",
             cutoff_hz: g(26).parse().unwrap_or(20000.0),
             resonance: g(27).parse().unwrap_or(0.0),
+            pitch_env: Env::from_field(&g(28)),
+            pitch_depth: g(29).parse().unwrap_or(-12.0),
+            cutoff_env: Env::from_field(&g(30)),
+            res_env: Env::from_field(&g(31)),
             flash_t: -1.0,
         };
         (pad, has_audio)
@@ -20669,6 +21033,93 @@ fn apply_lowpass(
         }
     }
     region
+}
+
+/// Apply a low-pass whose cutoff and/or resonance are **modulated by an envelope** over time
+/// (a filter sweep). `cutoff_env` sweeps the cutoff 30 Hz…`cutoff_max` (log); `res_env` sweeps the
+/// resonance 0…1; a `None` env holds that parameter static. Coeffs recompute only when a value
+/// moves enough (cheap). Time reference = source seconds, `one_shot` gates the release.
+#[allow(clippy::too_many_arguments)]
+fn apply_lowpass_env(
+    mut region: Vec<f32>,
+    ch: usize,
+    sr: f32,
+    cutoff_max: f32,
+    res_static: f32,
+    cutoff_env: Option<&Env>,
+    res_env: Option<&Env>,
+    one_shot: bool,
+) -> Vec<f32> {
+    if ch == 0 || ch > 2 || (cutoff_env.is_none() && res_env.is_none()) {
+        return region;
+    }
+    let frames = region.len() / ch;
+    let dur = frames as f32 / sr;
+    let cutoff_min = 30.0f32;
+    let ratio = (cutoff_max.max(cutoff_min + 1.0) / cutoff_min).max(1.0);
+    let mut bq = Biquad::new();
+    let (mut last_c, mut last_r) = (-1.0f32, -1.0f32);
+    for f in 0..frames {
+        let t = f as f32 / sr;
+        let cutoff = match cutoff_env {
+            Some(e) => cutoff_min * ratio.powf(eval_env(e, t, dur, one_shot).clamp(0.0, 1.0)),
+            None => cutoff_max,
+        };
+        let res = match res_env {
+            Some(e) => eval_env(e, t, dur, one_shot).clamp(0.0, 1.0),
+            None => res_static,
+        };
+        // Recompute coefficients only when the cutoff moved >1% or resonance >0.01.
+        if (cutoff - last_c).abs() > last_c.abs() * 0.01 + 0.5 || (res - last_r).abs() > 0.01 {
+            bq.set_lowpass(cutoff, res, sr);
+            last_c = cutoff;
+            last_r = res;
+        }
+        for c in 0..ch {
+            let i = f * ch + c;
+            region[i] = bq.process(c, region[i]);
+        }
+    }
+    region
+}
+
+/// Bake a **pitch envelope** into an interleaved region by variable-rate resampling: at each output
+/// frame the read rate is `2^(depth·env(t)/12)` (semitones), so the pitch glides with the envelope
+/// (e.g. a fast decay to 0 = an 808 "drop"). Linear interpolation; output length varies with the
+/// average rate (capped so an extreme down-sweep can't balloon memory). `depth` is signed semitones.
+fn apply_pitch_env(
+    region: Vec<f32>,
+    ch: usize,
+    sr: f32,
+    depth: f32,
+    env: &Env,
+    one_shot: bool,
+) -> Vec<f32> {
+    if ch == 0 || depth.abs() < 1e-3 {
+        return region;
+    }
+    let frames = region.len() / ch;
+    if frames < 2 {
+        return region;
+    }
+    let dur = frames as f32 / sr;
+    let cap = region.len().saturating_mul(8); // guard a slow down-sweep from ballooning
+    let mut out: Vec<f32> = Vec::with_capacity(region.len());
+    let mut pos = 0.0f32; // fractional source frame
+    while pos < (frames - 1) as f32 && out.len() < cap {
+        let t = pos / sr;
+        let ev = eval_env(env, t, dur, one_shot);
+        let rate = 2.0f32.powf(depth * ev / 12.0).clamp(0.03125, 32.0);
+        let i0 = pos.floor() as usize;
+        let frac = pos - i0 as f32;
+        for c in 0..ch {
+            let a = region[i0 * ch + c];
+            let b = region[(i0 + 1) * ch + c];
+            out.push(a + (b - a) * frac);
+        }
+        pos += rate;
+    }
+    out
 }
 
 /// Bake a constant-power **stereo pan** into an interleaved region. `pan` is −1 (hard left) …
@@ -23791,6 +24242,68 @@ mod tests {
                                    // An open filter (cutoff ≥ Nyquist) is a no-op.
         let t = tone(5000.0);
         assert_eq!(apply_lowpass(t.clone(), 1, sr, 30000.0, 0.0), t);
+    }
+
+    #[test]
+    fn env_field_roundtrip_and_eval() {
+        let e = Env {
+            on: true,
+            a: 0.02,
+            d: 0.3,
+            s: 0.4,
+            rel: 0.25,
+            ca: 0.6,
+            cd: -0.5,
+            cr: 0.1,
+        };
+        let r = Env::from_field(&e.to_field());
+        assert!(r.on);
+        assert!((r.a - 0.02).abs() < 1e-6 && (r.d - 0.3).abs() < 1e-6);
+        assert!((r.s - 0.4).abs() < 1e-6 && (r.rel - 0.25).abs() < 1e-6);
+        assert!((r.ca - 0.6).abs() < 1e-6 && (r.cd + 0.5).abs() < 1e-6);
+        // A missing/short field degrades to the seeded default (off).
+        assert!(!Env::from_field("").on);
+        // eval_env: attack start ≈ 0, sustain body = s, one-shot tail → ~0 at the end.
+        let lin = Env {
+            on: true,
+            a: 0.1,
+            d: 0.0,
+            s: 0.5,
+            rel: 0.1,
+            ca: 0.0,
+            cd: 0.0,
+            cr: 0.0,
+        };
+        assert!(eval_env(&lin, 0.0, 1.0, true) < 1e-3);
+        assert!((eval_env(&lin, 0.5, 1.0, true) - 0.5).abs() < 1e-3); // sustain body
+        assert!(eval_env(&lin, 0.99, 1.0, true) < 0.15); // release tail
+    }
+
+    #[test]
+    fn pitch_env_resamples_length() {
+        let sr = 1000.0;
+        let mono = vec![0.5f32; 1000]; // 1.0 s
+                                       // A sustained downward pitch (−12 st, sustain=1) reads the source slower → LONGER output.
+        let down = Env {
+            on: true,
+            a: 0.0,
+            d: 0.0,
+            s: 1.0,
+            rel: 0.0,
+            ca: 0.0,
+            cd: 0.0,
+            cr: 0.0,
+        };
+        let out = apply_pitch_env(mono.clone(), 1, sr, -12.0, &down, false);
+        assert!(out.len() > mono.len()); // slower playback → more output frames
+                                         // An upward pitch reads faster → SHORTER output.
+        let up = apply_pitch_env(mono.clone(), 1, sr, 12.0, &down, false);
+        assert!(up.len() < mono.len());
+        // Zero depth is a no-op.
+        assert_eq!(
+            apply_pitch_env(mono.clone(), 1, sr, 0.0, &down, false),
+            mono
+        );
     }
 
     #[test]

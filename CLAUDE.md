@@ -1039,12 +1039,24 @@ seeds a gentle starter shape (`seed_pad_env_if_flat`) so the handles aren't stac
 transient (reset on `focus_back` / navigation). A **live pad-voice playhead** (`pad_voice_pos`) sweeps
 across while the pad sounds. **BPM grid + snap** (`env_grid`/`env_snap`, persisted; share `self.bpm`
 + `musical_div` with the waveform's Musical grid via `env_grid_step`): draw beat-division lines in the
-overlay and optionally snap each node's absolute time to the nearest beat. **Curve export is hybrid**
-— a linear envelope stays **v1 `ampeg_*`** (universal); a curved one is written as an **SFZ v2 flex EG**
-(`eg01_amplitude=100` + `eg01_timeN`/`levelN`/`shapeN`, `sustain=3`) where `egN_shapeX` carries the
-curvature (`c·8`; ARIA/sforzando/Bitwig read it — exact curve rendering is player-dependent). Flex EGs
-can target far more than amplitude (`egN_pitch`/`cutoff`/`pan`/`eqNgain`…), so this editor is reusable
-for a future pitch/filter env. Pads **auto-map chromatically from a base note** (`pad_base_note`,
+overlay and optionally snap each node's absolute time to the nearest beat.
+
+**Multi-target envelopes (`EnvTarget` = Amp/Pitch/Cutoff/Res, `env_target`).** The SAME overlay shapes
+any of four modulation targets, picked by the `Env:` button row in the drill-in editor (each button
+tinted its target color, `EnvTarget::color`). A reusable **`Env`** struct `{on,a,d,s,rel,ca,cd,cr}`
+serializes to ONE record field (`to_field`/`from_field`, `;`-joined) so the Pad record stays flat
+(indices 28–31: `pitch_env`, `pitch_depth`, `cutoff_env`, `res_env`; amp keeps its legacy flat fields).
+The overlay reads/writes the selected target generically via `Pad::env_values`/`set_env_values`/
+`env_on`/`set_env_on`; `want_env` carries `(pad, EnvTarget, [f32;7])`. **`eval_env(env,t,dur,one_shot)`**
+(0..1, mirrors `apply_amp_env`'s shape) drives the non-amp bakers. **Filter**: a `Biquad` low-pass
+(`filter_on`/`cutoff_hz`/`resonance`, records 25–27); `apply_lowpass` (static) or `apply_lowpass_env`
+(cutoff swept 30 Hz…`cutoff_hz` log and/or resonance 0…1, coeffs recomputed only when they move).
+**Pitch env**: `apply_pitch_env` variable-rate resamples (`2^(depth·env/12)`; changes length, capped) —
+baked FIRST since it changes the frame count. Trigger order: **pitch → amp → filter → pan**. **Export
+is hybrid per target**: linear amp→`ampeg_*`, pitch→`pitcheg_*`+`pitcheg_depth`(cents),
+cutoff→`fil_type`+`cutoff`+`fileg_*`+`fileg_depth`; a **curved** one uses a v2 flex EG via `push_flex_eg`
+(eg01 amp / eg02 pitch / eg03 cutoff / eg04 resonance — SFZ v1 has no res EG, so resonance is always
+flex; ARIA/sforzando/Bitwig read flex EGs). Pads **auto-map chromatically from a base note** (`pad_base_note`,
 default 48 = C3, a header dropdown); `pad_note(i)` = the individual override (MIDI-learn / a pinned
 key-lock) or `base + i`. Per pad: ⟲ load (captures the current editor
 selection → `load_pad`, WAV write-through to `<data>/pads/pad_NN.wav`), **e** drill-in editor
