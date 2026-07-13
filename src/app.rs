@@ -3040,6 +3040,12 @@ impl PixelView {
         } else {
             region
         };
+        // Low-pass filter (static cutoff/resonance) after the amp shaping, before pan.
+        let region = if pad.filter_on {
+            apply_lowpass(region, ch, sr, pad.cutoff_hz, pad.resonance)
+        } else {
+            region
+        };
         let (region, eff_ch) = apply_pan(region, ch, pad.pan);
         let channels = std::num::NonZeroU16::new(eff_ch as u16).unwrap_or(buf.channels);
         let (pitch, loop_it) = (pad.pitch, pad.loop_on);
@@ -3208,6 +3214,13 @@ impl PixelView {
             } else {
                 old.amp_release_curve
             },
+            filter_on: !old.is_empty() && old.filter_on,
+            cutoff_hz: if old.is_empty() {
+                20000.0
+            } else {
+                old.cutoff_hz
+            },
+            resonance: if old.is_empty() { 0.0 } else { old.resonance },
             amp_attack: if old.is_empty() { 0.0 } else { old.amp_attack },
             amp_decay: if old.is_empty() { 0.0 } else { old.amp_decay },
             amp_sustain: if old.is_empty() { 1.0 } else { old.amp_sustain },
@@ -3597,6 +3610,15 @@ impl PixelView {
                         shp(pad.amp_release_curve)
                     ));
                 }
+            }
+            // Low-pass filter → native SFZ `cutoff` / `resonance` (dB) / `fil_type`. resonance 0..1
+            // maps to ~0..24 dB (matching the biquad's Q = 0.707·2^(4·res)).
+            if pad.filter_on && pad.cutoff_hz < 20000.0 {
+                let res_db = pad.resonance.clamp(0.0, 1.0) * 24.0;
+                sfz.push_str(&format!(
+                    "fil_type=lpf_2p\ncutoff={:.1}\nresonance={res_db:.2}\n",
+                    pad.cutoff_hz
+                ));
             }
             if pad.loop_on {
                 let (ls, le) = pad.loop_region(*dur);
@@ -4976,6 +4998,38 @@ impl PixelView {
                                         }
                                     });
                             }
+                        }
+                    });
+                    // Low-pass filter (static cutoff/resonance; baked + exported as SFZ
+                    // cutoff/resonance/fil_type).
+                    ui.horizontal_wrapped(|ui| {
+                        let mut fon = self.pads[i].filter_on;
+                        if ui
+                            .checkbox(&mut fon, "Filter")
+                            .on_hover_text(
+                                "Low-pass filter, baked into the pad's voice and exported to SFZ \
+                                 (cutoff / resonance / fil_type=lpf_2p).",
+                            )
+                            .changed()
+                        {
+                            self.pads[i].filter_on = fon;
+                        }
+                        if self.pads[i].filter_on {
+                            ui.weak("Cutoff");
+                            ui.add(
+                                egui::DragValue::new(&mut self.pads[i].cutoff_hz)
+                                    .range(20.0..=20000.0)
+                                    .speed(50.0)
+                                    .suffix(" Hz")
+                                    .max_decimals(0),
+                            );
+                            ui.weak("Res");
+                            ui.add(
+                                egui::DragValue::new(&mut self.pads[i].resonance)
+                                    .range(0.0..=1.0)
+                                    .speed(0.01)
+                                    .max_decimals(2),
+                            );
                         }
                     });
                 }
@@ -20065,6 +20119,10 @@ struct Pad {
     amp_attack_curve: f32,
     amp_decay_curve: f32,
     amp_release_curve: f32,
+    // Per-pad low-pass filter (baked via a biquad). `cutoff_hz` at/above Nyquist = open.
+    filter_on: bool,
+    cutoff_hz: f32,
+    resonance: f32,
     color: Option<[u8; 3]>, // optional tile color tag (right-click → colorize)
     source: Option<String>, // original sample path (for the sample-list hover); "" if unknown
     note_lock: bool, // key-lock: keep this pad firing on the same note when it's dragged to a new
@@ -20155,6 +20213,9 @@ impl Pad {
             amp_attack_curve: 0.0,
             amp_decay_curve: 0.0,
             amp_release_curve: 0.0,
+            filter_on: false,
+            cutoff_hz: 20000.0,
+            resonance: 0.0,
             color: None,
             source: None,
             note_lock: false,
@@ -20210,6 +20271,10 @@ impl Pad {
             format!("{}", self.amp_attack_curve),
             format!("{}", self.amp_decay_curve),
             format!("{}", self.amp_release_curve),
+            // Indices 25..=27: low-pass filter.
+            if self.filter_on { "1" } else { "0" }.to_string(),
+            format!("{}", self.cutoff_hz),
+            format!("{}", self.resonance),
         ]
     }
 
@@ -20262,6 +20327,9 @@ impl Pad {
             amp_attack_curve: g(22).parse().unwrap_or(0.0),
             amp_decay_curve: g(23).parse().unwrap_or(0.0),
             amp_release_curve: g(24).parse().unwrap_or(0.0),
+            filter_on: g(25) == "1",
+            cutoff_hz: g(26).parse().unwrap_or(20000.0),
+            resonance: g(27).parse().unwrap_or(0.0),
             flash_t: -1.0,
         };
         (pad, has_audio)
@@ -20519,6 +20587,85 @@ fn apply_amp_env(
         };
         for c in 0..ch {
             region[f * ch + c] *= env;
+        }
+    }
+    region
+}
+
+/// A biquad **low-pass** (RBJ cookbook) with per-channel state (≤2 ch). Coefficients can be
+/// recomputed mid-stream (`set_lowpass`) for a cutoff *envelope*; a static filter just sets them
+/// once. `resonance` 0..1 maps to Q ≈ 0.707 … ~11 (a peak at cutoff).
+struct Biquad {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    x1: [f32; 2],
+    x2: [f32; 2],
+    y1: [f32; 2],
+    y2: [f32; 2],
+}
+
+impl Biquad {
+    fn new() -> Self {
+        Biquad {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            x1: [0.0; 2],
+            x2: [0.0; 2],
+            y1: [0.0; 2],
+            y2: [0.0; 2],
+        }
+    }
+    fn set_lowpass(&mut self, cutoff: f32, resonance: f32, sr: f32) {
+        let q = 0.707 * 2.0f32.powf(resonance.clamp(0.0, 1.0) * 4.0);
+        let fc = cutoff.clamp(20.0, sr * 0.49);
+        let w0 = std::f32::consts::TAU * fc / sr;
+        let (sw, cw) = w0.sin_cos();
+        let alpha = sw / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        self.b0 = (1.0 - cw) * 0.5 / a0;
+        self.b1 = (1.0 - cw) / a0;
+        self.b2 = self.b0;
+        self.a1 = (-2.0 * cw) / a0;
+        self.a2 = (1.0 - alpha) / a0;
+    }
+    fn process(&mut self, c: usize, x: f32) -> f32 {
+        let c = c.min(1);
+        let y = self.b0 * x + self.b1 * self.x1[c] + self.b2 * self.x2[c]
+            - self.a1 * self.y1[c]
+            - self.a2 * self.y2[c];
+        self.x2[c] = self.x1[c];
+        self.x1[c] = x;
+        self.y2[c] = self.y1[c];
+        self.y1[c] = y;
+        y
+    }
+}
+
+/// Bake a **static low-pass** into an interleaved region. A cutoff at/above Nyquist ⇒ no-op (open
+/// filter); >2 channels are left alone (the biquad keeps only two channel states).
+fn apply_lowpass(
+    mut region: Vec<f32>,
+    ch: usize,
+    sr: f32,
+    cutoff: f32,
+    resonance: f32,
+) -> Vec<f32> {
+    if ch == 0 || ch > 2 || cutoff >= sr * 0.49 {
+        return region;
+    }
+    let mut bq = Biquad::new();
+    bq.set_lowpass(cutoff, resonance, sr);
+    let frames = region.len() / ch;
+    for f in 0..frames {
+        for c in 0..ch {
+            let i = f * ch + c;
+            region[i] = bq.process(c, region[i]);
         }
     }
     region
@@ -23622,6 +23769,28 @@ mod tests {
             true,
         );
         assert!(curved[5] < atk[5]); // convex (c=+1) is lower mid-ramp than linear
+    }
+
+    #[test]
+    fn lowpass_attenuates_highs_more_than_lows() {
+        let sr = 44100.0;
+        let n = 4096;
+        // A low tone (200 Hz) and a high tone (10 kHz); a 1 kHz LP should keep the low, cut the high.
+        let tone = |hz: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| (std::f32::consts::TAU * hz * i as f32 / sr).sin())
+                .collect()
+        };
+        let rms = |v: &[f32]| {
+            (v[1000..].iter().map(|x| x * x).sum::<f32>() / (v.len() - 1000) as f32).sqrt()
+        };
+        let low = apply_lowpass(tone(200.0), 1, sr, 1000.0, 0.0);
+        let high = apply_lowpass(tone(10000.0), 1, sr, 1000.0, 0.0);
+        assert!(rms(&low) > 0.5); // 200 Hz passes ~unattenuated
+        assert!(rms(&high) < 0.1); // 10 kHz is well below the cutoff → cut
+                                   // An open filter (cutoff ≥ Nyquist) is a no-op.
+        let t = tone(5000.0);
+        assert_eq!(apply_lowpass(t.clone(), 1, sr, 30000.0, 0.0), t);
     }
 
     #[test]
