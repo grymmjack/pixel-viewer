@@ -5573,7 +5573,7 @@ impl PixelView {
                     let env_col = egui::Color32::from_rgb(255, 210, 90);
                     let curve_col = egui::Color32::from_rgb(255, 170, 70);
                     // CURVED contour: each ramp sampled through `curve_shape`, the sustain flat.
-                    const NS: usize = 18;
+                    const NS: usize = 28;
                     let mut contour: Vec<egui::Pos2> = Vec::with_capacity(NS * 3 + 3);
                     for k in 0..=NS {
                         let u = k as f32 / NS as f32; // attack 0→1
@@ -20450,15 +20450,18 @@ fn build_pad_region(buf: &SampleBuf, start: f32, end: f32, loop_type: u8) -> Vec
     }
 }
 
-/// Shape a 0..1 ramp parameter by a curvature `c` (−1 concave/fast … 0 linear … +1 convex/slow),
-/// as `t^k` with `k = 2^(3c)` — c=+1 ⇒ k=8 (slow start, steep finish), c=−1 ⇒ k=⅛ (fast start).
-/// The same shaping is drawn in the editor and translated to an SFZ flex-EG `egN_shapeX` on export.
+/// Shape a 0..1 ramp parameter by a curvature `c` (−1 concave/fast … 0 linear … +1 convex/slow).
+/// An **exponential ease** `(e^{kt} − 1)/(e^k − 1)` with tension `k = 5c`: unlike `t^k` it has a
+/// *finite, smooth slope at both ends* — so a concave attack rises gently instead of shooting up
+/// vertically at t=0 (the "wonky toe"). The same shaping is drawn in the editor and translated to
+/// an SFZ flex-EG `egN_shapeX` on export.
 fn curve_shape(t: f32, c: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     if c.abs() < 1e-3 {
         return t;
     }
-    t.powf(2.0f32.powf(3.0 * c.clamp(-1.0, 1.0)))
+    let k = c.clamp(-1.0, 1.0) * 5.0;
+    ((k * t).exp() - 1.0) / (k.exp() - 1.0)
 }
 
 /// Bake a per-pad **amplitude ADSR** into an interleaved region (all channels share the frame
