@@ -3003,6 +3003,13 @@ impl PixelView {
                 }
             }
         }
+        // Monophonic self-choke: a new hit cuts this pad's OWN previous voice (a one-shot pad set
+        // mono — hi-hats / 808s). Looping pads handle their own retrigger above.
+        if self.pads[i].mono && !self.pads[i].loop_on {
+            if let Some(ap) = &mut self.audio_player {
+                ap.stop_pad(i);
+            }
+        }
         // Choke group: firing this pad silences every OTHER pad sharing its non-zero group (the
         // open/closed hi-hat idiom). Do it before the new voice starts so the old one cuts cleanly.
         let choke = self.pads[i].choke_group;
@@ -3140,7 +3147,8 @@ impl PixelView {
         let v = p.env_values(target); // [a, d, s, rel, ca, cd, cr]
         let flat = v[0] < 1e-4 && v[1] < 1e-4 && (v[2] - 1.0).abs() < 1e-4 && v[3] < 1e-4;
         if flat {
-            p.set_env_values(target, [0.01, 0.10, 0.75, 0.15, v[4], v[5], v[6]]);
+            // No attack (node pins top-left, clear of decay), 100 ms decay, sustain, release tail.
+            p.set_env_values(target, [0.0, 0.10, 0.75, 0.20, v[4], v[5], v[6]]);
         }
     }
 
@@ -3266,6 +3274,7 @@ impl PixelView {
             } else {
                 old.res_env
             },
+            mono: !old.is_empty() && old.mono,
             amp_attack: if old.is_empty() { 0.0 } else { old.amp_attack },
             amp_decay: if old.is_empty() { 0.0 } else { old.amp_decay },
             amp_sustain: if old.is_empty() { 1.0 } else { old.amp_sustain },
@@ -4947,6 +4956,18 @@ impl PixelView {
                                 ap.looping = loop_on;
                             }
                         }
+                        // Monophonic: a re-hit cuts this pad's own previous voice (self-choke).
+                        let mut mono = self.pads[i].mono;
+                        if ui
+                            .checkbox(&mut mono, "Mono")
+                            .on_hover_text(
+                                "Monophonic: a new hit cuts this pad's own previous voice \
+                                 (self-choke). Looping pads are always monophonic.",
+                            )
+                            .changed()
+                        {
+                            self.pads[i].mono = mono;
+                        }
                         let cur = (self.pads[i].loop_type as usize).min(2);
                         egui::ComboBox::from_id_salt("pad_loop_type")
                             .selected_text(LOOP_TYPES[cur])
@@ -5704,19 +5725,28 @@ impl PixelView {
                     egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 224, 130)),
                 );
             }
-            // Live pad-voice playhead — while drilled into a pad, a bright marker sweeps left→right
-            // tracking that pad's currently-playing voice, so you can watch the envelope shape the
-            // sound. (A pad plays as a separate mixer voice, so the main yellow playhead can't show
-            // it.) Repaint continuously while it sounds so the sweep animates.
+            // Live pad-voice playheads — while drilled into a pad, a marker sweeps left→right for
+            // EACH currently-sounding voice of that pad (a pad is polyphonic, so several one-shots
+            // can overlap). The newest hit is fully opaque; older voices fade but never vanish, so
+            // you can see the sounds stacking. Repaint continuously so the sweeps animate.
             if let EditFocus::Pad(pi) = self.edit_focus {
-                if let Some(pt) = ap.pad_voice_pos(pi) {
+                let positions = ap.pad_voice_positions(pi);
+                let n = positions.len();
+                for (k, &pt) in positions.iter().enumerate() {
                     if pt >= vs - 1e-6 && pt <= ve + 1e-6 {
+                        let recency = (n - 1 - k) as f32; // 0 = newest (drawn last, on top)
+                        let alpha = (235.0 - recency * 55.0).max(70.0) as u8;
                         p.vline(
                             x_of(pt),
                             rect.y_range(),
-                            egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 240, 170)),
+                            egui::Stroke::new(
+                                2.0,
+                                egui::Color32::from_rgba_unmultiplied(90, 240, 170, alpha),
+                            ),
                         );
                     }
+                }
+                if n > 0 {
                     ui.ctx().request_repaint();
                 }
             }
@@ -5753,7 +5783,48 @@ impl PixelView {
                     let span_y = (rect.height() - 2.0 * pad_y).max(1.0);
                     let y_of = |lvl: f32| rect.bottom() - pad_y - lvl.clamp(0.0, 1.0) * span_y;
                     let level_at = |y: f32| ((rect.bottom() - pad_y - y) / span_y).clamp(0.0, 1.0);
-                    // Key time points along the sample (release measured back from the end).
+                    const NS: usize = 28;
+                    // Build a CURVED contour polyline from a target's 7 values (ramps sampled through
+                    // `curve_shape`, the sustain flat).
+                    let build_contour = |v: &[f32; 7]| -> Vec<egui::Pos2> {
+                        let (a, d, s, rel, ca, cd, cr) = (v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
+                        let t_a = a.clamp(0.0, dur);
+                        let t_d = (a + d).clamp(0.0, dur);
+                        let t_r = (dur - rel).clamp(t_d, dur);
+                        let mut c = Vec::with_capacity(NS * 3 + 3);
+                        for k in 0..=NS {
+                            let u = k as f32 / NS as f32;
+                            c.push(egui::pos2(x_of(t_a * u), y_of(curve_shape(u, ca))));
+                        }
+                        for k in 1..=NS {
+                            let u = k as f32 / NS as f32;
+                            c.push(egui::pos2(
+                                x_of(t_a + (t_d - t_a) * u),
+                                y_of(1.0 + (s - 1.0) * curve_shape(u, cd)),
+                            ));
+                        }
+                        c.push(egui::pos2(x_of(t_r), y_of(s)));
+                        for k in 1..=NS {
+                            let u = k as f32 / NS as f32;
+                            c.push(egui::pos2(
+                                x_of(t_r + (dur - t_r) * u),
+                                y_of(s * (1.0 - curve_shape(u, cr))),
+                            ));
+                        }
+                        c
+                    };
+                    // Background: every OTHER enabled envelope, faded + non-editable, in its color —
+                    // so you see all your modulation at once (only the foreground one is editable).
+                    for ot in EnvTarget::ALL {
+                        if ot != target && self.pads[pi].env_on(ot) {
+                            let pts = build_contour(&self.pads[pi].env_values(ot));
+                            p.add(egui::Shape::line(
+                                pts,
+                                egui::Stroke::new(1.5, ot.color().gamma_multiply(0.32)),
+                            ));
+                        }
+                    }
+                    // Foreground node positions for the handles (release measured back from the end).
                     let t_a = a.clamp(0.0, dur);
                     let t_d = (a + d).clamp(0.0, dur);
                     let t_r = (dur - rel).clamp(t_d, dur);
@@ -5762,25 +5833,11 @@ impl PixelView {
                     let pr = egui::pos2(x_of(t_r), y_of(s));
                     let env_col = target.color();
                     let curve_col = env_col.gamma_multiply(0.8);
-                    // CURVED contour: each ramp sampled through `curve_shape`, the sustain flat.
-                    const NS: usize = 28;
-                    let mut contour: Vec<egui::Pos2> = Vec::with_capacity(NS * 3 + 3);
-                    for k in 0..=NS {
-                        let u = k as f32 / NS as f32; // attack 0→1
-                        contour.push(egui::pos2(x_of(t_a * u), y_of(curve_shape(u, ca))));
-                    }
-                    for k in 1..=NS {
-                        let u = k as f32 / NS as f32; // decay 1→s
-                        let lvl = 1.0 + (s - 1.0) * curve_shape(u, cd);
-                        contour.push(egui::pos2(x_of(t_a + (t_d - t_a) * u), y_of(lvl)));
-                    }
-                    contour.push(pr); // sustain hold t_d→t_r
-                    for k in 1..=NS {
-                        let u = k as f32 / NS as f32; // release s→0
-                        let lvl = s * (1.0 - curve_shape(u, cr));
-                        contour.push(egui::pos2(x_of(t_r + (dur - t_r) * u), y_of(lvl)));
-                    }
-                    p.add(egui::Shape::line(contour, egui::Stroke::new(2.0, env_col)));
+                    // Foreground contour (full opacity, editable).
+                    p.add(egui::Shape::line(
+                        build_contour(&[a, d, s, rel, ca, cd, cr]),
+                        egui::Stroke::new(2.0, env_col),
+                    ));
                     // ---- Node handles (circles): attack (X), decay+sustain (X·Y), release (X).
                     // Allocated on top of the waveform so a grab claims the pointer (the selection
                     // drag is gated off by `env_editing`). Driven from the global pointer so a drag
@@ -6948,6 +7005,7 @@ impl PixelView {
                     let assigning = self.pad_assign == Some(i); // MIDI-learn armed on this pad
                     let color = self.pads[i].color;
                     let note_lock = self.pads[i].note_lock; // 🔒 keeps the key across a drag-move
+                    let is_mono = self.pads[i].mono || self.pads[i].loop_on; // self-cutoff (1 voice)
 
                     let (rect, resp) = ui.allocate_exact_size(
                         egui::vec2(cell_w, cell_h),
@@ -6995,6 +7053,26 @@ impl PixelView {
                         base_bg
                     };
                     ui.painter().rect_filled(rect, 5.0, bg);
+                    // Monophonic (self-cutoff) pads get a small cyan "1" chip in the bottom-left
+                    // corner — a quick read of which pads can only sound one voice at a time.
+                    if is_mono && !empty {
+                        let cr = egui::Rect::from_min_size(
+                            egui::pos2(rect.left() + 3.0, rect.bottom() - 15.0),
+                            egui::vec2(13.0, 12.0),
+                        );
+                        ui.painter().rect_filled(
+                            cr,
+                            2.0,
+                            egui::Color32::from_rgba_unmultiplied(60, 140, 190, 190),
+                        );
+                        ui.painter().text(
+                            cr.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "1",
+                            egui::FontId::proportional(9.0),
+                            egui::Color32::WHITE,
+                        );
+                    }
                     let border = if clone_hover {
                         egui::Stroke::new(2.5, egui::Color32::from_rgb(120, 230, 140))
                     // clone (Alt)
@@ -15848,6 +15926,36 @@ impl PixelView {
                     {
                         audio_mute = true;
                     }
+                    // Live voice counter — how many voices the engine is sounding right now (every
+                    // pad voice + the preview player). The pad engine is polyphonic with no fixed
+                    // cap. Fixed width so the count changing digits doesn't jiggle the row.
+                    {
+                        let voices = self
+                            .audio_player
+                            .as_ref()
+                            .map(|a| a.active_voice_count())
+                            .unwrap_or(0);
+                        ui.add_space(6.0);
+                        let col = if voices > 0 {
+                            egui::Color32::from_rgb(120, 220, 255)
+                        } else {
+                            egui::Color32::from_gray(110)
+                        };
+                        ui.add_sized(
+                            [40.0, 16.0],
+                            egui::Label::new(
+                                egui::RichText::new(format!("{} {voices}", icons::MUSIC))
+                                    .color(col)
+                                    .monospace(),
+                            ),
+                        )
+                        .on_hover_text(format!(
+                            "{voices} voice(s) sounding — the pad engine is polyphonic (no fixed limit)"
+                        ));
+                        if voices > 0 {
+                            self.want_repaint = true; // keep the count live
+                        }
+                    }
                     // MIDI activity LED — a quick "is my controller working?" indicator: lit
                     // bright green on a hardware-MIDI event, fading to a dim green when idle. Only
                     // shown when a controller is connected.
@@ -20259,6 +20367,9 @@ struct Pad {
     pitch_depth: f32,
     cutoff_env: Env,
     res_env: Env,
+    // Monophonic: a new hit cuts this pad's own previous voice (self-choke). Looping pads are
+    // always monophonic; this makes a one-shot pad mono too (hi-hats, 808s). Shown by a tile chip.
+    mono: bool,
     color: Option<[u8; 3]>, // optional tile color tag (right-click → colorize)
     source: Option<String>, // original sample path (for the sample-list hover); "" if unknown
     note_lock: bool, // key-lock: keep this pad firing on the same note when it's dragged to a new
@@ -20286,10 +20397,10 @@ impl Env {
     fn seeded() -> Self {
         Env {
             on: false,
-            a: 0.0,
-            d: 0.10,
+            a: 0.0,  // no attack (its node pins to the top-left, clear of the decay node)
+            d: 0.10, // a little decay
             s: 0.75,
-            rel: 0.15,
+            rel: 0.20, // an adjustable release tail
             ca: 0.0,
             cd: 0.0,
             cr: 0.0,
@@ -20510,6 +20621,7 @@ impl Pad {
             pitch_depth: -12.0,
             cutoff_env: Env::seeded(),
             res_env: Env::seeded(),
+            mono: false,
             color: None,
             source: None,
             note_lock: false,
@@ -20574,6 +20686,8 @@ impl Pad {
             format!("{}", self.pitch_depth),
             self.cutoff_env.to_field(),
             self.res_env.to_field(),
+            // Index 32: monophonic self-choke.
+            if self.mono { "1" } else { "0" }.to_string(),
         ]
     }
 
@@ -20694,6 +20808,7 @@ impl Pad {
             pitch_depth: g(29).parse().unwrap_or(-12.0),
             cutoff_env: Env::from_field(&g(30)),
             res_env: Env::from_field(&g(31)),
+            mono: g(32) == "1",
             flash_t: -1.0,
         };
         (pad, has_audio)
@@ -21565,23 +21680,20 @@ impl AudioPlayer {
         });
     }
 
-    /// The live playback position (in SAMPLE seconds) of pad `i`'s currently-sounding voice, for the
-    /// moving playhead — `None` if it isn't playing. Maps the voice's consumed source time (scaled by
-    /// pitch `speed`, wrapped for a looping voice) back onto the sample timeline, honoring the region
-    /// offset and reverse / ping-pong direction so the marker tracks what you actually hear.
-    fn pad_voice_pos(&self, i: usize) -> Option<f32> {
-        let v = self
-            .pad_voices
-            .iter()
-            .find(|v| v.pad == i && !v.player.empty() && !v.player.is_paused())?;
+    /// Map ONE voice's consumed source time (scaled by pitch `speed`, wrapped for a loop) back onto
+    /// the sample timeline (seconds), honoring the region offset + reverse / ping-pong direction.
+    /// `None` for a finished one-shot the reaper hasn't dropped yet, or a paused voice.
+    fn voice_sample_pos(v: &PadVoice) -> Option<f32> {
+        if v.player.empty() || v.player.is_paused() {
+            return None;
+        }
         let rlen = v.region_len.max(1e-4);
-        // Total length of the played buffer in source seconds (ping-pong plays fwd then back).
         let played = if v.loop_type == 2 { rlen * 2.0 } else { rlen };
         let mut src = v.player.get_pos().as_secs_f32() * v.speed;
         if v.loop_it {
             src %= played; // a looping voice's clock runs past the buffer end
         } else if src > played {
-            return None; // a finished one-shot (reaper hasn't dropped it yet)
+            return None;
         }
         let t = match v.loop_type {
             1 => v.region_start + (rlen - src.min(rlen)), // reverse: played 0 = region end
@@ -21595,6 +21707,28 @@ impl AudioPlayer {
             _ => v.region_start + src.min(rlen), // forward
         };
         Some(t.clamp(0.0, v.buf.duration.max(0.0)))
+    }
+
+    /// Every live voice position for pad `i`, **oldest → newest** (push order), for the fading
+    /// multi-voice traversal lines — the newest is drawn fully opaque, older ones progressively
+    /// fainter (never fully transparent).
+    fn pad_voice_positions(&self, i: usize) -> Vec<f32> {
+        self.pad_voices
+            .iter()
+            .filter(|v| v.pad == i)
+            .filter_map(Self::voice_sample_pos)
+            .collect()
+    }
+
+    /// The number of currently-sounding voices in the engine — every live pad voice plus the main
+    /// preview player if it's playing. Drives the menu-bar voice counter.
+    fn active_voice_count(&self) -> usize {
+        let pads = self
+            .pad_voices
+            .iter()
+            .filter(|v| !v.player.empty() && !v.player.is_paused())
+            .count();
+        pads + if self.is_playing() { 1 } else { 0 }
     }
 
     /// Drop finished pad voices (call once per frame; bounds the Vec + frees rodio players).
@@ -24126,6 +24260,21 @@ mod tests {
             amp_release: 0.15,
             amp_attack_curve: 0.5,
             amp_release_curve: -0.7,
+            mono: true,
+            filter_on: true,
+            cutoff_hz: 1200.0,
+            resonance: 0.4,
+            pitch_depth: -7.0,
+            pitch_env: Env {
+                on: true,
+                a: 0.0,
+                d: 0.2,
+                s: 0.0,
+                rel: 0.1,
+                ca: 0.0,
+                cd: 0.3,
+                cr: 0.0,
+            },
             ..Pad::empty()
         };
         let (r, has_audio) = Pad::from_record(&p.record());
@@ -24149,7 +24298,17 @@ mod tests {
         assert!((r.amp_attack_curve - 0.5).abs() < 1e-6);
         assert!((r.amp_release_curve + 0.7).abs() < 1e-6); // segment curvature survives
         assert!(r.amp_env_on); // envelope-enable survives
-                               // A short/garbage row degrades gracefully to sane defaults.
+        assert!(r.mono); // monophonic self-choke survives
+        assert!(
+            r.filter_on && (r.cutoff_hz - 1200.0).abs() < 1e-3 && (r.resonance - 0.4).abs() < 1e-6
+        );
+        assert!(
+            r.pitch_env.on
+                && (r.pitch_env.d - 0.2).abs() < 1e-6
+                && (r.pitch_env.cd - 0.3).abs() < 1e-6
+        );
+        assert!((r.pitch_depth + 7.0).abs() < 1e-6); // pitch env + depth survive
+                                                     // A short/garbage row degrades gracefully to sane defaults.
         let (d, _) = Pad::from_record(&["1".to_string()]);
         assert_eq!(d.note, None);
         assert_eq!(d.volume, 1.0);
