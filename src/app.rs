@@ -843,6 +843,14 @@ pub struct PixelView {
     audio_wave_h: f32,  // height of the resizable waveform in the big audio view; persisted
     audio_kb_h: f32, // height of the resizable onscreen keyboard in the big audio view; persisted
     pad_assign: Option<usize>, // "MIDI-learn" mode: the next note-on assigns this pad's note (transient)
+    // Live-edit re-trigger of a drilled-in pad's LOOPING voice: `pad_last_vel[i]` remembers the raw
+    // velocity a pad was fired at (so a re-fire matches level); `pad_edit_sig` = (pad, param hash)
+    // of the sounding loop last frame; `pad_edit_dirty` is set when it changes and consumed on
+    // mouse-release to re-fire — so tweaking loop/pitch/filter/envelope is heard without a re-trigger,
+    // without restarting every drag frame. All transient. See `poll_pad_retrigger`.
+    pad_last_vel: [u8; PAD_COUNT],
+    pad_edit_sig: Option<(usize, u64)>,
+    pad_edit_dirty: bool,
     edit_focus: EditFocus, // what the waveform editor is pointed at (Song / Sample / a Pad drill-in)
     editor_stash: Option<EditorStash>, // saved editor state during a pad drill-in (restored on Back)
     note_flash: HashMap<i32, f32>, // MIDI note → last-played ctx time, for the keyboard key lights (transient)
@@ -1893,6 +1901,9 @@ impl PixelView {
             audio_wave_h,
             audio_kb_h,
             pad_assign: None,
+            pad_last_vel: [127; PAD_COUNT],
+            pad_edit_sig: None,
+            pad_edit_dirty: false,
             edit_focus: EditFocus::Song,
             editor_stash: None,
             note_flash: HashMap::new(),
@@ -2998,9 +3009,9 @@ impl PixelView {
         if !self.plugin_audio || i >= self.pads.len() {
             return;
         }
-        let Some(buf) = self.pads[i].buf.clone() else {
-            return;
-        };
+        if self.pads[i].buf.is_none() {
+            return; // empty pad — nothing to fire (fire_pad_voice re-checks too)
+        }
         // A looping pad that's already sounding → press again to stop it (there's no key-up for
         // an onscreen/pad click, and MIDI Note-Off is ignored, so a re-press is the "off").
         if self.pads[i].loop_on {
@@ -3032,6 +3043,21 @@ impl PixelView {
                     ap.stop_pad(j);
                 }
             }
+        }
+        self.fire_pad_voice(i, vel, now);
+    }
+
+    /// Build pad `i`'s region (loop + the full modulation chain baked in) and fire it as a
+    /// concurrent mixer voice, flashing its key. Split out of `trigger_pad` — which keeps the
+    /// stop-on-repress / mono / choke guards — so a **live edit** can re-fire a sounding loop with
+    /// the current settings (see `poll_pad_retrigger`). `raw_vel` is the pre-remap incoming velocity;
+    /// it's remembered in `pad_last_vel` so a re-fire reproduces the same level.
+    fn fire_pad_voice(&mut self, i: usize, raw_vel: u8, now: f32) {
+        let Some(buf) = self.pads.get(i).and_then(|p| p.buf.clone()) else {
+            return;
+        };
+        if let Some(slot) = self.pad_last_vel.get_mut(i) {
+            *slot = raw_vel;
         }
         let pad = &self.pads[i];
         let (ls, le) = pad.loop_region(buf.duration);
@@ -3127,15 +3153,15 @@ impl PixelView {
         let vel = if self.kit_global_vel {
             self.kit_global_vel_amt
         } else if pad.vel_track {
-            vel
+            raw_vel
         } else {
             127
         };
-        let gain = (if self.audio_muted || !self.pad_audible(i) {
-            0.0
-        } else {
-            pad.volume
-        }) * (vel as f32 / 127.0).clamp(0.0, 1.0);
+        // Level WITHOUT master volume/mute: pad volume · solo/mute · velocity. The master fader is
+        // applied inside trigger_pad_voice (× effective_volume) and re-applied live by apply_volume,
+        // so dragging the master slider changes even a sustained looping pad without a re-trigger.
+        let base_gain = (if self.pad_audible(i) { pad.volume } else { 0.0 })
+            * (vel as f32 / 127.0).clamp(0.0, 1.0);
         if let Some(ap) = &mut self.audio_player {
             ap.trigger_pad_voice(
                 i,
@@ -3146,7 +3172,7 @@ impl PixelView {
                 region_len,
                 loop_type,
                 pitch,
-                gain,
+                base_gain,
                 loop_it,
             );
         }
@@ -3158,6 +3184,62 @@ impl PixelView {
         self.note_flash.retain(|_, t| now - *t < 1.0); // bound the map
         self.note_flash.insert(note, now);
         self.want_repaint = true; // animate the key-light fade
+    }
+
+    /// A hash of everything about pad `i` that changes how its voice SOUNDS (loop region, pitch,
+    /// filter, envelopes, LFOs, pan, volume, mono/choke). `Pad::record()` already serializes all of
+    /// them, plus the kit-wide velocity that feeds the gain — so hashing that string catches any
+    /// edit worth re-firing a sounding loop for. Cheap enough to run every frame.
+    fn pad_sound_sig(&self, i: usize) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        if let Some(p) = self.pads.get(i) {
+            p.record().join("\u{1}").hash(&mut h);
+        }
+        self.kit_global_vel.hash(&mut h);
+        self.kit_global_vel_amt.hash(&mut h);
+        h.finish()
+    }
+
+    /// Make a **live edit heard**: while drilled into a pad whose LOOPING voice is sounding, watch
+    /// its sound signature and, when it changes, re-fire the loop with the new settings — so moving
+    /// the loop range / pitch / filter / envelope updates what you hear WITHOUT a manual re-trigger.
+    /// The re-fire waits for the mouse button to come up so a continuous drag doesn't restart the
+    /// loop every frame (which would stutter); the first observation only sets the baseline, so
+    /// clicking a pad to start it doesn't immediately re-fire. Called each frame from `ui()`.
+    fn poll_pad_retrigger(&mut self, now: f32) {
+        let EditFocus::Pad(i) = self.edit_focus else {
+            self.pad_edit_sig = None;
+            self.pad_edit_dirty = false;
+            return;
+        };
+        let has_loop = self
+            .audio_player
+            .as_ref()
+            .is_some_and(|ap| ap.pad_has_loop_voice(i));
+        if !has_loop {
+            self.pad_edit_sig = None;
+            self.pad_edit_dirty = false;
+            return;
+        }
+        let sig = self.pad_sound_sig(i);
+        match self.pad_edit_sig {
+            Some((pi, psig)) if pi == i => {
+                if psig != sig {
+                    self.pad_edit_sig = Some((i, sig));
+                    self.pad_edit_dirty = true;
+                }
+            }
+            // First observation of this sounding loop → baseline only (no spurious re-fire).
+            _ => self.pad_edit_sig = Some((i, sig)),
+        }
+        // Re-fire once the drag/click that made the change is released.
+        let pointer_down = self.egui_ctx.input(|inp| inp.pointer.any_down());
+        if self.pad_edit_dirty && !pointer_down {
+            self.pad_edit_dirty = false;
+            let vel = self.pad_last_vel.get(i).copied().unwrap_or(127);
+            self.fire_pad_voice(i, vel, now);
+        }
     }
 
     /// The envelope grid's beat-division step in seconds, from the shared BPM + `musical_div`
@@ -17303,6 +17385,7 @@ impl eframe::App for PixelView {
         self.poll_colo_sauce();
         self.poll_midi(ctx.input(|i| i.time) as f32); // hardware MIDI keys → pads / sample
         self.poll_audio_load(ctx.input(|i| i.stable_dt)); // background audio decode → build player
+        self.poll_pad_retrigger(ctx.input(|i| i.time) as f32); // live edit → re-fire a sounding loop
                                                           // Screensaver: once a (random) pack has finished downloading + mounting, open its
                                                           // first art file. Both async ops idle ⇒ the listing has settled.
         if self.pending_autoplay && self.random_rx.is_none() && self.remote_rx.is_none() {
@@ -22582,6 +22665,10 @@ struct PadVoice {
     region_len: f32,
     loop_type: u8,
     loop_it: bool,
+    // The voice's level WITHOUT master volume/mute (pad volume · solo/mute · velocity). The live
+    // gain is `base_gain · effective_volume()`, so dragging the master fader re-scales every voice
+    // (`apply_volume`) without a re-trigger.
+    base_gain: f32,
 }
 
 impl AudioPlayer {
@@ -22698,9 +22785,14 @@ impl AudioPlayer {
         }
     }
 
-    /// Push the current master volume/mute to the live player (no restart).
+    /// Push the current master volume/mute to the live player AND every sounding pad voice (no
+    /// restart) — so dragging the master fader is heard immediately, even on a sustained looping pad.
     fn apply_volume(&self) {
-        self.player.set_volume(self.effective_volume());
+        let eff = self.effective_volume();
+        self.player.set_volume(eff);
+        for v in &self.pad_voices {
+            v.player.set_volume(v.base_gain * eff);
+        }
     }
 
     /// (Re)start playback of the selected region on a fresh player (so a finished/looping
@@ -22738,14 +22830,14 @@ impl AudioPlayer {
         region_len: f32,               // the region's forward length (seconds)
         loop_type: u8,
         semitone: i32,
-        gain: f32,
+        base_gain: f32, // level WITHOUT master vol/mute — the live gain is base_gain · effective_volume()
         loop_it: bool,
     ) {
         use rodio::Source;
         let speed = 2.0f32.powf(semitone as f32 / 12.0);
         let src = rodio::buffer::SamplesBuffer::new(channels, buf.sample_rate, region).speed(speed);
         let player = rodio::Player::connect_new(self._stream.mixer());
-        player.set_volume(gain);
+        player.set_volume(base_gain * self.effective_volume());
         if loop_it {
             self.pad_voices.retain(|v| v.pad != pad); // a looping pad is monophonic (no stacking)
             player.append(src.repeat_infinite());
@@ -22762,6 +22854,7 @@ impl AudioPlayer {
             region_len,
             loop_type,
             loop_it,
+            base_gain,
         });
     }
 
@@ -22832,6 +22925,14 @@ impl AudioPlayer {
         self.pad_voices
             .iter()
             .any(|v| v.pad == i && !v.player.empty())
+    }
+
+    /// Whether pad `i` has a live **looping** voice — the case a live edit can re-fire in place so
+    /// tweaking its loop/pitch/filter/envelope is heard without a manual re-trigger.
+    fn pad_has_loop_voice(&self, i: usize) -> bool {
+        self.pad_voices
+            .iter()
+            .any(|v| v.pad == i && v.loop_it && !v.player.empty())
     }
 
     /// PANIC: stop the main player + every pad voice at once (all sound off).
