@@ -3122,20 +3122,23 @@ impl PixelView {
         (step > 1e-4).then_some(step)
     }
 
-    /// When the CURRENT target's envelope is switched on with an all-neutral ADSR, seed a gentle,
-    /// visibly editable starter shape — otherwise the overlay's handles stack at the top-left
-    /// (a≈0, d≈0, s≈1) and can't be grabbed individually.
-    fn seed_pad_env_if_flat(&mut self, i: usize) {
+    /// When the CURRENT target's envelope is switched on with an all-neutral ADSR, seed a starter
+    /// shape whose node TIMES are **proportional to the sample duration** — so on a long sample the
+    /// decay/release nodes still spread across the width instead of clustering at the top-left with
+    /// the attack node (fixed-second defaults overlapped). No attack, ~12% decay, 75% sustain, ~30%
+    /// release (clamped to musical bounds), no gate.
+    fn seed_pad_env_if_flat(&mut self, i: usize, dur: f32) {
         let target = self.env_target;
         let Some(p) = self.pads.get_mut(i) else {
             return;
         };
-        let v = p.env_values(target); // [a, d, s, rel, ca, cd, cr]
+        let v = p.env_values(target);
         let flat = v[0] < 1e-4 && v[1] < 1e-4 && (v[2] - 1.0).abs() < 1e-4 && v[3] < 1e-4;
         if flat {
-            // No attack (node pins top-left, clear of decay), 100 ms decay, sustain, release tail,
-            // no gate.
-            p.set_env_values(target, [0.0, 0.10, 0.75, 0.20, v[4], v[5], v[6], 0.0]);
+            let d = dur.max(0.2);
+            let decay = (d * 0.12).clamp(0.03, 0.6);
+            let rel = (d * 0.30).clamp(0.08, 1.5);
+            p.set_env_values(target, [0.0, decay, 0.75, rel, v[4], v[5], v[6], 0.0]);
         }
     }
 
@@ -5029,7 +5032,7 @@ impl PixelView {
                                 self.env_target = t;
                                 self.env_edit = true;
                                 self.pads[i].set_env_on(t, true);
-                                self.seed_pad_env_if_flat(i);
+                                self.seed_pad_env_if_flat(i, dur);
                             }
                         }
                         if self.env_edit
@@ -5051,6 +5054,17 @@ impl PixelView {
                             {
                                 self.pads[i].set_env_on(t, on);
                             }
+                            // Preset starter shapes (duration-proportional; apply to this target).
+                            egui::ComboBox::from_id_salt("env_preset")
+                                .selected_text("Preset")
+                                .width(64.0)
+                                .show_ui(ui, |ui| {
+                                    for name in ENV_PRESETS {
+                                        if ui.selectable_label(false, name).clicked() {
+                                            self.pads[i].set_env_values(t, env_preset(name, dur));
+                                        }
+                                    }
+                                });
                             // ADSR numeric fine-tune for the selected target.
                             let mut v = self.pads[i].env_values(t);
                             let mut ch = false;
@@ -20481,6 +20495,60 @@ impl Env {
     }
 }
 
+/// Named starter shapes for the envelope editor. Times are **duration-proportional** so a shape
+/// reads the same on any sample length (and nodes never cluster). Returns `[a,d,s,rel,ca,cd,cr,rel_end]`.
+const ENV_PRESETS: [&str; 7] = [
+    "Reset", "Pluck", "Perc", "Saw down", "Saw up", "Gate", "Pad",
+];
+
+fn env_preset(name: &str, dur: f32) -> [f32; 8] {
+    let d = dur.max(0.2);
+    let c = |t: f32, lo: f32, hi: f32| (d * t).clamp(lo, hi);
+    match name {
+        // Fast attack, medium decay, normal sustain, instant release.
+        "Pluck" => [
+            0.0,
+            c(0.15, 0.03, 0.5),
+            0.5,
+            c(0.15, 0.05, 0.6),
+            0.0,
+            0.3,
+            0.0,
+            0.0,
+        ],
+        // Instant hit → snappy convex decay to silence, no sustain/release.
+        "Perc" => [0.0, c(0.10, 0.02, 0.4), 0.0, 0.0, 0.0, 0.6, 0.0, 0.0],
+        // Instant to full → linear ramp DOWN to 0 across the whole sound.
+        "Saw down" => [0.0, d, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        // Linear ramp UP 0→1 across the whole sound, instant off.
+        "Saw up" => [d, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        // Instant on, full sustain, instant off — a square gate.
+        "Gate" => [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        // Slow attack, high sustain, long release — a pad swell.
+        "Pad" => [
+            c(0.25, 0.05, 1.0),
+            c(0.15, 0.03, 0.6),
+            0.85,
+            c(0.35, 0.1, 2.0),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ],
+        // Reset = the spread default.
+        _ => [
+            0.0,
+            c(0.12, 0.03, 0.6),
+            0.75,
+            c(0.30, 0.08, 1.5),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ],
+    }
+}
+
 /// Which modulation target the on-waveform envelope editor is shaping.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EnvTarget {
@@ -24508,6 +24576,26 @@ mod tests {
             apply_pitch_env(mono.clone(), 1, sr, 0.0, &down, false),
             mono
         );
+    }
+
+    #[test]
+    fn env_presets_are_sane() {
+        let dur = 2.0;
+        // Every preset is listed and produces 8 finite values in range.
+        for name in ENV_PRESETS {
+            let v = env_preset(name, dur);
+            assert!(v.iter().all(|x| x.is_finite()));
+            assert!((0.0..=1.0).contains(&v[2])); // sustain in range
+        }
+        // Saw down: instant to full → linear ramp to 0 (decay = whole, sustain 0).
+        let sd = env_preset("Saw down", dur);
+        assert!((sd[1] - dur).abs() < 1e-6 && sd[2].abs() < 1e-6);
+        // Gate: instant on/off, full sustain (all times 0, sustain 1).
+        let g = env_preset("Gate", dur);
+        assert!(g[0] < 1e-6 && g[1] < 1e-6 && (g[2] - 1.0).abs() < 1e-6 && g[3] < 1e-6);
+        // Reset spreads the nodes (decay before release, both nonzero, no attack).
+        let r = env_preset("Reset", dur);
+        assert!(r[0] < 1e-6 && r[1] > 0.0 && r[3] > r[1]);
     }
 
     #[test]
