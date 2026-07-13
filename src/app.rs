@@ -3167,7 +3167,7 @@ impl PixelView {
         if self.bpm <= 1.0 {
             return None;
         }
-        let beats = [4.0f32, 2.0, 1.0, 0.5, 0.25, 0.125][self.musical_div.min(5) as usize];
+        let beats = BEAT_DIVS[(self.musical_div as usize).min(BEAT_DIVS.len() - 1)].1;
         let step = (60.0 / self.bpm) * beats;
         (step > 1e-4).then_some(step)
     }
@@ -4913,7 +4913,7 @@ impl PixelView {
             );
         }
         if self.musical_on && self.bpm > 1.0 {
-            let beats = [4.0f32, 2.0, 1.0, 0.5, 0.25, 0.125][self.musical_div.min(5) as usize];
+            let beats = BEAT_DIVS[(self.musical_div as usize).min(BEAT_DIVS.len() - 1)].1;
             let step = (60.0 / self.bpm) * beats;
             if step > 1e-3 {
                 let mut g = 0.0;
@@ -5399,12 +5399,13 @@ impl PixelView {
                                     .speed(0.5)
                                     .max_decimals(1),
                             );
-                            const DIVS: [&str; 6] =
-                                ["whole", "half", "quarter", "eighth", "sixteenth", "32nd"];
                             egui::ComboBox::from_id_salt("env_grid_div")
-                                .selected_text(DIVS[self.musical_div.min(5) as usize])
+                                .selected_text(
+                                    BEAT_DIVS[(self.musical_div as usize).min(BEAT_DIVS.len() - 1)].0,
+                                )
+                                .width(58.0)
                                 .show_ui(ui, |ui| {
-                                    for (di, name) in DIVS.iter().enumerate() {
+                                    for (di, (name, _)) in BEAT_DIVS.iter().enumerate() {
                                         ui.selectable_value(&mut self.musical_div, di as u8, *name);
                                     }
                                 });
@@ -5433,10 +5434,14 @@ impl PixelView {
                                     .on_hover_text("Lock the rate to the BPM (beat divisions)");
                                 if l.sync {
                                     egui::ComboBox::from_id_salt("lfo_div")
-                                        .selected_text(LFO_SYNC[(l.sync_div as usize).min(4)].0)
-                                        .width(52.0)
+                                        .selected_text(
+                                            BEAT_DIVS
+                                                [(l.sync_div as usize).min(BEAT_DIVS.len() - 1)]
+                                            .0,
+                                        )
+                                        .width(58.0)
                                         .show_ui(ui, |ui| {
-                                            for (di, (name, _)) in LFO_SYNC.iter().enumerate() {
+                                            for (di, (name, _)) in BEAT_DIVS.iter().enumerate() {
                                                 ui.selectable_value(
                                                     &mut l.sync_div,
                                                     di as u8,
@@ -5448,8 +5453,8 @@ impl PixelView {
                                     ui.weak("Rate");
                                     ui.add(
                                         egui::DragValue::new(&mut l.rate_hz)
-                                            .range(0.01..=40.0)
-                                            .speed(0.05)
+                                            .range(0.01..=120.0)
+                                            .speed(0.1)
                                             .suffix(" Hz")
                                             .max_decimals(2),
                                     );
@@ -5941,7 +5946,7 @@ impl PixelView {
             }
             // Musical (beat-division) grid — faint blue lines under everything else (item 10).
             if self.musical_on && self.bpm > 1.0 {
-                let beats = [4.0f32, 2.0, 1.0, 0.5, 0.25, 0.125][self.musical_div.min(5) as usize];
+                let beats = BEAT_DIVS[(self.musical_div as usize).min(BEAT_DIVS.len() - 1)].1;
                 let step = (60.0 / self.bpm) * beats;
                 if step > 1e-4 && step > vspan / (w * 0.5) {
                     let gcol = egui::Color32::from_rgba_unmultiplied(120, 160, 255, 70);
@@ -6638,12 +6643,13 @@ impl PixelView {
                         self.musical_on = m_on;
                     }
                     if self.musical_on {
-                        const DIVS: [&str; 6] =
-                            ["whole", "half", "quarter", "eighth", "sixteenth", "32nd"];
                         egui::ComboBox::from_id_salt("musical_div")
-                            .selected_text(DIVS[self.musical_div.min(5) as usize])
+                            .selected_text(
+                                BEAT_DIVS[(self.musical_div as usize).min(BEAT_DIVS.len() - 1)].0,
+                            )
+                            .width(58.0)
                             .show_ui(ui, |ui| {
-                                for (i, name) in DIVS.iter().enumerate() {
+                                for (i, (name, _)) in BEAT_DIVS.iter().enumerate() {
                                     ui.selectable_value(&mut self.musical_div, i as u8, *name);
                                 }
                             });
@@ -21126,15 +21132,27 @@ fn eval_shape(s: &ModShape, t: f32, dur: f32, one_shot: bool) -> f32 {
     }
 }
 
-/// LFO waveform names (indexed by `Lfo.wave`), and the tempo-sync beat divisions (label + beats
-/// per cycle — `freq = (bpm/60)/beats`).
+/// LFO waveform names (indexed by `Lfo.wave`).
 const LFO_WAVES: [&str; 6] = ["Sine", "Tri", "Saw up", "Saw dn", "Square", "S&H"];
-const LFO_SYNC: [(&str, f32); 5] = [
-    ("1/1", 4.0),
-    ("1/2", 2.0),
-    ("1/4", 1.0),
-    ("1/8", 0.5),
-    ("1/16", 0.25),
+
+/// Beat divisions shared by the BPM grid (envelope + waveform Musical grid, `musical_div`) AND LFO
+/// tempo-sync (`Lfo.sync_div`): `(label, beats per cycle)`. `freq = (bpm/60)/beats`; grid step =
+/// `(60/bpm)*beats`. **Appended, never reordered** — indices 0..=5 stay whole…1/32 so persisted
+/// `musical_div`/`sync_div` values keep meaning; the finer straight divisions + triplets follow.
+const BEAT_DIVS: [(&str, f32); 13] = [
+    ("1/1", 4.0),          // 0
+    ("1/2", 2.0),          // 1
+    ("1/4", 1.0),          // 2
+    ("1/8", 0.5),          // 3
+    ("1/16", 0.25),        // 4
+    ("1/32", 0.125),       // 5
+    ("1/64", 0.0625),      // 6
+    ("1/128", 0.03125),    // 7
+    ("1/2T", 4.0 / 3.0),   // 8
+    ("1/4T", 2.0 / 3.0),   // 9
+    ("1/8T", 1.0 / 3.0),   // 10
+    ("1/16T", 1.0 / 6.0),  // 11
+    ("1/32T", 1.0 / 12.0), // 12
 ];
 
 /// A per-target **low-frequency oscillator** — tremolo (amp), vibrato (pitch) or filter wobble
@@ -21147,7 +21165,7 @@ struct Lfo {
     wave: u8,     // index into LFO_WAVES
     rate_hz: f32, // free-running frequency
     sync: bool,   // tempo-sync (rate from BPM + sync_div)
-    sync_div: u8, // index into LFO_SYNC
+    sync_div: u8, // index into BEAT_DIVS (tempo-sync division)
     depth: f32,   // modulation depth in target units
     fade: f32,    // fade-in seconds
     delay: f32,   // delay before onset (seconds)
@@ -21201,7 +21219,7 @@ impl Lfo {
     /// The effective frequency (Hz) — from the tempo-sync division if `sync`, else the free rate.
     fn freq(&self, bpm: f32) -> f32 {
         if self.sync {
-            let beats = LFO_SYNC[(self.sync_div as usize).min(LFO_SYNC.len() - 1)].1;
+            let beats = BEAT_DIVS[(self.sync_div as usize).min(BEAT_DIVS.len() - 1)].1;
             (bpm.max(1.0) / 60.0) / beats.max(1e-3)
         } else {
             self.rate_hz.max(0.0)
