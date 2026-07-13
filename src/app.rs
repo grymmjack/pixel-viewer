@@ -6584,7 +6584,13 @@ impl PixelView {
                     .as_ref()
                     .map(|ap| ap.pad_levels())
                     .unwrap_or([0.0; PAD_COUNT]);
-                let avail = ui.available_width();
+                // `available_width()` is INFLATED by the wide non-wrapping MIDI-in row inside this
+                // vertical ScrollArea (auto_shrink=false): it reports the widest child's width, not
+                // the viewport's. That blew `right_w` up so the 4×4 pad grid rendered far wider than
+                // the pane — pads 2/3/4 of each row fell off the right edge, leaving only column 1
+                // (pads 1/5/9/13) on-screen + reachable, so every drop landed on pad 1. Clamp to the
+                // real viewport width (`clip_rect`) so the whole grid fits and every pad is hittable.
+                let avail = ui.available_width().min(ui.clip_rect().width());
                 // A wider minimum when the pane shows the "Pads (N)" list, so the truncated names
                 // stay readable (the pad grid gets the rest).
                 let left_min = if self.pad_list_visible() {
@@ -7856,12 +7862,20 @@ impl PixelView {
             self.download_pad(i);
         }
         if let Some((i, drop)) = want_drop {
+            // A sample load drills into the pad afterwards (below); a pad move/swap/clone doesn't.
+            let sample_load = matches!(drop, PadDrop::File(_) | PadDrop::Tracker(_));
             match drop {
                 PadDrop::File(p) => self.load_pad_from_file(i, &p),
                 PadDrop::Tracker(idx) => self.load_pad_from_tracker(i, idx),
                 // Alt = clone the whole pad; plain = move/swap.
                 PadDrop::Pad(src) if alt_down => self.clone_pad(src, i),
                 PadDrop::Pad(src) => self.move_pad(src, i),
+            }
+            // Drop → drill into the just-loaded pad (the user's ask): "Editing pad N" + its waveform
+            // confirms WHICH pad received the sample and drops you straight into trimming/looping it.
+            // Only when the load produced audio (a failed decode leaves the pad empty).
+            if sample_load && self.pads.get(i).is_some_and(|p| !p.is_empty()) {
+                self.focus_pad(i);
             }
         }
         if let Some((i, vel)) = want_trigger {
