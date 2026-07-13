@@ -3893,10 +3893,14 @@ impl PixelView {
             }
             if pad.loop_on {
                 let (ls, le) = pad.loop_region(*dur);
-                let (sf, ef) = (
-                    (ls * *rate as f32).round() as u64,
-                    (le * *rate as f32).round() as u64,
-                );
+                // SFZ `loop_end` is the last sample INDEX of the loop, so it must be ≤ samples−1.
+                // For a full-sample loop `le·rate` = the sample COUNT, which strict players
+                // (sforzando) reject as out of range — clamp it to the last valid index.
+                let total = (*dur * *rate as f32).round() as u64;
+                let sf = ((ls * *rate as f32).round() as u64).min(total.saturating_sub(1));
+                let ef = ((le * *rate as f32).round() as u64)
+                    .min(total.saturating_sub(1))
+                    .max(sf);
                 sfz.push_str(&format!(
                     "loop_mode=loop_continuous\nloop_start={sf}\nloop_end={ef}\n"
                 ));
