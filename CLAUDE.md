@@ -975,7 +975,11 @@ finished/looping source), the gain is re-applied there from `AudioPlayer::effect
 `AudioPlayer` mirrors the two values (seeded from `self.audio_volume`/`audio_muted` wherever a
 player is created — `ensure_audio_loaded` + `toggle_audio`). The menu-bar handlers defer through
 `audio_stop`/`audio_mute`/`audio_vol` locals applied after the `MenuBar` closure (it can't
-borrow `self` twice).
+borrow `self` twice). **Master volume scales pad voices too:** a pad voice stores a `base_gain`
+(pad vol · solo/mute · velocity, **no** master) and its live gain is `base_gain ·
+effective_volume()` — set at trigger AND re-applied to every sounding voice by `apply_volume()`,
+so the fader is heard live even on a sustained looping pad (before, the pad gain omitted
+`audio_volume` and only master *mute* reached the pads).
 
 **Sample explorer (a swappable-buffer model).** A tracker module carries a bank of individual
 samples; `AudioPlayer.tracker_samples: Vec<NamedSample>` holds them (`extract_tracker_samples`
@@ -1150,7 +1154,14 @@ tile's right/bottom edge (the drop-target rendered as a "[" — 3 sides — duri
 onscreen keyboard — `trigger_pad` inserts `pad_note(i)` into `note_flash` (red, since it routes to a
 pad), so a click, a keyboard press, and a MIDI note all light the key identically. **`AudioPlayer::trigger_pad_voice`** fires each hit as its own `rodio::Player` on the
 **shared `_stream.mixer()`** (`pad_voices: Vec<PadVoice>`, reaped each frame) — the mixer sums them,
-so pads are **polyphonic** (the base player is monophonic). Feedback (the user's ask): every played
+so pads are **polyphonic** (the base player is monophonic). The firing body is `fire_pad_voice`
+(loop region + full modulation bake + voice), split out of `trigger_pad` (which keeps the
+stop-on-repress / mono / choke guards) so a **live edit can re-fire a sounding loop**:
+`poll_pad_retrigger` (each frame) hashes the drilled-in pad's `Pad::record()` and, when it changes,
+re-fires the loop **on mouse-release** (`pad_edit_sig`/`pad_edit_dirty` + `pad_last_vel[i]` to match
+level) — so tweaking loop range / pitch / filter / envelope is heard **without a manual re-trigger**,
+and a continuous drag doesn't restart the loop every frame. Only the drilled-in pad's own looping
+voice (`pad_has_loop_voice`); the editor player's loop already restarts on selection commit. Feedback (the user's ask): every played
 note lights its keyboard key (`note_flash`) — **red** if it routes to a pad, an accent otherwise — and
 the triggered **pad flashes green**. **Octave lock** (`octave_lock`) keeps the keyboard octave across
 drill-ins **and, while on, auditions a browser-clicked sample at that octave** (`select_sample` takes
@@ -1161,10 +1172,12 @@ kit. **PANIC** (**Shift+Esc**, `audio_panic` → `AudioPlayer::panic`; a bright-
 bar *and* both transport rows) stops all sound + pad voices + MIDI notes, incl. looping pads — the
 truly-global escape hatch (the plain back-to-grid Escape excludes Shift). The whole kit is a
 **persistent cross-file working set** (metadata in `PADS_KEY`, audio in
-`<data>/pads/*.wav`, reloaded in `new()` via `decode_audio`), plus **named kits**: Save/Load + a name
+`<data>/pads/*.wav`, reloaded in `new()` via `decode_audio`), plus **named kits**: New/Save/Load + a name
 field save the kit as a `.pvkit` (a zip — `manifest.txt` storing the kit name + **MIDI controller +
 base/octave + global velocity + every pad's record** + `pad_NN.wav`s; `save_kit`/`load_kit` via the
-`zip` crate). Saved
+`zip` crate). **New** (`new_kit`) clears all 16 pads + removes their persisted WAVs + resets
+name/base/global-velocity to defaults (confirms first via native OK/Cancel when the kit has content,
+since the working set can't be undone; keeps the MIDI connection). Saved
 kits live in `<data>/kits/`. **Places dock sub-tabs are `Local · PixelFX · 16colo · Kits · Samples`**
 (PixelFX is `places_tab == 4`, ordered between Local and 16colo by the button array, *not* by index,
 so 16colo/Kits/Samples keep their indices; Kits/Samples audio-plugin-only): the **PixelFX** tab is the

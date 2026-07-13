@@ -483,7 +483,7 @@ The audio player goes further than playback:
   hardware grid controller), and set per-pad volume, an Ableton-style **pan knob**, **pitch**, **loop
   points**, a **choke group** (1–8; a hi-hat idiom — triggering one pad silences the others in its
   group), an **amplitude ADSR envelope** (attack / decay / sustain / release), and velocity response.
-  Save the working kit as a `.pvkit`, export every pad as a **zip of WAVs**, or export the whole
+  Start a fresh kit with **New**, save the working kit as a `.pvkit`, export every pad as a **zip of WAVs**, or export the whole
   thing as an **SFZ instrument** — a `.sfz` next to a `<name>_samples/` folder of 16-bit WAVs that
   loads in any SFZ-capable sampler or DAW (Bitwig, sforzando, TX16Wx, Kontakt via convert, …). Each
   pad becomes a mapped region carrying its note, volume, pan, pitch, loop (forward/reverse), choke
