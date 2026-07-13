@@ -3715,6 +3715,40 @@ impl PixelView {
         self.status = format!("Loaded kit map {}", short_name(path));
     }
 
+    /// Reset the working kit to a fresh, empty state: 16 empty pads + default name/base/octave/
+    /// velocity. Removes the persisted pad WAVs so the blank kit reloads blank next launch. Keeps
+    /// the MIDI connection (the controller is still plugged in) and drops any pad drill-in. If the
+    /// kit has loaded pads, confirm first — clearing it can't be undone and there's no autosave of
+    /// the *previous* working set (only an explicitly Saved `.pvkit` is recoverable).
+    fn new_kit(&mut self) {
+        let has_content =
+            self.pads.iter().any(|p| !p.is_empty()) || self.kit_name.trim() != "Untitled";
+        if has_content {
+            let ok = rfd::MessageDialog::new()
+                .set_title("New kit")
+                .set_description(
+                    "Clear the current kit? Loaded pads are removed. Save it first if you want to keep it.",
+                )
+                .set_buttons(rfd::MessageButtons::OkCancel)
+                .show();
+            if ok != rfd::MessageDialogResult::Ok {
+                return;
+            }
+        }
+        for i in 0..PAD_COUNT {
+            let _ = std::fs::remove_file(self.pad_wav_path(i));
+        }
+        self.pads = vec![Pad::empty(); PAD_COUNT];
+        self.kit_name = "Untitled".to_string();
+        self.pad_base_note = 48;
+        self.kit_global_vel = false;
+        self.kit_global_vel_amt = 100;
+        // Drop any drill-in / envelope edit so we're not pointed at a now-empty pad.
+        self.edit_focus = EditFocus::Song;
+        self.env_edit = false;
+        self.status = "New kit".into();
+    }
+
     /// Save the whole kit to a `.pvkit` (a zip: `manifest.txt` with the kit name, chosen MIDI
     /// controller, base note, keyboard octave + per-pad records, plus each non-empty pad's WAV).
     /// This is the one true kit format — the Places "Kits" browser and Load… both read it.
@@ -7170,6 +7204,7 @@ impl PixelView {
         let mut rename_cancel = false;
         let mut want_zip = false;
         let mut want_sfz = false;
+        let mut want_new_kit = false;
         let mut want_save_kit = false;
         let mut want_load_kit = false;
         let mut want_drop: Option<(usize, PadDrop)> = None; // a sample dropped onto pad i
@@ -7184,6 +7219,13 @@ impl PixelView {
                     .desired_width(150.0)
                     .hint_text("Untitled"),
             );
+            if ui
+                .button("New")
+                .on_hover_text("Start a fresh, empty kit (clears the current pads)")
+                .clicked()
+            {
+                want_new_kit = true;
+            }
             if ui
                 .button("Save")
                 .on_hover_text("Save this kit to the Kits folder (browsable in Places)")
@@ -7815,6 +7857,9 @@ impl PixelView {
         }
         if want_sfz {
             self.export_sfz();
+        }
+        if want_new_kit {
+            self.new_kit();
         }
         if want_save_kit {
             let name = self.kit_name.clone();
