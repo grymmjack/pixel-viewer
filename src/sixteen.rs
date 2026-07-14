@@ -135,7 +135,7 @@ pub fn fetch_packs(year: u32) -> Result<Vec<Pack>, String> {
             break;
         }
     }
-    packs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    packs.sort_by_key(|a| a.name.to_lowercase());
     write_packs_cache(year, &packs);
     Ok(packs)
 }

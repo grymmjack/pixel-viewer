@@ -46,6 +46,9 @@ pub fn write(_path: &Path, _stars: u8) -> std::io::Result<()> {
 }
 
 /// Parse a Baloo rating value (ASCII `0..10`) into stars (0..=5).
+// Only the cfg(unix) `read` path (and the tests) use this — gate it so a non-unix
+// build doesn't warn it dead.
+#[cfg(any(unix, test))]
 fn parse_value(bytes: &[u8]) -> u8 {
     std::str::from_utf8(bytes)
         .ok()
@@ -55,6 +58,7 @@ fn parse_value(bytes: &[u8]) -> u8 {
 }
 
 /// Encode stars (clamped 0..=5) as the Baloo ASCII value (`stars * 2`).
+#[cfg(any(unix, test))]
 fn encode_stars(stars: u8) -> String {
     (u32::from(stars.min(5)) * 2).to_string()
 }

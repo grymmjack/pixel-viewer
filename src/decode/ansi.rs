@@ -474,14 +474,13 @@ fn parse(data: &[u8], wrap: usize, ice: bool) -> (Vec<Vec<Cell>>, usize) {
                         }
                     }
                     // Clear screen (ESC[2J) — restart the grid at the origin.
-                    b'J' => {
-                        if nums.first().copied() == Some(2) {
+                    b'J'
+                        if nums.first().copied() == Some(2) => {
                             grid.clear();
                             x = 0;
                             y = 0;
                             max_y = 0; // a clear restarts the screen extent
                         }
-                    }
                     _ => {}
                 }
                 i = j + 1;

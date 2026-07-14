@@ -29,9 +29,11 @@ embedded CP437 VGA font), and the binary scene formats **XBin** (`.xb`/`.xbin`),
 SAUCE-driven hints, shown in the Details pane. Also **source code + text** (~90 exts: rs,
 c/cpp/h, py, js/ts, css, html, php, lua, asm, gd, json, yaml, md, log, … — rasterized with
 the CP437 font + a lean hand-rolled syntax highlighter, `decode/code.rs`), **PDF**
-(`decode/pdf.rs`: the tile is the **real first page** rendered via poppler's `pdftoppm` —
-PDF on stdin, PNG on stdout — falling back to a labeled placeholder if poppler is absent;
-page-count/size/title/author metadata via pure-Rust `lopdf`), and **audio**
+(`decode/pdf.rs`: the tile is the **real first page**, rendered in-process by **pdfium**
+(`pdfium-render`, a bundled `pdfium.dll` on Windows — no external tool, thread-safe for the
+thumbnailer), then falling back to poppler's `pdftoppm` (PDF on stdin, PNG on stdout), then a
+labeled placeholder if neither is available; page-count/size/title/author metadata via pure-Rust
+`lopdf`), and **audio**
 (`decode/audio.rs`: a real waveform tile for mp3/wav/ogg/flac/**aiff** via `symphonia` — AIFF
 needs the `aiff` feature on symphonia + `symphonia-aiff` on rodio, else `.aif` decoded to a flat
 silent buffer; symphonia's AIFF reader also **over-reads** (SSND size not minus its 8-byte
@@ -125,9 +127,12 @@ vendor/libxmp/       vendored libxmp 4.6.3 source (MIT) — src/ + include/ + li
                      line-number gutter, tab expand, UTF-8→CP437, line+cell budget). `CODE_EXTS`
                      re-exported; registry routes code exts to `decode_ext(bytes, ext)`. ipynb
                      flattens to highlighted Python. Zero heavy deps (no syntect).
-    pdf.rs           .pdf — the tile is the REAL first page via `render_first_page` (poppler
-                     `pdftoppm`: PDF→stdin, PNG→stdout, decoded by the image crate; stdin fed
-                     from a thread to avoid pipe deadlock), else a labeled placeholder. Metadata
+    pdf.rs           .pdf — the tile is the REAL first page via `render_page`. Tries in-process
+                     **pdfium** first (`pdfium-render`; `pdfium_instance` lazily loads the lib next
+                     to the exe / `PDFIUM_DYNAMIC_LIB_PATH` / system — Windows ships a bundled
+                     `vendor/pdfium/win-x64/pdfium.dll`, copied beside the exe by build.rs), then
+                     poppler `pdftoppm` (PDF→stdin, PNG→stdout, stdin fed from a thread to avoid
+                     pipe deadlock), else a labeled placeholder. Metadata
                      (page count / MediaBox size / /Info title+author) via `lopdf`; `pdf_meta`/
                      `PdfMeta` feed the Details pane.
     audio.rs         audio → waveform tile (mp3/wav/ogg/flac via `symphonia`: decode → peak
@@ -185,6 +190,15 @@ First-time eframe/winit system deps on Debian/KDE:
 ```sh
 sudo apt-get install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libasound2-dev
 ```
+
+**Windows (MSVC) build.** Builds with the standard MSVC toolchain — no extra setup. Three
+platform gotchas are already handled: (1) the `xattr` crate is Unix-only, so it's a
+`[target.'cfg(unix)'.dependencies]` entry and `rating.rs` `#[cfg(unix)]`-gates it (Windows ratings
+go through the `ratings.json` sidecar); (2) `build.rs` links libm (`m`) only off-Windows (MSVC has
+no `m.lib` — math is in the CRT); (3) PDFs render via a **bundled `pdfium.dll`** (`vendor/pdfium/
+win-x64`, copied beside the exe by `build.rs`) so poppler isn't needed. NB `cargo`/`cargo test`
+must be run from **PowerShell**, not the Git-Bash shell — Git Bash's `/usr/bin/link.exe` (a GNU
+hardlink util) shadows MSVC's real `link.exe` and fails linking with LNK1181.
 
 ## Architecture: the big picture
 

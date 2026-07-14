@@ -3945,7 +3945,7 @@ impl PixelView {
                 }
             }
             // Decode each pad's WAV from the zip (decode_audio takes the bytes + an ext hint).
-            for i in 0..PAD_COUNT {
+            for (i, pad) in pads.iter_mut().enumerate() {
                 let mut bytes = Vec::new();
                 let ok = zip
                     .by_name(&format!("pad_{i:02}.wav"))
@@ -3956,7 +3956,7 @@ impl PixelView {
                     if let Ok(d) =
                         decode_audio(Path::new("pad.wav"), std::mem::take(&mut bytes), None)
                     {
-                        pads[i].buf = Some(std::sync::Arc::new(SampleBuf {
+                        pad.buf = Some(std::sync::Arc::new(SampleBuf {
                             samples: d.samples,
                             channels: d.channels,
                             sample_rate: d.sample_rate,
@@ -3966,7 +3966,7 @@ impl PixelView {
                         }));
                     }
                 } else {
-                    pads[i].buf = None; // manifest said audio but the WAV is missing → empty
+                    pad.buf = None; // manifest said audio but the WAV is missing → empty
                 }
             }
             Ok(KitManifest {
@@ -4770,6 +4770,7 @@ impl PixelView {
     /// - detected **transient** onsets — but only when the Transients display is on AND the
     ///   sensitivity slider is above zero (all the way left = "off");
     /// - the **Musical** beat-division grid lines (whole…32nd from BPM), when Musical is on.
+    ///
     /// So dragging the Transients sensitivity to zero drops the transients, and if Musical is on it
     /// takes over as the snap/slice grid (e.g. middle-click a quarter-note's worth).
     fn snap_boundaries(&self, dur: f32) -> Vec<f32> {
@@ -5442,7 +5443,7 @@ impl PixelView {
             let env_editing = big && self.env_edit && matches!(self.edit_focus, EditFocus::Pad(_));
             let sr = ap.sample_rate.get() as f32;
             let ch = ap.channels.get() as usize;
-            let nframes = if ch > 0 { ap.samples.len() / ch } else { 0 };
+            let nframes = ap.samples.len().checked_div(ch).unwrap_or(0);
             // Recompute transient onset marks when needed (buffer or sensitivity changed). Marks
             // are needed both to DRAW guidelines (Transients) and to SNAP selections / middle-click
             // slice (snap_transient), so compute them if either is on.
@@ -5770,7 +5771,7 @@ impl PixelView {
             p.hline(
                 rect.x_range(),
                 mid,
-                egui::Stroke::new(1.0, accent.gamma_multiply(0.32)),
+                egui::Stroke::new(1.0_f32, accent.gamma_multiply(0.32)),
             );
             let cols = w as usize;
             let np = ap.peaks.len().max(1);
@@ -5811,7 +5812,7 @@ impl PixelView {
                 };
                 p.line_segment(
                     [egui::pos2(x, mid - half), egui::pos2(x, mid + half)],
-                    egui::Stroke::new(1.0, col),
+                    egui::Stroke::new(1.0_f32, col),
                 );
             }
             // Musical (beat-division) grid — faint blue lines under everything else (item 10).
@@ -5823,7 +5824,7 @@ impl PixelView {
                     let mut g = (vs / step).floor() * step;
                     while g <= ve {
                         if g >= vs {
-                            p.vline(x_of(g), rect.y_range(), egui::Stroke::new(1.0, gcol));
+                            p.vline(x_of(g), rect.y_range(), egui::Stroke::new(1.0_f32, gcol));
                         }
                         g += step;
                     }
@@ -5840,7 +5841,7 @@ impl PixelView {
                     if m >= vs && m <= ve {
                         let mx = x_of(m);
                         if mx - last_x >= 4.0 {
-                            p.vline(mx, rect.y_range(), egui::Stroke::new(1.0, tcol));
+                            p.vline(mx, rect.y_range(), egui::Stroke::new(1.0_f32, tcol));
                             last_x = mx;
                         }
                     }
@@ -5861,9 +5862,9 @@ impl PixelView {
                 for (e, et, tag) in [(Edge::Left, draw_lo, "S"), (Edge::Right, draw_hi, "E")] {
                     if et >= vs - 1e-6 && et <= ve + 1e-6 {
                         let (col, wdt) = if hot(e) {
-                            (GREEN_HOT, 2.5)
+                            (GREEN_HOT, 2.5_f32)
                         } else {
-                            (GREEN, 1.5)
+                            (GREEN, 1.5_f32)
                         };
                         let ex = x_of(et);
                         p.vline(ex, rect.y_range(), egui::Stroke::new(wdt, col));
@@ -5890,7 +5891,7 @@ impl PixelView {
                     p.vline(
                         x,
                         rect.y_range(),
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 215, 120)),
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(90, 215, 120)),
                     );
                 }
             }
@@ -5900,7 +5901,7 @@ impl PixelView {
                 if pf >= vs - 1e-6 && pf <= ve + 1e-6 {
                     let neon = egui::Color32::from_rgb(57, 255, 20);
                     let px = x_of(pf);
-                    p.vline(px, rect.y_range(), egui::Stroke::new(1.5, neon));
+                    p.vline(px, rect.y_range(), egui::Stroke::new(1.5_f32, neon));
                     p.text(
                         egui::pos2(px + 3.0, rect.top() + 2.0),
                         egui::Align2::LEFT_TOP,
@@ -5915,7 +5916,7 @@ impl PixelView {
                 p.vline(
                     x_of(pos),
                     rect.y_range(),
-                    egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 224, 130)),
+                    egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 224, 130)),
                 );
             }
             // Live pad-voice playheads — while drilled into a pad, a marker sweeps left→right for
@@ -5933,7 +5934,7 @@ impl PixelView {
                             x_of(pt),
                             rect.y_range(),
                             egui::Stroke::new(
-                                2.0,
+                                2.0_f32,
                                 egui::Color32::from_rgba_unmultiplied(90, 240, 170, alpha),
                             ),
                         );
@@ -5954,7 +5955,7 @@ impl PixelView {
                             let mut g = (vs / step).floor() * step;
                             while g <= ve {
                                 if g >= vs {
-                                    p.vline(x_of(g), rect.y_range(), egui::Stroke::new(1.0, gcol));
+                                    p.vline(x_of(g), rect.y_range(), egui::Stroke::new(1.0_f32, gcol));
                                 }
                                 g += step;
                             }
@@ -6029,7 +6030,7 @@ impl PixelView {
                             }
                             p.add(egui::Shape::line(
                                 line,
-                                egui::Stroke::new(1.5, ot.color().gamma_multiply(0.32)),
+                                egui::Stroke::new(1.5_f32, ot.color().gamma_multiply(0.32)),
                             ));
                         }
                     }
@@ -6048,7 +6049,7 @@ impl PixelView {
                         // Foreground contour (full opacity, editable).
                         p.add(egui::Shape::line(
                             build_contour(&[a, d, s, rel, ca, cd, cr, rend]),
-                            egui::Stroke::new(2.0, env_col),
+                            egui::Stroke::new(2.0_f32, env_col),
                         ));
                         // ---- Node handles (circles): attack (X), decay+sustain (X·Y), release-start (X),
                         // release-END/gate (X). Allocated on top of the waveform so a grab claims the
@@ -6066,7 +6067,7 @@ impl PixelView {
                             p.circle_stroke(
                                 center,
                                 if hot { hr + 1.5 } else { hr },
-                                egui::Stroke::new(1.5, egui::Color32::from_gray(20)),
+                                egui::Stroke::new(1.5_f32, egui::Color32::from_gray(20)),
                             );
                             if hresp.dragged() {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -6113,7 +6114,7 @@ impl PixelView {
                                     egui::pos2(center.x - sz, center.y),
                                 ],
                                 curve_col,
-                                egui::Stroke::new(1.0, egui::Color32::from_gray(20)),
+                                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(20)),
                             ));
                             if hresp.dragged() {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
@@ -6195,7 +6196,7 @@ impl PixelView {
                                 }
                             }
                         }
-                        p.add(egui::Shape::line(contour, egui::Stroke::new(2.0, env_col)));
+                        p.add(egui::Shape::line(contour, egui::Stroke::new(2.0_f32, env_col)));
                         // Node handles (drag to move; right-click deletes, keeping ≥2).
                         let ptr = ui.input(|inp| inp.pointer.latest_pos());
                         for (idx, pt) in pts.iter().enumerate() {
@@ -6209,7 +6210,7 @@ impl PixelView {
                             p.circle_stroke(
                                 center,
                                 if hot { 6.5 } else { 5.0 },
-                                egui::Stroke::new(1.5, egui::Color32::from_gray(20)),
+                                egui::Stroke::new(1.5_f32, egui::Color32::from_gray(20)),
                             );
                             if hresp.dragged() {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -6253,7 +6254,7 @@ impl PixelView {
                                     egui::pos2(center.x - sz, center.y),
                                 ],
                                 env_col.gamma_multiply(0.7),
-                                egui::Stroke::new(1.0, egui::Color32::from_gray(20)),
+                                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(20)),
                             ));
                             if hresp.dragged() {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
@@ -6305,7 +6306,7 @@ impl PixelView {
                         }
                         p.add(egui::Shape::line(
                             pts,
-                            egui::Stroke::new(1.0, env_col.gamma_multiply(0.5)),
+                            egui::Stroke::new(1.0_f32, env_col.gamma_multiply(0.5)),
                         ));
                     }
                 }
@@ -6358,7 +6359,7 @@ impl PixelView {
                     p.rect_stroke(
                         ir,
                         3.0,
-                        egui::Stroke::new(1.0, GREEN),
+                        egui::Stroke::new(1.0_f32, GREEN),
                         egui::StrokeKind::Inside,
                     );
                     let iw = ir.width().max(1.0);
@@ -6366,7 +6367,7 @@ impl PixelView {
                     p.hline(
                         ir.x_range(),
                         imid,
-                        egui::Stroke::new(1.0, accent.gamma_multiply(0.3)),
+                        egui::Stroke::new(1.0_f32, accent.gamma_multiply(0.3)),
                     );
                     for cx in 0..(iw as usize) {
                         let f0 = (ws + (cx as f32 / iw) * span_f) as usize;
@@ -6385,7 +6386,7 @@ impl PixelView {
                         let x = ir.left() + cx as f32;
                         p.line_segment(
                             [egui::pos2(x, imid - hh), egui::pos2(x, imid + hh)],
-                            egui::Stroke::new(1.0, accent),
+                            egui::Stroke::new(1.0_f32, accent),
                         );
                     }
                     // The OTHER selection edge, if it falls inside the magnified window (so when
@@ -6394,12 +6395,12 @@ impl PixelView {
                         let other_f = (if edge == Edge::Left { draw_hi } else { draw_lo }) * sr;
                         if other_f >= ws && other_f <= we {
                             let ox = ir.left() + ((other_f - ws) / span_f).clamp(0.0, 1.0) * iw;
-                            p.vline(ox, ir.y_range(), egui::Stroke::new(1.5, GREEN));
+                            p.vline(ox, ir.y_range(), egui::Stroke::new(1.5_f32, GREEN));
                         }
                     }
                     // The edge itself, centered-ish, in bright green.
                     let ex = ir.left() + ((ef - ws) / span_f).clamp(0.0, 1.0) * iw;
-                    p.vline(ex, ir.y_range(), egui::Stroke::new(1.5, GREEN_HOT));
+                    p.vline(ex, ir.y_range(), egui::Stroke::new(1.5_f32, GREEN_HOT));
                     p.text(
                         ir.left_top() + egui::vec2(4.0, 2.0),
                         egui::Align2::LEFT_TOP,
@@ -6637,7 +6638,7 @@ impl PixelView {
                         dr.center().x,
                         dr.y_range(),
                         egui::Stroke::new(
-                            if active { 2.0 } else { 1.0 },
+                            if active { 2.0_f32 } else { 1.0_f32 },
                             if active {
                                 ui.visuals().strong_text_color()
                             } else {
@@ -6909,7 +6910,7 @@ impl PixelView {
             if save {
                 if let Some(p) = rfd::FileDialog::new()
                     .add_filter("kit map", &["pvmap"])
-                    .set_file_name(&format!("{}.pvmap", sanitize_filename(&self.kit_name)))
+                    .set_file_name(format!("{}.pvmap", sanitize_filename(&self.kit_name)))
                     .save_file()
                 {
                     self.save_kit_map(&p);
@@ -6932,6 +6933,7 @@ impl PixelView {
 
     /// The onscreen-keyboard section (octave row + piano + MIDI-in picker). Collects its actions
     /// into the caller's `want_*`; shared by the big + compact players so it isn't duplicated.
+    #[allow(clippy::too_many_arguments)]
     fn audio_keyboard_section(
         &mut self,
         ui: &mut egui::Ui,
@@ -7079,7 +7081,7 @@ impl PixelView {
                     && self
                         .audio_player
                         .as_ref()
-                        .map_or(true, |ap| ap.tracker_samples.is_empty())))
+                        .is_none_or(|ap| ap.tracker_samples.is_empty())))
     }
 
     /// The tracker sample explorer list (click to load into the editor, ⬇ to export a WAV).
@@ -7095,6 +7097,7 @@ impl PixelView {
         // in the standalone kit editor OR the normal audio view: click a row to drill the editor
         // into that pad, hover to see its source path.
         if big && self.pad_list_visible() {
+            #[allow(clippy::type_complexity)]
             let pads: Vec<(String, Option<String>, bool, Option<[u8; 3]>)> = self
                 .pads
                 .iter()
@@ -7189,7 +7192,7 @@ impl PixelView {
                 ui.painter().rect_stroke(
                     sa.inner_rect,
                     3.0,
-                    egui::Stroke::new(2.0, egui::Color32::from_rgb(120, 170, 235)),
+                    egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(120, 170, 235)),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -7490,22 +7493,22 @@ impl PixelView {
                         );
                     }
                     let border = if clone_hover {
-                        egui::Stroke::new(2.5, egui::Color32::from_rgb(120, 230, 140))
+                        egui::Stroke::new(2.5_f32, egui::Color32::from_rgb(120, 230, 140))
                     // clone (Alt)
                     } else if drop_hover {
-                        egui::Stroke::new(2.5, egui::Color32::from_rgb(90, 180, 255))
+                        egui::Stroke::new(2.5_f32, egui::Color32::from_rgb(90, 180, 255))
                     // drop target
                     } else if assigning {
-                        egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 190, 70))
+                        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(240, 190, 70))
                     // MIDI-learn
                     } else if soloed {
-                        egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 220, 110))
+                        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(80, 220, 110))
                     // solo = green
                     } else if muted {
-                        egui::Stroke::new(2.0, egui::Color32::from_rgb(225, 70, 70))
+                        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(225, 70, 70))
                     // mute = red
                     } else {
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(72))
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(72))
                     };
                     // Defer the border to a second pass (drawn over all tile backgrounds).
                     tile_borders.push((rect, border));
@@ -7543,11 +7546,11 @@ impl PixelView {
                                     let col = egui::Color32::from_rgb(c[0], c[1], c[2]);
                                     ui.painter().rect_filled(cr, 0.0, col);
                                     let outline = if color == Some(c) {
-                                        egui::Stroke::new(2.0, egui::Color32::WHITE)
+                                        egui::Stroke::new(2.0_f32, egui::Color32::WHITE)
                                     } else if cresp.hovered() {
-                                        egui::Stroke::new(1.0, egui::Color32::WHITE)
+                                        egui::Stroke::new(1.0_f32, egui::Color32::WHITE)
                                     } else {
-                                        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(70))
+                                        egui::Stroke::new(1.0_f32, egui::Color32::from_black_alpha(70))
                                     };
                                     ui.painter().rect_stroke(
                                         cr,
@@ -9503,11 +9506,11 @@ impl PixelView {
                             let col = egui::Color32::from_rgb(c[0], c[1], c[2]);
                             ui.painter().rect_filled(rect, 0.0, col); // 0 radius = square
                             let outline = if color == Some(c) {
-                                egui::Stroke::new(2.0, egui::Color32::WHITE)
+                                egui::Stroke::new(2.0_f32, egui::Color32::WHITE)
                             } else if resp.hovered() {
-                                egui::Stroke::new(1.0, egui::Color32::WHITE)
+                                egui::Stroke::new(1.0_f32, egui::Color32::WHITE)
                             } else {
-                                egui::Stroke::new(1.0, egui::Color32::from_black_alpha(70))
+                                egui::Stroke::new(1.0_f32, egui::Color32::from_black_alpha(70))
                             };
                             ui.painter()
                                 .rect_stroke(rect, 0.0, outline, egui::StrokeKind::Inside);
@@ -11078,7 +11081,7 @@ impl PixelView {
                             ui.painter().rect_stroke(
                                 r,
                                 2.0,
-                                egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+                                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)),
                                 egui::StrokeKind::Inside,
                             );
                             let resp = resp.on_hover_text(format!(
@@ -11594,7 +11597,7 @@ impl PixelView {
                                     ui.painter().hline(
                                         first.x_range(),
                                         line_y,
-                                        egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
+                                        egui::Stroke::new(2.0_f32, ui.visuals().selection.bg_fill),
                                     );
                                     if released {
                                         let mut v: Vec<OpKind> = a.order.to_vec();
@@ -12796,12 +12799,12 @@ impl PixelView {
                         // not one continuous row. Drawn last so it sits over the thumbnail edges.
                         if self.grid_tile_border {
                             let stroke = if is_selected {
-                                egui::Stroke::new(1.5, ui.visuals().selection.stroke.color)
+                                egui::Stroke::new(1.5_f32, ui.visuals().selection.stroke.color)
                             } else if resp.hovered() {
-                                egui::Stroke::new(1.0, ui.visuals().widgets.hovered.bg_stroke.color)
+                                egui::Stroke::new(1.0_f32, ui.visuals().widgets.hovered.bg_stroke.color)
                             } else {
                                 egui::Stroke::new(
-                                    1.0,
+                                    1.0_f32,
                                     ui.visuals().widgets.noninteractive.bg_stroke.color,
                                 )
                             };
@@ -12996,7 +12999,7 @@ impl PixelView {
                                  // theme-agnostic translucent grey so it reads on both light and dark.
         let grid_lines = self.table_grid;
         let divider = egui::Stroke::new(
-            1.0,
+            1.0_f32,
             egui::Color32::from_rgba_unmultiplied(128, 128, 128, 46),
         );
 
@@ -13366,7 +13369,7 @@ impl PixelView {
                         hrect.center().x,
                         hrect.y_range(),
                         egui::Stroke::new(
-                            1.0,
+                            1.0_f32,
                             if hot {
                                 ui.visuals().strong_text_color()
                             } else {
@@ -13399,7 +13402,7 @@ impl PixelView {
                     ui.painter().vline(
                         line_x,
                         yr,
-                        egui::Stroke::new(2.0, ui.visuals().strong_text_color()),
+                        egui::Stroke::new(2.0_f32, ui.visuals().strong_text_color()),
                     );
                 }
             }
@@ -13641,7 +13644,7 @@ impl PixelView {
                                             egui::pos2(tp.x, uy),
                                             egui::pos2(tp.x + galley.size().x, uy),
                                         ],
-                                        egui::Stroke::new(1.0, col),
+                                        egui::Stroke::new(1.0_f32, col),
                                     );
                                 }
                                 if resp.hovered() && (linkable || name_link) {
@@ -14225,7 +14228,7 @@ impl PixelView {
                             }
                             // The slider already shows the byte position, so don't repeat it:
                             // just the percent and total size (baud is the picker to the left).
-                            let pct = if len > 0 { p.pos * 100 / len } else { 100 };
+                            let pct = (p.pos * 100).checked_div(len).unwrap_or(100);
                             ui.label(format!("{pct}%  ·  {}", human_size(len as u64)));
                         });
                     }
@@ -14851,7 +14854,7 @@ impl PixelView {
             painter.rect_stroke(
                 r,
                 0.0,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)),
                 egui::StrokeKind::Inside,
             );
             // Visible region in image-normalized coords → the box on the minimap.
@@ -14866,7 +14869,7 @@ impl PixelView {
             painter.rect_stroke(
                 box_rect,
                 0.0,
-                egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 64, 64)),
+                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 64, 64)),
                 egui::StrokeKind::Inside,
             );
         }
@@ -15255,7 +15258,7 @@ impl PixelView {
         painter.rect_stroke(
             rect,
             8.0,
-            egui::Stroke::new(1.0, white(40.0)),
+            egui::Stroke::new(1.0_f32, white(40.0)),
             egui::StrokeKind::Inside,
         );
 
@@ -15279,7 +15282,7 @@ impl PixelView {
                 tp.hline(
                     abs.x_range(),
                     abs.bottom() - 2.0,
-                    egui::Stroke::new(1.0, white(220.0)),
+                    egui::Stroke::new(1.0_f32, white(220.0)),
                 );
             }
             links.push((abs, t));
@@ -16400,7 +16403,7 @@ impl PixelView {
                                 r.center(),
                                 6.5,
                                 egui::Stroke::new(
-                                    1.5,
+                                    1.5_f32,
                                     egui::Color32::from_rgba_unmultiplied(90, 255, 130, 110),
                                 ),
                             );
@@ -16850,12 +16853,12 @@ impl PixelView {
                                             let col = egui::Color32::from_rgb(c[0], c[1], c[2]);
                                             ui.painter().rect_filled(rect, 0.0, col);
                                             let outline = if *color == Some(c) {
-                                                egui::Stroke::new(2.0, egui::Color32::WHITE)
+                                                egui::Stroke::new(2.0_f32, egui::Color32::WHITE)
                                             } else if resp.hovered() {
-                                                egui::Stroke::new(1.0, egui::Color32::WHITE)
+                                                egui::Stroke::new(1.0_f32, egui::Color32::WHITE)
                                             } else {
                                                 egui::Stroke::new(
-                                                    1.0,
+                                                    1.0_f32,
                                                     egui::Color32::from_black_alpha(70),
                                                 )
                                             };
@@ -17017,7 +17020,7 @@ impl PixelView {
                                 ui.painter().rect_stroke(
                                     sa.inner_rect,
                                     3.0,
-                                    egui::Stroke::new(2.0, egui::Color32::from_rgb(120, 170, 235)),
+                                    egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(120, 170, 235)),
                                     egui::StrokeKind::Inside,
                                 );
                             }
@@ -18686,11 +18689,11 @@ fn ansi32_swatch_grid(
                 ui.painter()
                     .rect_filled(rect, 0.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
                 let outline = if current == Some(c) {
-                    egui::Stroke::new(2.0, egui::Color32::WHITE)
+                    egui::Stroke::new(2.0_f32, egui::Color32::WHITE)
                 } else if resp.hovered() {
-                    egui::Stroke::new(1.0, egui::Color32::WHITE)
+                    egui::Stroke::new(1.0_f32, egui::Color32::WHITE)
                 } else {
-                    egui::Stroke::new(1.0, egui::Color32::from_black_alpha(70))
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_black_alpha(70))
                 };
                 ui.painter()
                     .rect_stroke(rect, 0.0, outline, egui::StrokeKind::Inside);
@@ -22485,7 +22488,7 @@ fn pan_knob(ui: &mut egui::Ui, pan: &mut f32, diameter: f32) -> egui::Response {
     } else {
         egui::Color32::from_gray(95)
     };
-    painter.circle_stroke(c, r, egui::Stroke::new(1.0, rim));
+    painter.circle_stroke(c, r, egui::Stroke::new(1.0_f32, rim));
     // Angle: 0 = straight up (−y), swings ±135° (0.75π) with pan. Screen point on the rim.
     let ang = p * 0.75 * std::f32::consts::PI;
     let (sa, ca) = ang.sin_cos();
@@ -22499,13 +22502,13 @@ fn pan_knob(ui: &mut egui::Ui, pan: &mut f32, diameter: f32) -> egui::Response {
         let a = ang * t;
         let (s2, c2) = a.sin_cos();
         let pt = egui::pos2(c.x + r * s2, c.y - r * c2);
-        painter.line_segment([prev, pt], egui::Stroke::new(2.0, accent));
+        painter.line_segment([prev, pt], egui::Stroke::new(2.0_f32, accent));
         prev = pt;
     }
     // Pointer line from center to the rim.
     painter.line_segment(
         [c, tip],
-        egui::Stroke::new(2.0, egui::Color32::from_gray(230)),
+        egui::Stroke::new(2.0_f32, egui::Color32::from_gray(230)),
     );
     painter.circle_filled(c, 1.6, egui::Color32::from_gray(200));
     let label = if p.abs() < 1e-3 {
@@ -23728,7 +23731,7 @@ fn piano_keyboard(
     let ww = rect.width() / (7 * n_oct) as f32;
     let lit = |semi: i32| highlights.iter().find(|(s, _)| *s == semi).map(|(_, c)| *c);
     let pad_of = |semi: i32| pad_keys.iter().find(|(s, _)| *s == semi).map(|(_, c)| *c);
-    let border = egui::Stroke::new(1.0, egui::Color32::from_gray(60));
+    let border = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60));
     let mut picked = None;
     let mut hovered = None;
     // Little pad chip on a mapped key (top of the key so it clears the letter label at the bottom).
@@ -23743,7 +23746,7 @@ fn piano_keyboard(
             cr,
             1.5,
             egui::Stroke::new(
-                1.0,
+                1.0_f32,
                 if dark_key {
                     egui::Color32::from_gray(230)
                 } else {
@@ -24877,9 +24880,23 @@ fn fmt_time(t: SystemTime) -> String {
     }
 }
 
-/// The user's home directory, if `$HOME` is set.
+/// The user's home directory. `$HOME` on Unix; Windows doesn't set it, so fall back to
+/// `%USERPROFILE%` (then the `%HOMEDRIVE%%HOMEPATH%` pair) there.
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    if let Some(h) = std::env::var_os("HOME") {
+        return Some(PathBuf::from(h));
+    }
+    if let Some(p) = std::env::var_os("USERPROFILE") {
+        return Some(PathBuf::from(p));
+    }
+    match (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH")) {
+        (Some(drive), Some(path)) => {
+            let mut s = drive;
+            s.push(path);
+            Some(PathBuf::from(s))
+        }
+        _ => None,
+    }
 }
 
 /// True for dotfiles / hidden entries.
@@ -25074,7 +25091,7 @@ fn paint_spinner(p: &egui::Painter, c: egui::Pos2, r: f32, t: f64, color: egui::
         .collect();
     p.add(egui::Shape::line(
         pts,
-        egui::Stroke::new((r * 0.18).max(1.5), color),
+        egui::Stroke::new((r * 0.18).max(1.5_f32), color),
     ));
 }
 
@@ -25086,7 +25103,7 @@ fn paint_check_badge(p: &egui::Painter, c: egui::Pos2, r: f32) {
     p.circle_stroke(
         c,
         r,
-        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(130)),
+        egui::Stroke::new(1.0_f32, egui::Color32::from_black_alpha(130)),
     );
     let s = egui::Stroke::new((r * 0.30).max(1.5), egui::Color32::WHITE);
     let a = c + egui::vec2(-r * 0.42, r * 0.02);

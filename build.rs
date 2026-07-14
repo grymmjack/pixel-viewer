@@ -56,4 +56,34 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=vendor/libxmp/src");
     println!("cargo:rerun-if-changed=vendor/libxmp/cmake/libxmp-sources.cmake");
+
+    copy_pdfium_next_to_exe();
+}
+
+/// The Windows build renders PDFs in-process via a bundled `pdfium.dll` (loaded dynamically
+/// at runtime — see `decode/pdf.rs`). pdfium looks for its library next to the executable, so
+/// copy the vendored DLL from `vendor/pdfium/win-x64/` into the target profile dir (and its
+/// `deps/` subdir, where the test binaries live). No-op on other platforms — they fall back to
+/// poppler's `pdftoppm`.
+fn copy_pdfium_next_to_exe() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let src = Path::new("vendor/pdfium/win-x64/pdfium.dll");
+    println!("cargo:rerun-if-changed=vendor/pdfium/win-x64/pdfium.dll");
+    if !src.is_file() {
+        return;
+    }
+    // OUT_DIR = target/<profile>/build/<pkg>-<hash>/out → up 3 = target/<profile>.
+    let Ok(out) = std::env::var("OUT_DIR") else {
+        return;
+    };
+    let Some(profile_dir) = Path::new(&out).ancestors().nth(3) else {
+        return;
+    };
+    let _ = std::fs::copy(src, profile_dir.join("pdfium.dll"));
+    let deps = profile_dir.join("deps");
+    if deps.is_dir() {
+        let _ = std::fs::copy(src, deps.join("pdfium.dll"));
+    }
 }

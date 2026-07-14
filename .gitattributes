@@ -1,0 +1,4 @@
+# Treat the bundled pdfium library as binary so it is never line-ending-normalized
+# (CRLF conversion would corrupt the DLL). See decode/pdf.rs + build.rs.
+*.dll binary
+vendor/pdfium/** -text

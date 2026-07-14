@@ -290,10 +290,91 @@ fn render_first_page(bytes: &[u8]) -> Option<PixImage> {
     render_page(bytes, 1, 1100)
 }
 
-/// Render one PDF page (1-based) to a raster via `pdftoppm` (poppler): PDF on stdin, PNG on
-/// stdout — no temp file, no bundled lib. `scale_to` sets the longest side in px. `None` if
-/// pdftoppm is absent or errors. Backs both the grid tile and the in-app multi-page viewer.
+/// Render one PDF page (1-based) to a raster. `scale_to` sets the longest side in px. Tries,
+/// in order: in-process **pdfium** (bundled `pdfium.dll` on Windows — no external tool, no
+/// console flash, works even in a folder full of PDFs), then poppler's **`pdftoppm`** (the
+/// portable Unix path), else `None` so the caller shows a labeled placeholder tile. Backs both
+/// the grid tile and the in-app multi-page viewer.
 pub fn render_page(bytes: &[u8], page: usize, scale_to: u32) -> Option<PixImage> {
+    if let Some(img) = render_via_pdfium(bytes, page, scale_to) {
+        return Some(img);
+    }
+    render_via_pdftoppm(bytes, page, scale_to)
+}
+
+/// The lazily-loaded, process-wide pdfium instance (`None` if the library can't be found).
+/// The `thread_safe` feature makes `Pdfium` `Send + Sync`, so a single instance is shared by
+/// the multithreaded thumbnailer. Searched: next to the exe (where `build.rs` copies the
+/// bundled DLL), the exe's parent (covers `target/<profile>/deps/` test binaries), the
+/// `PDFIUM_DYNAMIC_LIB_PATH` override, then any system-installed pdfium.
+fn pdfium_instance() -> Option<&'static pdfium_render::prelude::Pdfium> {
+    use pdfium_render::prelude::*;
+    use std::sync::OnceLock;
+    static PDFIUM: OnceLock<Option<Pdfium>> = OnceLock::new();
+    PDFIUM
+        .get_or_init(|| {
+            for candidate in pdfium_lib_candidates() {
+                if let Ok(bindings) = Pdfium::bind_to_library(&candidate) {
+                    return Some(Pdfium::new(bindings));
+                }
+            }
+            Pdfium::bind_to_system_library().ok().map(Pdfium::new)
+        })
+        .as_ref()
+}
+
+fn pdfium_lib_candidates() -> Vec<std::path::PathBuf> {
+    use pdfium_render::prelude::*;
+    let mut v = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            v.push(Pdfium::pdfium_platform_library_name_at_path(&dir));
+            if let Some(up) = dir.parent() {
+                v.push(Pdfium::pdfium_platform_library_name_at_path(&up));
+            }
+        }
+    }
+    if let Ok(p) = std::env::var("PDFIUM_DYNAMIC_LIB_PATH") {
+        let pb = std::path::PathBuf::from(&p);
+        if pb.is_dir() {
+            v.push(Pdfium::pdfium_platform_library_name_at_path(&pb));
+        } else {
+            v.push(pb);
+        }
+    }
+    v
+}
+
+fn render_via_pdfium(bytes: &[u8], page: usize, scale_to: u32) -> Option<PixImage> {
+    use pdfium_render::prelude::*;
+    let pdfium = pdfium_instance()?;
+    let doc = pdfium.load_pdf_from_byte_slice(bytes, None).ok()?;
+    let index = (page.max(1) - 1) as i32;
+    let pdf_page = doc.pages().get(index).ok()?;
+    let wpt = pdf_page.width().value.max(1.0);
+    let hpt = pdf_page.height().value.max(1.0);
+    let factor = (scale_to.max(64) as f32 / wpt.max(hpt)).clamp(0.02, 20.0);
+    let config = PdfRenderConfig::new().scale_page_by_factor(factor);
+    let bitmap = pdf_page.render_with_config(&config).ok()?;
+    let img = bitmap.as_image().ok()?.into_rgba8();
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let px: Vec<[u8; 4]> = img
+        .into_raw()
+        .chunks_exact(4)
+        .map(|c| [c[0], c[1], c[2], c[3]])
+        .collect();
+    if px.len() != (w * h) as usize {
+        return None;
+    }
+    Some(PixImage::from_rgba(w, h, px))
+}
+
+/// Render via poppler's `pdftoppm`: PDF on stdin, PNG on stdout — no temp file, no bundled lib.
+/// `None` if pdftoppm is absent or errors.
+fn render_via_pdftoppm(bytes: &[u8], page: usize, scale_to: u32) -> Option<PixImage> {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let pg = page.max(1).to_string();
@@ -397,5 +478,25 @@ mod tests {
     fn utf16_title_decodes() {
         let raw = [0xFE, 0xFF, 0x00, b'H', 0x00, b'i'];
         assert_eq!(decode_pdf_string(&raw), "Hi");
+    }
+
+    /// End-to-end pdfium render of a real page. Only asserts when pdfium can be loaded
+    /// (bundled `pdfium.dll` on Windows, or a system lib) — elsewhere the render path falls
+    /// back to pdftoppm/placeholder, so there's nothing to check and the test no-ops.
+    #[test]
+    fn pdfium_renders_real_page_when_available() {
+        if pdfium_instance().is_none() {
+            eprintln!("pdfium not available on this platform — skipping render assertion");
+            return;
+        }
+        let img = render_via_pdfium(&mini_pdf(), 1, 400).expect("pdfium should render page 1");
+        // US Letter portrait → taller than wide; longest side ≈ the 400px request.
+        assert!(img.height > img.width, "portrait page renders taller than wide");
+        assert!(
+            img.width > 50 && img.height > 50 && img.height <= 420,
+            "sane raster dimensions ({}x{})",
+            img.width,
+            img.height
+        );
     }
 }
