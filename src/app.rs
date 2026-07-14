@@ -27156,11 +27156,13 @@ mod tests {
     #[test]
     #[ignore]
     fn dump_adjustment_previews() {
-        let dir = std::path::Path::new(concat!(
-            env!("HOME"),
-            "/git/qb64pe-lab/greywood/sprites/ash_wolf"
-        ));
-        let Ok(rd) = std::fs::read_dir(dir) else {
+        // Resolve $HOME at runtime (not `env!`, which is compile-time and undefined on
+        // Windows) — this is a dev-only visual dump gated behind `--ignored`.
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_default();
+        let dir = std::path::PathBuf::from(home).join("git/qb64pe-lab/greywood/sprites/ash_wolf");
+        let Ok(rd) = std::fs::read_dir(&dir) else {
             eprintln!("sprite dir missing, skipping");
             return;
         };

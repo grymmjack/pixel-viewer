@@ -48,7 +48,12 @@ fn main() {
     );
 
     build.compile("xmp");
-    println!("cargo:rustc-link-lib=m"); // libxmp's oscillators use the math library
+    // libxmp's oscillators use the math library. On Unix that's a separate `libm`; on
+    // Windows/MSVC the math functions live in the C runtime, so there is no `m.lib` to link
+    // (and asking for one is LNK1181: cannot open input file 'm.lib').
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        println!("cargo:rustc-link-lib=m");
+    }
     println!("cargo:rerun-if-changed=vendor/libxmp/src");
     println!("cargo:rerun-if-changed=vendor/libxmp/cmake/libxmp-sources.cmake");
 }

@@ -6,9 +6,14 @@
 
 use std::path::Path;
 
+#[cfg(unix)]
 const ATTR: &str = "user.baloo.rating";
 
 /// Read the star rating (0..=5). 0 means unrated / absent / unreadable.
+///
+/// Extended attributes only exist on Unix; on Windows there's no xattr backend, so
+/// this always returns 0 (unrated) and the caller falls back to the ratings.json sidecar.
+#[cfg(unix)]
 pub fn read(path: &Path) -> u8 {
     match xattr::get(path, ATTR) {
         Ok(Some(bytes)) => parse_value(&bytes),
@@ -16,7 +21,15 @@ pub fn read(path: &Path) -> u8 {
     }
 }
 
+#[cfg(not(unix))]
+pub fn read(_path: &Path) -> u8 {
+    0
+}
+
 /// Write a star rating (1..=5), or clear it (0 removes the attribute, like Baloo).
+///
+/// No-op on non-Unix (no xattr backend) — ratings persist via the ratings.json sidecar.
+#[cfg(unix)]
 pub fn write(path: &Path, stars: u8) -> std::io::Result<()> {
     if stars == 0 {
         // Removing a non-existent attr returns an error (ENODATA) — that's fine.
@@ -25,6 +38,11 @@ pub fn write(path: &Path, stars: u8) -> std::io::Result<()> {
     } else {
         xattr::set(path, ATTR, encode_stars(stars).as_bytes())
     }
+}
+
+#[cfg(not(unix))]
+pub fn write(_path: &Path, _stars: u8) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Parse a Baloo rating value (ASCII `0..10`) into stars (0..=5).
@@ -67,6 +85,7 @@ mod tests {
         assert_eq!(encode_stars(9), "10"); // clamps
     }
 
+    #[cfg(unix)]
     #[test]
     fn xattr_round_trip_on_real_file() {
         // Best-effort: some temp filesystems don't support user xattrs, so we
