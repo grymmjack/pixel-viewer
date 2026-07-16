@@ -1587,9 +1587,9 @@ impl PixelView {
         let crt_scanline_dark = cc
             .storage
             .and_then(|s| eframe::get_value::<f32>(s, Self::CRT_SCANLINE_DARK_KEY))
-            .unwrap_or(0.5)
+            .unwrap_or(0.0) // default OFF (fresh install); persisted value wins
             .clamp(0.0, 1.0);
-        let crt_scanline_scale = get_bool(Self::CRT_SCANLINE_SCALE_KEY).unwrap_or(true);
+        let crt_scanline_scale = get_bool(Self::CRT_SCANLINE_SCALE_KEY).unwrap_or(false);
         let black_bg = get_bool(Self::BLACK_BG_KEY).unwrap_or(true);
         let osd_enabled = get_bool(Self::OSD_ENABLED_KEY).unwrap_or(true);
         let osd_position = get_u8(Self::OSD_POSITION_KEY).unwrap_or(1).min(7);
@@ -1598,9 +1598,9 @@ impl PixelView {
             .and_then(|s| eframe::get_value::<f32>(s, Self::OSD_SECS_KEY))
             .unwrap_or(3.0)
             .clamp(0.5, 30.0);
-        let auto_next = get_bool(Self::AUTO_NEXT_KEY).unwrap_or(true);
+        let auto_next = get_bool(Self::AUTO_NEXT_KEY).unwrap_or(false); // default OFF (fresh install)
         let auto_next_secs = get_u8(Self::AUTO_NEXT_SECS_KEY).unwrap_or(5).clamp(1, 60);
-        let glow = get_bool(Self::GLOW_KEY).unwrap_or(true);
+        let glow = get_bool(Self::GLOW_KEY).unwrap_or(false); // default OFF (fresh install)
         let shuffle = get_bool(Self::SHUFFLE_KEY).unwrap_or(false);
         let glow_amt = cc
             .storage

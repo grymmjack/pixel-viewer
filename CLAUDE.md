@@ -727,11 +727,13 @@ rematch**, and the *order* of all of it is user-controlled.
   idle. With **Shuffle** on, reaching a pack's end (a `step_image` no-op — it doesn't wrap)
   triggers the next random pack → endless. Shuffle auto-enables `auto_next`; pair with F11
   for a screensaver of real scene art. **R** jumps to a new random pack (skip a dud).
-- **Look defaults** lean to the late-night-BBS aesthetic (`crt_aspect`, scanlines 0.5 +
-  `scale`, `glow`, `black_bg`, `zoom_lock`/Snap, `auto_next`, ANSI 4800 / RIP 9600 baud —
-  all `unwrap_or(...)` in `PixelView::new`). `font_9px` is the one left default-off: its
-  setter flips a process-global the decoder reads, which would leak into parallel decode
-  tests. Persisted values always override the defaults.
+- **Look defaults** lean to the late-night-BBS aesthetic (`crt_aspect`, `black_bg`,
+  `zoom_lock`/Snap, ANSI 4800 / RIP 9600 baud — all `unwrap_or(...)` in `PixelView::new`). The
+  **CRT post-FX + slideshow default OFF** though: `crt_scanline_dark` 0, `crt_scanline_scale` false,
+  `glow` false, `auto_next` false — a fresh install is clean + doesn't auto-advance; opt into the
+  CRT look / slideshow in the status bar. `font_9px` is also default-off: its setter flips a
+  process-global the decoder reads, which would leak into parallel decode tests. Persisted values
+  always override the defaults.
 - **Fit W** button (status bar, single view): re-applies the fit-to-viewport-width zoom
   (sets the one-shot `fit_width_on_open`) after you've zoomed away. Text-mode art already
   fits width on open.
