@@ -566,7 +566,11 @@ rematch**, and the *order* of all of it is user-controlled.
   of a builtin (the pre-folder release) into Factory, but leaves one the user re-filed elsewhere.
   The grouped render builds an owned `Vec<FxRow>` + a `render_row` closure so the nested
   `CollapsingHeader` closures don't borrow `self.pixelfx` (all edits go through the `fx_*` deferred
-  locals, incl. `fx_move` / `fx_rename_edit`).
+  locals, incl. `fx_move` / `fx_rename_edit`). **Factory presets are read-only** (`is_builtin_fx_name`,
+  keyed on the name not the folder — a user preset in a "Factory"-named folder stays editable): the
+  `read_only` arg to `render_row` gates the inline rename + swaps the whole context menu for an
+  "apply only" note, so a bundled preset can't be renamed/moved/removed/recolored into a resurrecting
+  duplicate. Fork one by applying it and Save-ing a copy (lands top-level / your folder).
 - **Applies to 16colo.rs browsing too.** The remote-thumb upload (`colo_thumbs.drain`) now
   stores the rendered PNG's CPU pixels in `thumb_rgba` (previously only `thumb_tex`), so
   `grid_recolored_tex` can recolor 16colo tiles (LINEAR — they're rendered previews);

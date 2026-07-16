@@ -16754,21 +16754,24 @@ impl PixelView {
                                               name: &str,
                                               color: Option<[u8; 3]>,
                                               fg: Option<[u8; 3]>,
-                                              cur_folder: &Option<String>| {
-                            if let Some((ri, buf)) = &rename_state {
-                                if *ri == i {
-                                    let mut b = buf.clone();
-                                    let r = ui.add(
-                                        egui::TextEdit::singleline(&mut b)
-                                            .desired_width(f32::INFINITY),
-                                    );
-                                    fx_rename_edit = Some((i, b.clone()));
-                                    if r.lost_focus()
-                                        && ui.input(|inp| inp.key_pressed(egui::Key::Enter))
-                                    {
-                                        fx_rename_commit = Some((i, b));
+                                              cur_folder: &Option<String>,
+                                              read_only: bool| {
+                            if !read_only {
+                                if let Some((ri, buf)) = &rename_state {
+                                    if *ri == i {
+                                        let mut b = buf.clone();
+                                        let r = ui.add(
+                                            egui::TextEdit::singleline(&mut b)
+                                                .desired_width(f32::INFINITY),
+                                        );
+                                        fx_rename_edit = Some((i, b.clone()));
+                                        if r.lost_focus()
+                                            && ui.input(|inp| inp.key_pressed(egui::Key::Enter))
+                                        {
+                                            fx_rename_commit = Some((i, b));
+                                        }
+                                        return;
                                     }
-                                    return;
                                 }
                             }
                             let bg = color
@@ -16781,13 +16784,26 @@ impl PixelView {
                             if let Some(tc) = text_col {
                                 label = label.color(tc);
                             }
-                            let r = ui.add(egui::Button::new(label).fill(bg)).on_hover_text(
-                                "Apply this preset · right-click to rename / move / recolor / remove",
-                            );
+                            let hover = if read_only {
+                                "Apply this Factory preset (read-only — Save a copy to customize)"
+                            } else {
+                                "Apply this preset · right-click to rename / move / recolor / remove"
+                            };
+                            let r = ui.add(egui::Button::new(label).fill(bg)).on_hover_text(hover);
                             if r.clicked() {
                                 fx_apply = Some(i);
                             }
                             r.context_menu(|ui| {
+                                if read_only {
+                                    // Factory presets are read-only: apply only, no mutate (else a
+                                    // rename/delete would just resurrect next launch, confusingly).
+                                    ui.weak("Factory preset — read-only");
+                                    if ui.button("Apply").clicked() {
+                                        fx_apply = Some(i);
+                                        ui.close();
+                                    }
+                                    return;
+                                }
                                 if ui.button("Rename").clicked() {
                                     fx_rename_start = Some(i);
                                     ui.close();
@@ -16842,7 +16858,7 @@ impl PixelView {
                         // Top-level presets first…
                         for (i, name, color, fg, folder) in &rows {
                             if folder.is_none() {
-                                render_row(ui, *i, name, *color, *fg, folder);
+                                render_row(ui, *i, name, *color, *fg, folder, is_builtin_fx_name(name));
                             }
                         }
                         // …then each folder as a collapsible section (Factory starts collapsed).
@@ -16860,7 +16876,8 @@ impl PixelView {
                                 .show(ui, |ui| {
                                     for (i, name, color, fg, folder) in &rows {
                                         if folder.as_deref() == Some(fname.as_str()) {
-                                            render_row(ui, *i, name, *color, *fg, folder);
+                                            let ro = is_builtin_fx_name(name);
+                                            render_row(ui, *i, name, *color, *fg, folder, ro);
                                         }
                                     }
                                 });
@@ -18755,6 +18772,14 @@ fn builtin_palette_paths() -> Vec<PathBuf> {
 /// the embedded blob with `ron`. Each references only bundled palettes (the `<built-in palettes>`
 /// sentinel root), so they resolve on any machine. Parsed once.
 pub const FX_FACTORY_FOLDER: &str = "Factory";
+
+/// Whether `name` is one of the bundled (Factory) presets — those are **read-only** in the PixelFX
+/// tab (apply only; no rename/move/remove/recolor), so they can't be edited into a resurrecting
+/// duplicate. Keyed on the name, not the folder, so a user's own preset filed in a "Factory"-named
+/// folder stays editable. O(bundled count) — tiny.
+fn is_builtin_fx_name(name: &str) -> bool {
+    builtin_fx_presets().iter().any(|b| b.name == name)
+}
 
 fn builtin_fx_presets() -> &'static [FxPreset] {
     static FX: std::sync::OnceLock<Vec<FxPreset>> = std::sync::OnceLock::new();
@@ -26426,6 +26451,10 @@ mod tests {
         assert_eq!(f("CGA1").as_deref(), Some("Mine"), "re-filed builtin kept");
         assert_eq!(f("My Look"), None, "user preset untouched");
         assert!(user.len() > 3, "missing builtins were appended");
+
+        // Read-only gate keys on the name, not the folder.
+        assert!(is_builtin_fx_name("Gameboy"), "bundled preset is read-only");
+        assert!(!is_builtin_fx_name("My Look"), "user preset is editable");
     }
 
     #[test]
