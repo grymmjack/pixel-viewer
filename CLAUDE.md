@@ -42,7 +42,9 @@ offset/blockSize header → ~2 garbage frames from the next chunk = a pop after 
 music-note icon for trackers/voc/au/midi; duration/rate/channels/codec in Details, plus an
 **in-app play/pause/seek preview** via `rodio`). These three are **toggleable plugins**
 (Preferences → "Format plugins" checkboxes; a runtime atomic flag on the `Registry` — off
-drops the type from the listing + skips decoding). **Any** file also gets "Open in default
+drops the type from the listing + skips decoding). **All three default OFF** (a fresh install:
+`load_bool(PLUGIN_*_KEY, false)` in `new()` — they're the heaviest decode paths; an existing
+user keeps whatever they persisted); enable them in Preferences. **Any** file also gets "Open in default
 app" (xdg-open/open/explorer) in the right-click "Open in…" menu, the Details pane, and via
 **Enter** in the viewer — so a source file drops into its associated editor.
 **Animated GIFs** play (autoplay + seek in the viewer,

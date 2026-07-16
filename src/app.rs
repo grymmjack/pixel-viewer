@@ -1352,16 +1352,18 @@ impl PixelView {
         // "Font glyph gotcha" note in CLAUDE.md.
         install_fallback_font(&cc.egui_ctx);
         let registry = Arc::new(Registry::with_builtins());
-        // Optional format plugins (persisted, default on) → apply to the registry so a
-        // disabled one drops its file types from the listing + skips decoding.
+        // Optional format plugins (persisted) → apply to the registry so a disabled one drops its
+        // file types from the listing + skips decoding. **Default OFF** — a fresh install ships with
+        // audio/PDF/source-text off (they pull the heaviest decode paths); an existing user keeps
+        // whatever they persisted. Enable in Preferences → "Format plugins".
         let load_bool = |key: &str, default: bool| -> bool {
             cc.storage
                 .and_then(|s| eframe::get_value::<bool>(s, key))
                 .unwrap_or(default)
         };
-        let plugin_pdf = load_bool(Self::PLUGIN_PDF_KEY, true);
-        let plugin_audio = load_bool(Self::PLUGIN_AUDIO_KEY, true);
-        let plugin_code = load_bool(Self::PLUGIN_CODE_KEY, true);
+        let plugin_pdf = load_bool(Self::PLUGIN_PDF_KEY, false);
+        let plugin_audio = load_bool(Self::PLUGIN_AUDIO_KEY, false);
+        let plugin_code = load_bool(Self::PLUGIN_CODE_KEY, false);
         let audio_autoplay = load_bool(Self::AUDIO_AUTOPLAY_KEY, false);
         let audio_volume = cc
             .storage
