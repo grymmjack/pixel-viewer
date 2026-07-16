@@ -3617,6 +3617,7 @@ dependencies = [
  "resvg",
  "rfd",
  "rodio",
+ "ron",
  "rusqlite",
  "rustysynth",
  "serde",

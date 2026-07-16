@@ -41,6 +41,10 @@ serde_json = "1"
 # derive Serialize/Deserialize for persisted structs (e.g. FxPreset). serde +
 # serde_derive are already in the tree via eframe/serde_json; this just exposes it.
 serde = { version = "1", features = ["derive"] }
+# Parse the bundled PixelFX presets (assets/pixelfx_builtin.ron) — eframe persists
+# `Vec<FxPreset>` as compact RON, so we embed + parse that exact format. Already in the
+# tree via eframe (0.12.x); a direct dep just unifies to that same build.
+ron = "0.12"
 # HQx pixel-art upscalers (HQ2x/3x/4x). Operates on raw &[u32] ARGB — no image-crate
 # coupling — so it plugs straight into the scale module's RGBA buffers.
 hqx = "0.1"

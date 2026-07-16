@@ -156,6 +156,7 @@ vendor/libxmp/       vendored libxmp 4.6.3 source (MIT) — src/ + include/ + li
   palettes_builtin.rs  the bundled .GPL palette library, embedded via include_str!
 assets/pixelview.png   generated app icon (4×4 thumbnail grid)
 assets/palettes/       55 bundled .GPL palettes (embedded into the binary)
+assets/pixelfx_builtin.ron  bundled PixelFX recolor presets (embedded; see PixelFX presets)
 assets/DejaVuSans.ttf  embedded UI fallback font (fills egui's tofu gaps; see Font gotcha)
 assets/SymbolsNerdFont-Regular.ttf  embedded icon font (the `icons::*` designed glyphs)
 pixelview.desktop      desktop entry (StartupWMClass=pixelview) for the task icon
@@ -546,7 +547,15 @@ rematch**, and the *order* of all of it is user-controlled.
   as a record) + `#[serde(default)]` so a preset survives new ops/params. Each preset has
   a background `color` + text `fg` tag (auto-contrasts when `fg` is None); `ansi32_swatch_grid`
   backs both pickers. **serde derive is used** here (added to `Cargo.toml`; serde+serde_derive
-  were already in the tree via eframe/serde_json).
+  were already in the tree via eframe/serde_json). **Bundled presets:** a curated retro set
+  (CGA/Gameboy/Atari/EGA/…) ships in the binary — `assets/pixelfx_builtin.ron` (the same compact
+  RON `eframe` persists `Vec<FxPreset>` as) is `include_str!`d + parsed by `builtin_fx_presets`
+  (via the `ron` crate, already transitive through eframe). `new()` calls `merge_builtin_fx_presets`
+  to overlay them onto the user's saved list — appending any bundled preset whose **name** isn't
+  already present (user edits win by name; a fresh install gets the whole set; a deleted builtin
+  re-appears next launch, like the bundled palettes). Every bundled preset references only
+  `<built-in palettes>` (the embedded palette sentinel), so it resolves on any machine. To add one:
+  save it in-app, copy its RON record from `<data>/app.ron`'s `pixelfx` value into the asset file.
 - **Applies to 16colo.rs browsing too.** The remote-thumb upload (`colo_thumbs.drain`) now
   stores the rendered PNG's CPU pixels in `thumb_rgba` (previously only `thumb_tex`), so
   `grid_recolored_tex` can recolor 16colo tiles (LINEAR — they're rendered previews);

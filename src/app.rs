@@ -1959,10 +1959,15 @@ impl PixelView {
                     )
                 })
                 .unwrap_or_default(),
-            pixelfx: cc
-                .storage
-                .and_then(|s| eframe::get_value::<Vec<FxPreset>>(s, Self::PIXELFX_KEY))
-                .unwrap_or_default(),
+            pixelfx: {
+                // User-saved presets, then overlay the bundled set (fresh installs get all of them).
+                let mut v = cc
+                    .storage
+                    .and_then(|s| eframe::get_value::<Vec<FxPreset>>(s, Self::PIXELFX_KEY))
+                    .unwrap_or_default();
+                merge_builtin_fx_presets(&mut v);
+                v
+            },
             pixelfx_name: String::new(),
             pixelfx_rename: None,
             sample_rename: None,
@@ -18639,6 +18644,33 @@ fn builtin_palette_paths() -> Vec<PathBuf> {
         .collect()
 }
 
+/// The bundled **PixelFX presets** — a curated set of retro looks (CGA/Gameboy/Atari/EGA/…)
+/// embedded like the `.GPL` palettes, so a fresh install ships with them. They're stored in the
+/// same compact RON `eframe` persists `Vec<FxPreset>` as (see `save`/`PIXELFX_KEY`), so we parse
+/// the embedded blob with `ron`. Each references only bundled palettes (the `<built-in palettes>`
+/// sentinel root), so they resolve on any machine. Parsed once.
+fn builtin_fx_presets() -> &'static [FxPreset] {
+    static FX: std::sync::OnceLock<Vec<FxPreset>> = std::sync::OnceLock::new();
+    FX.get_or_init(|| {
+        ron::from_str::<Vec<FxPreset>>(include_str!("../assets/pixelfx_builtin.ron"))
+            .unwrap_or_default()
+    })
+}
+
+/// Overlay the bundled presets onto the user's saved list: append any bundled preset whose **name**
+/// isn't already present. So a fresh install gets the whole set, an existing user keeps their own
+/// (edits win by name), and a later-added bundled preset shows up. (A user-deleted bundled preset
+/// re-appears next launch — they're built-ins, always available, like the bundled palettes.)
+fn merge_builtin_fx_presets(user: &mut Vec<FxPreset>) {
+    let have: std::collections::HashSet<&str> = user.iter().map(|p| p.name.as_str()).collect();
+    let add: Vec<FxPreset> = builtin_fx_presets()
+        .iter()
+        .filter(|b| !have.contains(b.name.as_str()))
+        .cloned()
+        .collect();
+    user.extend(add);
+}
+
 /// The bundled ANSI32 palette as 32 RGB colors, parsed once — the swatch set offered
 /// when color-tagging a favorite/pin (Places).
 fn ansi32_palette() -> &'static [[u8; 3]] {
@@ -26233,6 +26265,27 @@ mod tests {
                 "{fav} parsed to no colors"
             );
         }
+    }
+
+    #[test]
+    fn builtin_fx_presets_parse_and_reference_bundled_palettes() {
+        let fx = builtin_fx_presets();
+        assert!(fx.len() >= 20, "bundled PixelFX presets embedded ({} found)", fx.len());
+        assert!(fx.iter().any(|p| p.name == "Gameboy"), "a known preset is present");
+        // Every referenced palette must resolve to embedded contents — else a fresh install would
+        // recall a preset whose palette silently doesn't exist.
+        for p in fx {
+            if let Some(pal) = &p.selected_palette {
+                let text = builtin_palette_contents(pal)
+                    .unwrap_or_else(|| panic!("preset {:?} references missing palette {:?}", p.name, pal));
+                assert!(!crate::thumb::parse_gpl(text).is_empty(), "{:?} palette parsed empty", p.name);
+            }
+        }
+        // Merge is idempotent: overlaying builtins onto a list that already has them adds nothing.
+        let mut have: Vec<FxPreset> = fx.to_vec();
+        let before = have.len();
+        merge_builtin_fx_presets(&mut have);
+        assert_eq!(have.len(), before, "merging builtins twice must not duplicate");
     }
 
     #[test]
