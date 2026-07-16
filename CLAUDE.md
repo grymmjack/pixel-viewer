@@ -556,6 +556,17 @@ rematch**, and the *order* of all of it is user-controlled.
   re-appears next launch, like the bundled palettes). Every bundled preset references only
   `<built-in palettes>` (the embedded palette sentinel), so it resolves on any machine. To add one:
   save it in-app, copy its RON record from `<data>/app.ron`'s `pixelfx` value into the asset file.
+  **Folders:** each preset has an optional `folder` (`FxPreset.folder`; the bundled set is
+  `FX_FACTORY_FOLDER` = "Factory", set in `builtin_fx_presets` not the RON so the blob stays the
+  exact eframe format). The tab renders **top-level presets first, then one collapsible
+  `CollapsingHeader` per folder** (Factory `default_open(false)` = **starts collapsed**; a stable
+  `id_salt` so the "(N)" count in the label can't reset the open state). Save into a folder via the
+  "folder (optional)" field; re-file via a preset's right-click **Move to ▸** (Top level / an
+  existing folder / ＋ the typed folder). `merge_builtin_fx_presets` **migrates** a folder-less copy
+  of a builtin (the pre-folder release) into Factory, but leaves one the user re-filed elsewhere.
+  The grouped render builds an owned `Vec<FxRow>` + a `render_row` closure so the nested
+  `CollapsingHeader` closures don't borrow `self.pixelfx` (all edits go through the `fx_*` deferred
+  locals, incl. `fx_move` / `fx_rename_edit`).
 - **Applies to 16colo.rs browsing too.** The remote-thumb upload (`colo_thumbs.drain`) now
   stores the rendered PNG's CPU pixels in `thumb_rgba` (previously only `thumb_tex`), so
   `grid_recolored_tex` can recolor 16colo tiles (LINEAR — they're rendered previews);

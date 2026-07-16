@@ -915,6 +915,7 @@ pub struct PixelView {
     // Places → PixelFX sub-tab. Save/apply/rename/colorize/remove.
     pixelfx: Vec<FxPreset>,
     pixelfx_name: String,                    // "save current" name buffer
+    pixelfx_folder: String,                  // "save into folder" buffer (empty = top level); also the "＋ new folder" target in Move-to
     pixelfx_rename: Option<(usize, String)>, // inline-rename buffer (transient)
     // User-managed "Samples" locations (name, dir, optional color tag) — quick jumps to sample
     // folders to drag/assign into pads. Add/rename/colorize/remove from the Samples sub-tab.
@@ -1969,6 +1970,7 @@ impl PixelView {
                 v
             },
             pixelfx_name: String::new(),
+            pixelfx_folder: String::new(),
             pixelfx_rename: None,
             sample_rename: None,
             sample_browse: None,
@@ -9976,6 +9978,7 @@ impl PixelView {
             quantize_n: self.quantize_n,
             selected_palette: self.selected_palette.clone(),
             custom_palette: self.custom_palette.clone(),
+            folder: None, // the caller (fx_save) sets it from the folder field
         }
     }
 
@@ -16561,6 +16564,8 @@ impl PixelView {
         let mut fx_fg: Option<(usize, Option<[u8; 3]>)> = None; // set text color
         let mut fx_rename_start: Option<usize> = None;
         let mut fx_rename_commit: Option<(usize, String)> = None;
+        let mut fx_rename_edit: Option<(usize, String)> = None; // in-progress inline-rename buffer
+        let mut fx_move: Option<(usize, Option<String>)> = None; // move preset i to a folder (None = top level)
         // Tabs: Places | Folders (one at a time, to save vertical room).
         ui.horizontal(|ui| {
             if ui
@@ -16706,47 +16711,78 @@ impl PixelView {
                                 fx_save = true;
                             }
                         });
+                        // Optional folder for the saved preset (empty = top level). Also the target
+                        // offered as "＋ <name>" in a preset's right-click "Move to ▸" submenu, so
+                        // typing a name here is how you create a new folder.
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.pixelfx_folder)
+                                    .hint_text("folder (optional)")
+                                    .desired_width(150.0),
+                            )
+                            .on_hover_text(
+                                "File the saved preset into this folder (blank = top level); also the \
+                                 target of a preset's right-click → Move to ▸ ＋",
+                            );
+                        });
                         ui.separator();
                         if self.pixelfx.is_empty() {
                             ui.weak("(no presets — build a look, name it, Save)");
                         }
-                        for i in 0..self.pixelfx.len() {
-                            let (name, color, fg) = {
-                                let p = &self.pixelfx[i];
-                                (p.name.clone(), p.color, p.fg)
-                            };
-                            // Inline rename replaces the button while this row is renamed.
-                            if matches!(&self.pixelfx_rename, Some((ri, _)) if *ri == i) {
-                                let mut buf = match &self.pixelfx_rename {
-                                    Some((_, b)) => b.clone(),
-                                    None => String::new(),
-                                };
-                                let r = ui.add(
-                                    egui::TextEdit::singleline(&mut buf)
-                                        .desired_width(f32::INFINITY),
-                                );
-                                self.pixelfx_rename = Some((i, buf.clone()));
-                                if r.lost_focus()
-                                    && ui.input(|inp| inp.key_pressed(egui::Key::Enter))
-                                {
-                                    fx_rename_commit = Some((i, buf));
+                        // Owned snapshot so the collapsible-group closures don't borrow self.pixelfx.
+                        let rename_state = self.pixelfx_rename.clone();
+                        let rows: Vec<FxRow> = self
+                            .pixelfx
+                            .iter()
+                            .enumerate()
+                            .map(|(i, p)| (i, p.name.clone(), p.color, p.fg, p.folder.clone()))
+                            .collect();
+                        // Folder names in first-appearance order (drives the group sections + Move-to menu).
+                        let mut folder_names: Vec<String> = Vec::new();
+                        for (_, _, _, _, f) in &rows {
+                            if let Some(f) = f {
+                                if !folder_names.iter().any(|x| x == f) {
+                                    folder_names.push(f.clone());
                                 }
-                                continue;
+                            }
+                        }
+                        let new_folder = self.pixelfx_folder.trim().to_string();
+                        // Render one preset row (inline-rename OR button + context menu), all via the
+                        // deferred locals so nothing borrows self. Reused for top-level + each folder.
+                        let mut render_row = |ui: &mut egui::Ui,
+                                              i: usize,
+                                              name: &str,
+                                              color: Option<[u8; 3]>,
+                                              fg: Option<[u8; 3]>,
+                                              cur_folder: &Option<String>| {
+                            if let Some((ri, buf)) = &rename_state {
+                                if *ri == i {
+                                    let mut b = buf.clone();
+                                    let r = ui.add(
+                                        egui::TextEdit::singleline(&mut b)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                    fx_rename_edit = Some((i, b.clone()));
+                                    if r.lost_focus()
+                                        && ui.input(|inp| inp.key_pressed(egui::Key::Enter))
+                                    {
+                                        fx_rename_commit = Some((i, b));
+                                    }
+                                    return;
+                                }
                             }
                             let bg = color
                                 .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
                                 .unwrap_or(ui.visuals().widgets.inactive.bg_fill);
-                            // Text: an explicit fg wins; else auto black/white against the
-                            // background tag so a light tint (e.g. "1bit") stays readable.
                             let text_col = fg
                                 .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
                                 .or_else(|| color.map(contrast_text));
-                            let mut label = egui::RichText::new(elide(&name, 22));
+                            let mut label = egui::RichText::new(elide(name, 22));
                             if let Some(tc) = text_col {
                                 label = label.color(tc);
                             }
                             let r = ui.add(egui::Button::new(label).fill(bg)).on_hover_text(
-                                "Apply this preset · right-click to rename / recolor / remove",
+                                "Apply this preset · right-click to rename / move / recolor / remove",
                             );
                             if r.clicked() {
                                 fx_apply = Some(i);
@@ -16756,6 +16792,27 @@ impl PixelView {
                                     fx_rename_start = Some(i);
                                     ui.close();
                                 }
+                                ui.menu_button("Move to ▸", |ui| {
+                                    if cur_folder.is_some() && ui.button("Top level").clicked() {
+                                        fx_move = Some((i, None));
+                                        ui.close();
+                                    }
+                                    for f in &folder_names {
+                                        if Some(f) != cur_folder.as_ref()
+                                            && ui.button(f.as_str()).clicked()
+                                        {
+                                            fx_move = Some((i, Some(f.clone())));
+                                            ui.close();
+                                        }
+                                    }
+                                    if !new_folder.is_empty()
+                                        && !folder_names.iter().any(|x| x == &new_folder)
+                                        && ui.button(format!("＋ {new_folder}")).clicked()
+                                    {
+                                        fx_move = Some((i, Some(new_folder.clone())));
+                                        ui.close();
+                                    }
+                                });
                                 if ui.button("× Remove").clicked() {
                                     fx_remove = Some(i);
                                     ui.close();
@@ -16781,6 +16838,32 @@ impl PixelView {
                                     ui.close();
                                 }
                             });
+                        };
+                        // Top-level presets first…
+                        for (i, name, color, fg, folder) in &rows {
+                            if folder.is_none() {
+                                render_row(ui, *i, name, *color, *fg, folder);
+                            }
+                        }
+                        // …then each folder as a collapsible section (Factory starts collapsed).
+                        for fname in &folder_names {
+                            let count = rows
+                                .iter()
+                                .filter(|(_, _, _, _, f)| f.as_deref() == Some(fname.as_str()))
+                                .count();
+                            let open = fname != FX_FACTORY_FOLDER;
+                            // id_salt is stable (not the label), so the count in the header can't
+                            // reset the open/closed state.
+                            egui::CollapsingHeader::new(format!("{fname} ({count})"))
+                                .id_salt(("pixelfx_folder", fname))
+                                .default_open(open)
+                                .show(ui, |ui| {
+                                    for (i, name, color, fg, folder) in &rows {
+                                        if folder.as_deref() == Some(fname.as_str()) {
+                                            render_row(ui, *i, name, *color, *fg, folder);
+                                        }
+                                    }
+                                });
                         }
                     } else {
                         // Samples: user-managed sample folders — quick jumps to browse + drag/assign
@@ -17126,13 +17209,24 @@ impl PixelView {
                     n.to_string()
                 }
             };
-            let preset = self.capture_fx_preset(name.clone());
-            // Overwrite a same-named preset (keeping its color tags), else append.
+            // Optional folder typed in the Save row (empty = top level). Kept after save so
+            // consecutive saves land in the same folder.
+            let folder = {
+                let f = self.pixelfx_folder.trim();
+                (!f.is_empty()).then(|| f.to_string())
+            };
+            let mut preset = self.capture_fx_preset(name.clone());
+            preset.folder = folder.clone();
+            // Overwrite a same-named preset (keeping its color tags + folder unless one was typed),
+            // else append.
             if let Some(slot) = self.pixelfx.iter_mut().find(|p| p.name == name) {
-                let (color, fg) = (slot.color, slot.fg);
+                let (color, fg, old_folder) = (slot.color, slot.fg, slot.folder.clone());
                 *slot = preset;
                 slot.color = color;
                 slot.fg = fg;
+                if folder.is_none() {
+                    slot.folder = old_folder; // no folder typed → keep where it already lived
+                }
             } else {
                 self.pixelfx.push(preset);
             }
@@ -17161,6 +17255,17 @@ impl PixelView {
             if let Some(p) = self.pixelfx.get_mut(i) {
                 p.fg = c;
             }
+        }
+        if let Some((i, folder)) = fx_move {
+            if let Some(p) = self.pixelfx.get_mut(i) {
+                let where_to = folder.clone().unwrap_or_else(|| "top level".to_string());
+                p.folder = folder;
+                self.status = format!("Moved “{}” to {where_to}", p.name);
+            }
+        }
+        // Keep the inline-rename buffer live as the user types (deferred out of the render closure).
+        if let Some((i, buf)) = fx_rename_edit {
+            self.pixelfx_rename = Some((i, buf));
         }
         if let Some(i) = fx_rename_start {
             let cur = self
@@ -18649,26 +18754,35 @@ fn builtin_palette_paths() -> Vec<PathBuf> {
 /// same compact RON `eframe` persists `Vec<FxPreset>` as (see `save`/`PIXELFX_KEY`), so we parse
 /// the embedded blob with `ron`. Each references only bundled palettes (the `<built-in palettes>`
 /// sentinel root), so they resolve on any machine. Parsed once.
+pub const FX_FACTORY_FOLDER: &str = "Factory";
+
 fn builtin_fx_presets() -> &'static [FxPreset] {
     static FX: std::sync::OnceLock<Vec<FxPreset>> = std::sync::OnceLock::new();
     FX.get_or_init(|| {
-        ron::from_str::<Vec<FxPreset>>(include_str!("../assets/pixelfx_builtin.ron"))
-            .unwrap_or_default()
+        let mut v = ron::from_str::<Vec<FxPreset>>(include_str!("../assets/pixelfx_builtin.ron"))
+            .unwrap_or_default();
+        // The bundled set is the "Factory" folder (collapsed by default in the PixelFX tab), set
+        // here rather than in the RON so the embedded blob stays the exact eframe-persisted format.
+        for p in &mut v {
+            p.folder = Some(FX_FACTORY_FOLDER.to_string());
+        }
+        v
     })
 }
 
 /// Overlay the bundled presets onto the user's saved list: append any bundled preset whose **name**
-/// isn't already present. So a fresh install gets the whole set, an existing user keeps their own
-/// (edits win by name), and a later-added bundled preset shows up. (A user-deleted bundled preset
-/// re-appears next launch — they're built-ins, always available, like the bundled palettes.)
+/// isn't already present, and **migrate** an already-present one that has no folder into "Factory"
+/// (the earlier release merged them folder-less). A fresh install gets the whole set; an existing
+/// user keeps their own (edits win by name); a bundled preset the user re-filed into another folder
+/// is left alone (`folder.is_some()`); a deleted builtin re-appears next launch (like the palettes).
 fn merge_builtin_fx_presets(user: &mut Vec<FxPreset>) {
-    let have: std::collections::HashSet<&str> = user.iter().map(|p| p.name.as_str()).collect();
-    let add: Vec<FxPreset> = builtin_fx_presets()
-        .iter()
-        .filter(|b| !have.contains(b.name.as_str()))
-        .cloned()
-        .collect();
-    user.extend(add);
+    for b in builtin_fx_presets() {
+        match user.iter_mut().find(|p| p.name == b.name) {
+            Some(existing) if existing.folder.is_none() => existing.folder = b.folder.clone(),
+            Some(_) => {} // user re-filed it into a folder — leave their choice
+            None => user.push(b.clone()),
+        }
+    }
 }
 
 /// The bundled ANSI32 palette as 32 RGB colors, parsed once — the swatch set offered
@@ -19390,6 +19504,10 @@ impl PostFx {
     }
 }
 
+/// One PixelFX-tab row snapshot: `(index into pixelfx, name, bg color, fg color, folder)` —
+/// owned so the grouped/collapsible render closures don't borrow `self.pixelfx`.
+type FxRow = (usize, String, Option<[u8; 3]>, Option<[u8; 3]>, Option<String>);
+
 /// A saved "PixelFX" preset — a snapshot of the WHOLE recolor stack (adjustments +
 /// order, post-FX, dither, color balance, resize, reduce, and the active palette), so
 /// a look can be named, colorized, and recalled from the Places → PixelFX tab. The
@@ -19426,6 +19544,8 @@ struct FxPreset {
     quantize_n: usize,
     selected_palette: Option<PathBuf>,
     custom_palette: Option<Vec<[u8; 4]>>,
+    // Collapsible group in the PixelFX tab: None = top level; the bundled presets are "Factory".
+    folder: Option<String>,
 }
 
 impl Default for FxPreset {
@@ -19457,6 +19577,7 @@ impl Default for FxPreset {
             quantize_n: 16,
             selected_palette: None,
             custom_palette: None,
+            folder: None,
         }
     }
 }
@@ -26281,11 +26402,30 @@ mod tests {
                 assert!(!crate::thumb::parse_gpl(text).is_empty(), "{:?} palette parsed empty", p.name);
             }
         }
+        // Every bundled preset is filed under the Factory folder.
+        assert!(
+            fx.iter().all(|p| p.folder.as_deref() == Some(FX_FACTORY_FOLDER)),
+            "bundled presets are in the Factory folder"
+        );
         // Merge is idempotent: overlaying builtins onto a list that already has them adds nothing.
         let mut have: Vec<FxPreset> = fx.to_vec();
         let before = have.len();
         merge_builtin_fx_presets(&mut have);
         assert_eq!(have.len(), before, "merging builtins twice must not duplicate");
+
+        // Migration: a folder-less copy of a builtin (the earlier release) is moved into Factory;
+        // a builtin the user re-filed elsewhere is left; a user-only preset is untouched.
+        let mut user = vec![
+            FxPreset { name: "Gameboy".into(), folder: None, ..Default::default() },
+            FxPreset { name: "CGA1".into(), folder: Some("Mine".into()), ..Default::default() },
+            FxPreset { name: "My Look".into(), folder: None, ..Default::default() },
+        ];
+        merge_builtin_fx_presets(&mut user);
+        let f = |n: &str| user.iter().find(|p| p.name == n).unwrap().folder.clone();
+        assert_eq!(f("Gameboy").as_deref(), Some(FX_FACTORY_FOLDER), "folderless builtin → Factory");
+        assert_eq!(f("CGA1").as_deref(), Some("Mine"), "re-filed builtin kept");
+        assert_eq!(f("My Look"), None, "user preset untouched");
+        assert!(user.len() > 3, "missing builtins were appended");
     }
 
     #[test]
